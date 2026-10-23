@@ -82,6 +82,12 @@ class _AcpError(Exception):
 class _AcpTimeout(Exception):
     """A request did not answer inside its slice of the wall-clock deadline."""
 
+    def __init__(self, message: str, *, stage: str | None = None,
+                 error_kind: str | None = None) -> None:
+        self.stage = stage
+        self.error_kind = error_kind
+        super().__init__(message)
+
 
 class _AcpPayloadTooLarge(_AcpError):
     """A complete JSON-RPC frame exceeded Summon's local wire ceiling."""
@@ -110,9 +116,16 @@ class _TurnState:
         self.usage: dict | None = None
         self._text_chars = 0
         self.truncated = False
+        self.meaningful_events = 0
+        try:
+            from _progress_signals import ProgressSignals
+            self.progress_signals = ProgressSignals()
+        except Exception:  # noqa: BLE001
+            self.progress_signals = None
 
     def add_text(self, chunk: str) -> None:
         with self.lock:
+            self.meaningful_events += 1
             room = self._MAX_TEXT_CHARS - self._text_chars
             if room <= 0:
                 self.truncated = True
@@ -135,6 +148,31 @@ class _TurnState:
         with self.lock:
             self.usage = usage
 
+    def record_tool_update(self, update: dict) -> None:
+        with self.lock:
+            self.meaningful_events += 1
+            if self.progress_signals is None:
+                return
+            call_id = update.get("toolCallId")
+            title = update.get("title") or update.get("kind") or "acp_tool"
+            args = update.get("rawInput") or update.get("locations") or update.get("title") or ""
+            status = str(update.get("status") or "").lower()
+            try:
+                if status in ("", "pending", "in_progress", "running"):
+                    if isinstance(call_id, str):
+                        if call_id not in self.progress_signals._pending:
+                            self.progress_signals.tool_call(str(title), args)
+                            self.progress_signals.tool_started(call_id)
+                    else:
+                        self.progress_signals.tool_call(str(title), args)
+                elif status in ("completed", "failed", "error", "cancelled"):
+                    if isinstance(call_id, str) and call_id not in self.progress_signals._pending:
+                        self.progress_signals.tool_call(str(title), args)
+                    self.progress_signals.tool_finished(call_id)
+                    self.progress_signals.tool_result(is_error=status in ("failed", "error"))
+            except Exception:  # noqa: BLE001
+                pass
+
     def snapshot(self) -> tuple:
         with self.lock:
             text = "".join(self.text)
@@ -156,10 +194,13 @@ class _AcpClient:
     def __init__(self, process: subprocess.Popen, permission: str,
                  cancelled=None, deadline_reached=None,
                  max_frame_bytes: int = _MAX_ACP_FRAME_BYTES,
-                 breaker=None) -> None:
+                 breaker=None, runtime_control=None,
+                 cli: str | None = None) -> None:
         self._proc = process
         self._permission = permission
         self._breaker = breaker
+        self._runtime_control = runtime_control
+        self._cli = cli
         self._cancelled = cancelled or (lambda: False)
         self._deadline_reached = deadline_reached or (lambda: False)
         self._write_lock = threading.Lock()
@@ -169,10 +210,86 @@ class _AcpClient:
         self._pending: dict = {}
         self.turn = _TurnState()
         self.stderr_lines: list = []
+        self._last_meaningful_events = 0
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._err_reader = threading.Thread(target=self._read_stderr, daemon=True)
         self._reader.start()
         self._err_reader.start()
+
+    def _poll_breaker(self) -> None:
+        """Evaluate runtime_control / breaker and raise _AcpTimeout on enforced containment."""
+        rc = self._runtime_control
+        breaker = self._breaker
+        if rc is not None:
+            try:
+                rc.refresh(force=True)
+            except Exception:  # noqa: BLE001
+                pass
+            if breaker is not None:
+                try:
+                    sync_fn = getattr(breaker, "sync_from_control", None)
+                    if callable(sync_fn):
+                        sync_fn(rc)
+                except Exception:  # noqa: BLE001
+                    pass
+            due_fn = getattr(rc, "checkpoint_due", None)
+            is_due = bool(callable(due_fn) and due_fn())
+            with self.turn.lock:
+                cur_events = self.turn.meaningful_events
+                usage_snap = dict(self.turn.usage) if isinstance(self.turn.usage, dict) else None
+            stream_active = cur_events > self._last_meaningful_events
+            if is_due:
+                self._last_meaningful_events = cur_events
+                try:
+                    rc.checkpoint(active=stream_active)
+                except Exception:  # noqa: BLE001
+                    pass
+            if breaker is not None and is_due:
+                try:
+                    _wt = None
+                    if usage_snap:
+                        try:
+                            from _usage_metrics import work_tokens as _calc_wt
+                            _wt = _calc_wt(usage_snap, cli=self._cli)
+                        except Exception:  # noqa: BLE001
+                            _wt = None
+                    decision = breaker.evaluate(
+                        signals=self.turn.progress_signals,
+                        progress_record=getattr(rc, "progress", None),
+                        work_tokens=_wt,
+                        extra_triggers=("no_progress",) if not stream_active else (),
+                    )
+                    record_fn = getattr(rc, "record_breaker", None)
+                    if callable(record_fn):
+                        record_fn(decision)
+                    if isinstance(decision, dict) and decision.get("enforced"):
+                        if decision.get("action") == "steer":
+                            rc.attention_required = True
+                except Exception:  # noqa: BLE001
+                    pass
+            enforced_stop = bool(
+                (breaker is not None and getattr(breaker, "mode", None) == "enforce"
+                 and getattr(breaker, "level", None) == "stopped")
+                or ((breaker is None or getattr(breaker, "mode", None) == "enforce")
+                    and getattr(rc, "breaker_stopped", False))
+            )
+            enforced_constrain = bool(
+                (breaker is not None and getattr(breaker, "mode", None) == "enforce"
+                 and getattr(breaker, "level", None) == "constrained")
+                or ((breaker is None or getattr(breaker, "mode", None) == "enforce")
+                    and getattr(rc, "constrained", False))
+            )
+            if enforced_stop or enforced_constrain:
+                stage = "breaker_stopped" if enforced_stop else "breaker_constrained"
+                raise _AcpTimeout(f"ACP turn stopped by {stage}",
+                                  stage=stage, error_kind=stage)
+        elif breaker is not None:
+            if getattr(breaker, "mode", None) == "enforce":
+                lvl = getattr(breaker, "level", None)
+                if lvl in ("constrained", "stopped"):
+                    stage = f"breaker_{lvl}"
+                    raise _AcpTimeout(f"ACP turn stopped by {stage}",
+                                      stage=stage, error_kind=stage)
 
     # -- IO ---------------------------------------------------------------
 
@@ -295,6 +412,12 @@ class _AcpClient:
                     self._pending.pop(rid, None)
                 raise _AcpError(
                     f"{method} deadline check failed ({type(e).__name__})") from e
+            try:
+                self._poll_breaker()
+            except _AcpTimeout:
+                with self._id_lock:
+                    self._pending.pop(rid, None)
+                raise
             if time.monotonic() >= deadline:
                 break
         if not slot["event"].is_set():
@@ -336,6 +459,7 @@ class _AcpClient:
             title = update.get("title") or update.get("toolCallId") or "?"
             status = update.get("status") or ""
             self.turn.add_diag(f"tool_call {title} {status}".strip())
+            self.turn.record_tool_update(update)
         elif kind in ("plan", "agent_thought_chunk", "available_commands_update",
                       "current_mode_update"):
             self.turn.add_diag(f"{kind} received")
@@ -633,16 +757,72 @@ def call(inv, timeout_ms: int, *, launch_control=None) -> dict:
     # human diagnostics here: appending another unit to the rich int produced
     # the unhelpful ``360000msms`` timeout report in the field.
     timeout_budget_ms = int(timeout_ms)
-    deadline = time.monotonic() + timeout_budget_ms / 1000
+    runtime_control = None
+    breaker = None
+    try:
+        from _job_control import RuntimeControl
+        runtime_control = RuntimeControl.from_environment(
+            timeout_budget_ms,
+            attempt_id=getattr(inv, "attempt_id", None),
+            attempt_kind=getattr(inv, "attempt_kind", "initial"),
+            attempt_ordinal=getattr(inv, "attempt_ordinal", 1),
+        )
+    except Exception:  # noqa: BLE001
+        runtime_control = None
+    if runtime_control is not None:
+        try:
+            from _breaker import (
+                GraduatedBreaker,
+                allow_stop_from_environment,
+                max_work_tokens_from_environment,
+                mode_from_environment as _breaker_mode_from_environment,
+            )
+            _bmode = _breaker_mode_from_environment()
+            if _bmode != "off":
+                breaker = GraduatedBreaker(
+                    mode=_bmode,
+                    allow_stop=allow_stop_from_environment(),
+                    max_work_tokens=max_work_tokens_from_environment(),
+                    clock=getattr(runtime_control, "clock", time.monotonic),
+                )
+        except Exception:  # noqa: BLE001
+            breaker = None
+
+    def _attach_control_projections(resp: dict) -> dict:
+        if breaker is not None:
+            try:
+                resp["breaker"] = breaker.projection()
+            except Exception:  # noqa: BLE001
+                pass
+        if runtime_control is not None:
+            try:
+                resp["runtime_control"] = runtime_control.projection()
+            except Exception:  # noqa: BLE001
+                pass
+        if client.turn.progress_signals is not None:
+            try:
+                resp["progress_signals"] = client.turn.progress_signals.snapshot()
+            except Exception:  # noqa: BLE001
+                pass
+        return resp
+
+    hard_budget_ms = (runtime_control.max_runtime_ms
+                      if runtime_control is not None else timeout_budget_ms)
+    deadline = time.monotonic() + hard_budget_ms / 1000
     client = _AcpClient(
         process, inv.permission,
         cancelled=(launch_control.is_cancelled if launch_control is not None else None),
         deadline_reached=(launch_control.is_deadline_reached
                           if launch_control is not None else None),
-        max_frame_bytes=_MAX_ACP_FRAME_BYTES)
+        max_frame_bytes=_MAX_ACP_FRAME_BYTES,
+        breaker=breaker,
+        runtime_control=runtime_control,
+        cli=cli)
     stage = "initialize"
     try:
         def _remaining() -> float:
+            if runtime_control is not None:
+                return runtime_control.hard_deadline - runtime_control.clock()
             return deadline - time.monotonic()
 
         # 1. Handshake. No fs/terminal capability: agents then use their own
@@ -765,27 +945,33 @@ def call(inv, timeout_ms: int, *, launch_control=None) -> dict:
                       if client.stderr_lines else [])
         if raw:
             resp["_debug_raw"] = "\n".join(raw)
-        return resp
+        return _attach_control_projections(resp)
 
-    except _AcpTimeout:
-        text, diag, _ = client.turn.snapshot()
+    except _AcpTimeout as e:
+        eff_stage = getattr(e, "stage", None) or stage
+        err_kind = getattr(e, "error_kind", None)
+        text, diag, usage = client.turn.snapshot()
         resp = {
             "result": text,
             "exit_code": 124,
             "status": "partial" if text else "error",
             "cli": cli,
-            "error": f"timed out after {timeout_budget_ms}ms over ACP during {stage}"
+            "error": f"timed out after {timeout_budget_ms}ms over ACP during {eff_stage}"
                      + ("; partial output preserved" if text else ""),
             "normalization_reason": ("timed out; partial output preserved" if text
                                      else "timed out before any usable output"),
-            "timeout": {"budget_ms": timeout_budget_ms, "stage": stage,
+            "timeout": {"budget_ms": timeout_budget_ms, "stage": eff_stage,
                         "partial_output": bool(text)},
         }
+        if err_kind:
+            resp["error_kind"] = err_kind
+        if usage:
+            resp["usage"] = usage
         raw = diag + (["", "# stderr"] + client.stderr_lines
                       if client.stderr_lines else [])
         if raw:
             resp["_debug_raw"] = "\n".join(raw)
-        return resp
+        return _attach_control_projections(resp)
     except _AcpPayloadTooLarge as e:
         _, diag, _ = client.turn.snapshot()
         resp = _err(cli, 1, str(e), diag or None,
@@ -793,12 +979,13 @@ def call(inv, timeout_ms: int, *, launch_control=None) -> dict:
         resp["provider_contacted"] = True
         resp["submission_state"] = "indeterminate"
         resp["transport_budget"] = e.budget
-        return resp
+        return _attach_control_projections(resp)
     except _AcpError as e:
         _, diag, _ = client.turn.snapshot()
         tail = "\n".join(client.stderr_lines[-20:])
-        return _err(cli, 1, f"{e}" + (f" | stderr tail: {tail[:400]}" if tail else ""),
-                    diag or None)
+        return _attach_control_projections(
+            _err(cli, 1, f"{e}" + (f" | stderr tail: {tail[:400]}" if tail else ""),
+                 diag or None))
     finally:
         # Premortem T4: NEVER wait on natural process exit after the turn ends —
         # ACP agents stay alive for the next prompt. Close stdin, then kill the

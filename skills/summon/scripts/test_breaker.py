@@ -436,3 +436,330 @@ def test_drive_process_loop_breaker_shadow_vs_enforce(tmp_path: Path, monkeypatc
     assert steers["steering"][0]["message"] == _breaker.fixed_steering_message(
         ["tool_loop", "error_storm", "no_progress"]
     )
+
+
+def test_replayed_constrained_or_stopped_terminates_immediately(tmp_path: Path, monkeypatch):
+    """Finding 1: Replayed breaker constraints from control log immediately terminate a fresh attempt."""
+    root, job_id, nonce = _prepared_job(tmp_path, job_id="d" * 32)
+    b = _breaker.GraduatedBreaker(mode="enforce", allow_stop=True)
+    d1 = b.evaluate(extra_triggers=("tool_loop",))
+    _job_control.queue_breaker_transition(root, job_id, d1)
+    d2 = b.evaluate(extra_triggers=("tool_loop",))
+    _job_control.queue_breaker_transition(root, job_id, d2)
+    assert d2["to_level"] == "constrained"
+
+    clock = FakeClock(initial=time.monotonic())
+    events = queue.Queue()
+
+    class Stuck:
+        returncode = None
+        killed = False
+        stdout = None
+        stderr = None
+
+        def poll(self):
+            return -9 if self.killed else None
+
+        def terminate(self):
+            pass
+
+    monkeypatch.setattr(_executor, "_spawn_reader", lambda _p: events)
+    monkeypatch.setattr(
+        _executor, "_kill_tree",
+        lambda t: (setattr(t, "killed", True), setattr(t, "returncode", -9)),
+    )
+    monkeypatch.setattr(_executor, "_drain_to_eof", lambda _q: None)
+    monkeypatch.setattr(_executor, "_safe_communicate", lambda _p, timeout=1.0: (None, ""))
+
+    control = _job_control.RuntimeControl(
+        path=_job_control.control_path(root, job_id),
+        heartbeat=_job_control.heartbeat_path(root, job_id),
+        job_id=job_id,
+        nonce=nonce,
+        checkpoint_ms=60_000,
+        max_runtime_ms=600_000,
+        clock=clock,
+        wall_clock=time.time,
+    )
+    tracker = _liveness.LivenessTracker(
+        attempt_id="att-replay-1",
+        overall_ms=3_600_000,
+        first_event_ms=60_000,
+        idle_ms=3_600_000,
+    )
+    processor = _stream.StreamProcessor(event_observer=tracker.emitter(), cli="codex")
+    processor.breaker = _breaker.GraduatedBreaker(mode="enforce", clock=clock)
+
+    stuck_proc = Stuck()
+    # Notice clock has NOT advanced to checkpoint_ms (60_000) — it is at t=0!
+    resp = _executor._drive_process_loop(
+        stuck_proc,
+        "codex",
+        60_000,
+        processor,
+        parse_stream=True,
+        liveness=tracker,
+        runtime_control=control,
+    )
+    assert stuck_proc.killed is True
+    assert resp["timeout"]["stage"] == "breaker_constrained"
+    assert resp["error_kind"] == "breaker_constrained"
+    assert processor.breaker.level == "constrained"
+
+
+def test_acp_client_polls_breaker_and_stops_on_enforced_constrain(tmp_path: Path):
+    """Finding 2: ACP client evaluates breaker and aborts with breaker_constrained when enforced."""
+    root, job_id, nonce = _prepared_job(tmp_path, job_id="e" * 32)
+    b_init = _breaker.GraduatedBreaker(mode="enforce")
+    _job_control.queue_breaker_transition(root, job_id, b_init.evaluate(extra_triggers=("tool_loop",)))
+    _job_control.queue_breaker_transition(root, job_id, b_init.evaluate(extra_triggers=("tool_loop",)))
+
+    clock = FakeClock(initial=100.0)
+    control = _job_control.RuntimeControl(
+        path=_job_control.control_path(root, job_id),
+        heartbeat=_job_control.heartbeat_path(root, job_id),
+        job_id=job_id,
+        nonce=nonce,
+        checkpoint_ms=60_000,
+        max_runtime_ms=600_000,
+        clock=clock,
+        wall_clock=time.time,
+    )
+    breaker = _breaker.GraduatedBreaker(mode="enforce", clock=clock)
+    r_fd, w_fd = io.pipe() if hasattr(io, "pipe") else __import__("os").pipe()
+    import os
+    stdout_r = os.fdopen(r_fd, "r", encoding="utf-8")
+    stdout_w = os.fdopen(w_fd, "w", encoding="utf-8")
+    try:
+        fake_proc = SimpleNamespace(
+            stdin=io.StringIO(),
+            stdout=stdout_r,
+            stderr=io.StringIO(""),
+        )
+        client = _acpbackend._AcpClient(
+            fake_proc,
+            "yolo",
+            breaker=breaker,
+            runtime_control=control,
+            cli="gemini",
+        )
+        with pytest.raises(_acpbackend._AcpTimeout) as exc_info:
+            client.request("session/prompt", {"sessionId": "s1", "prompt": []}, timeout=5.0)
+        assert exc_info.value.stage == "breaker_constrained"
+        assert exc_info.value.error_kind == "breaker_constrained"
+        assert breaker.level == "constrained"
+    finally:
+        stdout_w.close()
+        stdout_r.close()
+
+
+def test_live_work_tokens_tracks_mid_turn_claude_and_codex_events():
+    """Finding 3: StreamProcessor.live_work_tokens tracks mid-turn Claude assistant and Codex progress usage."""
+    # 1. Claude assistant streaming with deduplication by message id
+    claude_proc = _stream.StreamProcessor(cli="claude")
+    assert claude_proc.live_work_tokens(cli="claude") is None
+    claude_proc.process_line(json.dumps({
+        "type": "assistant",
+        "message": {
+            "id": "msg_01",
+            "usage": {"input_tokens": 400, "output_tokens": 100, "cache_read_input_tokens": 5000},
+        },
+    }))
+    # Duplicate chunk for same message id updates in-place rather than double-counting
+    claude_proc.process_line(json.dumps({
+        "type": "assistant",
+        "message": {
+            "id": "msg_01",
+            "usage": {"input_tokens": 400, "output_tokens": 250, "cache_read_input_tokens": 5000},
+        },
+    }))
+    claude_proc.process_line(json.dumps({
+        "type": "assistant",
+        "message": {
+            "id": "msg_02",
+            "usage": {"input_tokens": 500, "output_tokens": 300, "cache_read_input_tokens": 6000},
+        },
+    }))
+    wt_claude = claude_proc.live_work_tokens(cli="claude")
+    assert wt_claude is not None
+    # (400 + 250) + (500 + 300) = 1450 work tokens (cache_read excluded)
+    assert wt_claude["work_tokens"] == 1450
+
+    # 2. Codex mid-turn token_count event before turn.completed
+    codex_proc = _stream.StreamProcessor(cli="codex")
+    codex_proc.process_line(json.dumps({"type": "thread.started", "thread_id": "t-1"}))
+    codex_proc.process_line(json.dumps({
+        "type": "token_count",
+        "info": {
+            "total_token_usage": {
+                "input_tokens": 2000,
+                "cached_input_tokens": 1500,
+                "output_tokens": 300,
+            }
+        },
+    }))
+    wt_codex = codex_proc.live_work_tokens(cli="codex")
+    assert wt_codex is not None
+    # (2000 - 1500) + 300 = 800 work tokens
+    assert wt_codex["work_tokens"] == 800
+
+
+def test_huge_int_usage_does_not_overflow_or_disable_other_breaker_triggers():
+    """Finding 4: Oversized int usage (10**1000) returns None cleanly without OverflowError."""
+    from _usage_metrics import work_tokens
+    res = work_tokens({"input_tokens": 10**1000, "output_tokens": 50}, cli="claude")
+    assert res["evidence"] == "incomplete"
+    assert res["work_tokens"] is None
+
+
+def test_shadow_progress_pending_tool_does_not_inject_false_no_progress(tmp_path: Path, monkeypatch):
+    """Finding 5: Shadow ProgressJudge with judged_active=True (pending tool) does not trigger no_progress."""
+    import _progress_signals
+    root, job_id, nonce = _prepared_job(tmp_path, job_id="1" * 32)
+    clock = FakeClock(initial=time.monotonic())
+    control = _job_control.RuntimeControl(
+        path=_job_control.control_path(root, job_id),
+        heartbeat=_job_control.heartbeat_path(root, job_id),
+        job_id=job_id,
+        nonce=nonce,
+        checkpoint_ms=60_000,
+        max_runtime_ms=600_000,
+        clock=clock,
+        wall_clock=time.time,
+    )
+    judge = _progress_judge.ProgressJudge(
+        checkpoint_ms=60_000, mode="shadow", fingerprint_fn=lambda _c: "same"
+    )
+    signals = _progress_signals.ProgressSignals(clock=clock)
+    signals.tool_call("bash", {"cmd": "sleep 70"})
+    signals.tool_started("call-1")
+    # Stream is quiet (stream_active=False), but pending_tools=1 makes judged_active=True.
+    # Because judge is in shadow mode, checkpoint_active (legacy) is False!
+    checkpoint_active, progress_rec = judge.judge(stream_active=False, signals=signals)
+    assert checkpoint_active is False
+    assert progress_rec["judged_active"] is True
+
+    control.progress = progress_rec
+    breaker = _breaker.GraduatedBreaker(mode="enforce", clock=clock)
+    _extra = ("no_progress",) if getattr(control, "progress", None) is None and not checkpoint_active else ()
+    decision = breaker.evaluate(
+        signals=signals,
+        progress_record=control.progress,
+        extra_triggers=_extra,
+    )
+    assert decision["to_level"] == "healthy"
+    assert decision["signals"] == ["clean_checkpoint"]
+
+
+def test_breaker_log_rejects_invalid_ladder_jumps_and_unauthorized_stops(tmp_path: Path, monkeypatch):
+    """Finding 6: Authenticated breaker logs reject non-adjacent jumps, recovery from stopped, or unauthorized stop."""
+    root, job_id, nonce = _prepared_job(tmp_path, job_id="2" * 32)
+    cpath = _job_control.control_path(root, job_id)
+
+    def _write_single_cmd(cmd_body: dict):
+        cmd = dict(cmd_body)
+        cmd["generation"] = 1
+        cmd["action"] = "breaker"
+        cmd["queued_at"] = time.time()
+        cmd["auth"] = _job_control.command_auth(nonce, job_id, cmd)
+        payload = {
+            "schema": "summon.job-control/v2",
+            "job_id": job_id,
+            "generation": 1,
+            "commands": [cmd],
+        }
+        _jobs._atomic_write_json(cpath, payload)
+
+    # 1. Non-adjacent jump healthy -> constrained is rejected
+    _write_single_cmd({
+        "from_level": "healthy",
+        "to_level": "constrained",
+        "signals": ["tool_loop"],
+        "mode": "enforce",
+    })
+    assert _job_control.control_summary(root, job_id)["integrity"] == "untrusted"
+
+    # 2. Escalation healthy -> steering with ["clean_checkpoint"] is rejected
+    msg = _breaker.fixed_steering_message(["clean_checkpoint"])
+    _write_single_cmd({
+        "from_level": "healthy",
+        "to_level": "steering",
+        "signals": ["clean_checkpoint"],
+        "mode": "enforce",
+        "message": msg,
+        "message_sha256": hashlib.sha256(msg.encode("utf-8")).hexdigest(),
+    })
+    assert _job_control.control_summary(root, job_id)["integrity"] == "untrusted"
+
+    # 3. Transition to stopped without allow_stop enabled in environment is rejected
+    monkeypatch.delenv("SUMMON_BREAKER_ALLOW_STOP", raising=False)
+    b = _breaker.GraduatedBreaker(mode="enforce", allow_stop=True)
+    # Remove any bad control file first
+    Path(cpath).unlink(missing_ok=True)
+    _job_control.queue_breaker_transition(root, job_id, b.evaluate(extra_triggers=("tool_loop",)))
+    _job_control.queue_breaker_transition(root, job_id, b.evaluate(extra_triggers=("tool_loop",)))
+    _job_control.queue_breaker_transition(root, job_id, b.evaluate(extra_triggers=("tool_loop",)))
+    # When SUMMON_BREAKER_ALLOW_STOP is not set, validating the log for general consumption rejects the stop!
+    assert _job_control.control_summary(root, job_id)["integrity"] == "untrusted"
+    monkeypatch.setenv("SUMMON_BREAKER_ALLOW_STOP", "1")
+    assert _job_control.control_summary(root, job_id)["integrity"] == "authenticated"
+
+
+def test_rollback_detection_survives_runtime_control_restart(tmp_path: Path):
+    """Finding 7: Deleting or truncating control.json after seal/heartbeat marks control_untrusted across restart."""
+    root, job_id, nonce = _prepared_job(tmp_path, job_id="3" * 32)
+    cpath = _job_control.control_path(root, job_id)
+    hbpath = _job_control.heartbeat_path(root, job_id)
+
+    b = _breaker.GraduatedBreaker(mode="enforce")
+    d1 = b.evaluate(extra_triggers=("tool_loop",))
+    _job_control.queue_breaker_transition(root, job_id, d1)
+    d2 = b.evaluate(extra_triggers=("tool_loop",))
+    _job_control.queue_breaker_transition(root, job_id, d2)
+
+    rc1 = _job_control.RuntimeControl(
+        path=cpath,
+        heartbeat=hbpath,
+        job_id=job_id,
+        nonce=nonce,
+        checkpoint_ms=60_000,
+        max_runtime_ms=600_000,
+    )
+    rc1.refresh(force=True)
+    assert rc1.generation == 2
+    assert rc1.constrained is True
+    assert Path(cpath + ".seal").is_file()
+
+    # Now simulate rollback: truncate control.json back to generation 1 (only steering)
+    raw = _jobs.read_json(cpath)
+    raw["commands"] = raw["commands"][:1]
+    raw["generation"] = 1
+    _jobs._atomic_write_json(cpath, raw)
+
+    # New RuntimeControl instance (simulating process restart) loads .seal and detects rollback!
+    rc2 = _job_control.RuntimeControl(
+        path=cpath,
+        heartbeat=hbpath,
+        job_id=job_id,
+        nonce=nonce,
+        checkpoint_ms=60_000,
+        max_runtime_ms=600_000,
+    )
+    rc2.refresh(force=True)
+    assert rc2.control_untrusted is True
+    assert rc2.constrained is True
+
+    # Deleting control.json altogether after generation > 0 also marks control_untrusted!
+    Path(cpath).unlink(missing_ok=True)
+    rc3 = _job_control.RuntimeControl(
+        path=cpath,
+        heartbeat=hbpath,
+        job_id=job_id,
+        nonce=nonce,
+        checkpoint_ms=60_000,
+        max_runtime_ms=600_000,
+    )
+    rc3.refresh(force=True)
+    assert rc3.control_untrusted is True
+    assert rc3.constrained is True
+

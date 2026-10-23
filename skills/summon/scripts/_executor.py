@@ -3975,6 +3975,13 @@ def _drive_process_loop(
                 checkpoint_active = stream_active
                 judge = getattr(processor, "progress_judge", None)
                 breaker = getattr(processor, "breaker", None)
+                if breaker is not None:
+                    try:
+                        sync_fn = getattr(breaker, "sync_from_control", None)
+                        if callable(sync_fn):
+                            sync_fn(runtime_control)
+                    except Exception:  # noqa: BLE001
+                        pass
                 due_fn = getattr(runtime_control, "checkpoint_due", None)
                 until_fn = getattr(runtime_control, "ms_until_checkpoint", None)
                 is_due = bool(callable(due_fn) and due_fn())
@@ -3997,14 +4004,27 @@ def _drive_process_loop(
                 breaker_decision = None
                 if breaker is not None and is_due:
                     try:
-                        from _usage_metrics import work_tokens as _calc_work_tokens
-                        _wt = (_calc_work_tokens(processor.usage, cli=cli)
-                               if getattr(processor, "usage", None) else None)
+                        _wt = None
+                        try:
+                            live_wt_fn = getattr(processor, "live_work_tokens", None)
+                            if callable(live_wt_fn):
+                                _wt = live_wt_fn(cli=cli)
+                            elif getattr(processor, "usage", None):
+                                from _usage_metrics import work_tokens as _calc_work_tokens
+                                _wt = _calc_work_tokens(processor.usage, cli=cli)
+                        except Exception:  # noqa: BLE001 - isolate usage failure from other breaker signals
+                            _wt = None
+                        _prog_rec = getattr(runtime_control, "progress", None)
+                        _extra = (
+                            ("no_progress",)
+                            if _prog_rec is None and not checkpoint_active
+                            else ()
+                        )
                         breaker_decision = breaker.evaluate(
                             signals=getattr(processor, "progress_signals", None),
-                            progress_record=getattr(runtime_control, "progress", None),
+                            progress_record=_prog_rec,
                             work_tokens=_wt,
-                            extra_triggers=("no_progress",) if not checkpoint_active else (),
+                            extra_triggers=_extra,
                         )
                         record_fn = getattr(runtime_control, "record_breaker", None)
                         if callable(record_fn):
@@ -4012,20 +4032,33 @@ def _drive_process_loop(
                     except Exception:  # noqa: BLE001
                         breaker_decision = None
                 if isinstance(breaker_decision, dict) and breaker_decision.get("enforced"):
-                    _b_action = breaker_decision.get("action")
-                    if _b_action == "steer":
+                    if breaker_decision.get("action") == "steer":
                         runtime_control.attention_required = True
-                    elif _b_action in {"constrain", "stop"} and not saw_terminal:
-                        _b_stage = f"breaker_{breaker_decision.get('to_level')}"
-                        runtime_control.publish(liveness.snapshot())
-                        _kill_tree(process)
-                        _drain_to_eof(line_q)
-                        _safe_communicate(process)
-                        timed = _timeout_payload(cli, processor, timeout_ms, stdout_lines,
-                                                 stage=_b_stage,
-                                                 elapsed_ms=_elapsed_ms())
-                        timed["error_kind"] = _b_stage
-                        return timed
+                _enforced_stop = bool(
+                    (isinstance(breaker_decision, dict)
+                     and breaker_decision.get("enforced")
+                     and breaker_decision.get("action") == "stop")
+                    or ((breaker is None or getattr(breaker, "mode", None) == "enforce")
+                        and getattr(runtime_control, "breaker_stopped", False))
+                )
+                _enforced_constrain = bool(
+                    (isinstance(breaker_decision, dict)
+                     and breaker_decision.get("enforced")
+                     and breaker_decision.get("action") == "constrain")
+                    or ((breaker is None or getattr(breaker, "mode", None) == "enforce")
+                        and getattr(runtime_control, "constrained", False))
+                )
+                if not saw_terminal and (_enforced_stop or _enforced_constrain):
+                    _b_stage = "breaker_stopped" if _enforced_stop else "breaker_constrained"
+                    runtime_control.publish(liveness.snapshot())
+                    _kill_tree(process)
+                    _drain_to_eof(line_q)
+                    _safe_communicate(process)
+                    timed = _timeout_payload(cli, processor, timeout_ms, stdout_lines,
+                                             stage=_b_stage,
+                                             elapsed_ms=_elapsed_ms())
+                    timed["error_kind"] = _b_stage
+                    return timed
                 runtime_control.publish(liveness.snapshot())
                 if runtime_control.cancel_requested and not saw_terminal:
                     if liveness_emitter is not None:

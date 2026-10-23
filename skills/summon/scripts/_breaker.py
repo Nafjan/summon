@@ -231,6 +231,47 @@ class GraduatedBreaker:
         self.last = decision
         return decision
 
+    def sync_from_control(self, control: object) -> None:
+        """Restore breaker state from a replayed RuntimeControl log."""
+        if control is None:
+            return
+        ctrl_level = getattr(control, "breaker_level", None)
+        ctrl_transitions = getattr(control, "breaker_transitions", 0)
+        if not isinstance(ctrl_transitions, int) or isinstance(ctrl_transitions, bool):
+            ctrl_transitions = 0
+        if ctrl_level not in LEVELS:
+            return
+        if ctrl_transitions > self.transitions or ctrl_level != self.level:
+            prev = self.level
+            self.level = ctrl_level
+            self.transitions = max(self.transitions, ctrl_transitions)
+            action = (
+                "stop" if ctrl_level == "stopped"
+                else "constrain" if ctrl_level == "constrained"
+                else "steer" if ctrl_level == "steering"
+                else "none"
+            )
+            self.last = {
+                "schema": SCHEMA,
+                "mode": self.mode,
+                "allow_stop": self.allow_stop,
+                "from_level": prev,
+                "to_level": ctrl_level,
+                "level": ctrl_level,
+                "transitioned": ctrl_level != prev,
+                "escalated": LEVELS.index(ctrl_level) > LEVELS.index(prev),
+                "recovered": LEVELS.index(ctrl_level) < LEVELS.index(prev),
+                "action": action,
+                "enforced": bool(self.mode == "enforce" and action != "none"),
+                "signals": ["no_progress"] if ctrl_level != "healthy" else ["clean_checkpoint"],
+                "transitions": self.transitions,
+                "checkpoints": self.checkpoints,
+                "compaction_grace": self.in_compaction_grace(),
+                "constrained_permission": (
+                    "read-only" if ctrl_level == "constrained" else None
+                ),
+            }
+
     def effective_permission(self, base_permission: str) -> str:
         """Clamp live permission when the breaker enforces ``constrained``."""
         if self.mode == "enforce" and self.level in {"constrained", "stopped"}:

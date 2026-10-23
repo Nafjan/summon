@@ -187,6 +187,89 @@ def command_auth(nonce: str, job_id: str, command: dict) -> str:
     return _auth(nonce, f"summon-job-control/v2:{job_id}", command)
 
 
+def _seal_path(path: str) -> str:
+    return path + ".seal"
+
+
+def _write_control_seal(path: str, job_id: str, nonce: str, *,
+                        generation: int, digests: dict[int, str],
+                        constrained: bool, breaker_stopped: bool,
+                        cancel_requested: bool, breaker_level: str,
+                        breaker_transitions: int) -> None:
+    """Persist an authenticated high-water mark so rollback is detected across restarts."""
+    if generation < 1:
+        return
+    ordered = {str(k): digests[k] for k in sorted(digests)
+               if isinstance(k, int) and 1 <= k <= generation and _is_sha256(digests[k])}
+    if len(ordered) != generation:
+        return
+    body = {
+        "kind": "control_seal_v1",
+        "job_id": job_id,
+        "generation": generation,
+        "digests": ordered,
+        "constrained": bool(constrained),
+        "breaker_stopped": bool(breaker_stopped),
+        "cancel_requested": bool(cancel_requested),
+        "breaker_level": str(breaker_level),
+        "breaker_transitions": int(breaker_transitions),
+    }
+    payload = dict(body)
+    payload["auth"] = _auth(nonce, f"summon-job-control-seal/v1:{job_id}", body)
+    try:
+        _write_control_json(_seal_path(path), payload)
+    except OSError:
+        pass
+
+
+def _load_control_seal(path: str, job_id: str, nonce: str) -> tuple[dict | None, str]:
+    """Return ``(seal_dict, state)`` where state is ``_OK``, ``_MISSING``, or ``_CORRUPT``."""
+    data, state = _read_control_json(_seal_path(path))
+    if state != _jobs._OK:
+        return None, state
+    if not isinstance(data, dict):
+        return None, _jobs._CORRUPT
+    expected_keys = {
+        "kind", "job_id", "generation", "digests", "constrained",
+        "breaker_stopped", "cancel_requested", "breaker_level",
+        "breaker_transitions", "auth",
+    }
+    if set(data) != expected_keys or data.get("kind") != "control_seal_v1":
+        return None, _jobs._CORRUPT
+    if data.get("job_id") != job_id or not _is_sha256(data.get("auth")):
+        return None, _jobs._CORRUPT
+    gen = data.get("generation")
+    digests = data.get("digests")
+    if (not isinstance(gen, int) or isinstance(gen, bool)
+            or not (1 <= gen <= MAX_COMMANDS)
+            or not isinstance(digests, dict) or len(digests) != gen):
+        return None, _jobs._CORRUPT
+    parsed_digests: dict[int, str] = {}
+    for idx in range(1, gen + 1):
+        val = digests.get(str(idx))
+        if not _is_sha256(val):
+            return None, _jobs._CORRUPT
+        parsed_digests[idx] = val
+    for bkey in ("constrained", "breaker_stopped", "cancel_requested"):
+        if not isinstance(data.get(bkey), bool):
+            return None, _jobs._CORRUPT
+    transitions = data.get("breaker_transitions")
+    if not isinstance(transitions, int) or isinstance(transitions, bool) or transitions < 0:
+        return None, _jobs._CORRUPT
+    if not isinstance(data.get("breaker_level"), str):
+        return None, _jobs._CORRUPT
+    body = {k: v for k, v in data.items() if k != "auth"}
+    try:
+        expected_auth = _auth(nonce, f"summon-job-control-seal/v1:{job_id}", body)
+    except (TypeError, ValueError, OverflowError, UnicodeError):
+        return None, _jobs._CORRUPT
+    if not hmac.compare_digest(data["auth"], expected_auth):
+        return None, _jobs._CORRUPT
+    out = dict(body)
+    out["parsed_digests"] = parsed_digests
+    return out, _jobs._OK
+
+
 def _is_finite_number(value) -> bool:
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         return False
@@ -277,6 +360,8 @@ def _valid_command_shape(command: dict, *, authenticated: bool) -> bool:
         if not authenticated:
             return False
         expected.update({"from_level", "to_level", "signals", "mode"})
+        if command.get("to_level") == "stopped":
+            expected.add("allow_stop")
         if "message" in command or "message_sha256" in command:
             if command.get("to_level") != "steering":
                 return False
@@ -312,6 +397,7 @@ def _valid_command_shape(command: dict, *, authenticated: bool) -> bool:
     elif action == "breaker":
         try:
             from _breaker import (LEVELS as _BREAKER_LEVELS,
+                                  TRIGGER_SIGNALS as _TRIGGER_SIGNALS,
                                   fixed_steering_message as _fixed_steer,
                                   normalize_signals as _norm_signals)
         except Exception:
@@ -322,12 +408,28 @@ def _valid_command_shape(command: dict, *, authenticated: bool) -> bool:
         signals = command.get("signals")
         if (from_level not in _BREAKER_LEVELS
                 or to_level not in _BREAKER_LEVELS
+                or from_level == "stopped"
                 or from_level == to_level
                 or mode not in {"shadow", "enforce"}
                 or not isinstance(signals, list)
                 or not (1 <= len(signals) <= 8)
                 or signals != _norm_signals(signals)):
             return False
+        from_idx = _BREAKER_LEVELS.index(from_level)
+        to_idx = _BREAKER_LEVELS.index(to_level)
+        if abs(to_idx - from_idx) != 1:
+            return False
+        escalating = to_idx > from_idx
+        if escalating:
+            if not all(s in _TRIGGER_SIGNALS for s in signals):
+                return False
+            if to_level == "steering" and "message" not in command:
+                return False
+            if to_level == "stopped" and command.get("allow_stop") is not True:
+                return False
+        else:
+            if signals != ["clean_checkpoint"] or "message" in command:
+                return False
         if "message" in command:
             message = command.get("message")
             expected_msg = _fixed_steer(signals)
@@ -345,7 +447,8 @@ def _valid_command_shape(command: dict, *, authenticated: bool) -> bool:
     return not authenticated or _is_sha256(command.get("auth"))
 
 
-def _validated_commands(data: dict, job_id: str, nonce: str):
+def _validated_commands(data: dict, job_id: str, nonce: str, *,
+                        allow_stop: bool | None = None):
     """Return ``(commands, integrity)`` or ``(None, 'untrusted')``.
 
     V2 is accepted only after exact schema, generation, command shape, and HMAC
@@ -376,9 +479,24 @@ def _validated_commands(data: dict, job_id: str, nonce: str):
             or len(commands) > MAX_COMMANDS
             or not _valid_command_log(commands, generation)):
         return None, "untrusted"
+    if allow_stop is None:
+        try:
+            from _breaker import allow_stop_from_environment
+            effective_allow_stop = allow_stop_from_environment()
+        except Exception:
+            effective_allow_stop = False
+    else:
+        effective_allow_stop = bool(allow_stop)
+    expected_breaker_from = "healthy"
     for command in commands:
         if not _valid_command_shape(command, authenticated=authenticated):
             return None, "untrusted"
+        if command.get("action") == "breaker":
+            if command.get("from_level") != expected_breaker_from:
+                return None, "untrusted"
+            if command.get("to_level") == "stopped" and not effective_allow_stop:
+                return None, "untrusted"
+            expected_breaker_from = command["to_level"]
         if authenticated:
             body = {key: value for key, value in command.items() if key != "auth"}
             try:
@@ -543,9 +661,18 @@ def _append_breaker_command(path: str, job_id: str, nonce: str,
     mode = decision.get("mode")
     signals = normalize_signals(decision.get("signals"))
     if (from_level not in _BREAKER_LEVELS or to_level not in _BREAKER_LEVELS
+            or from_level == "stopped"
             or from_level == to_level or mode not in {"shadow", "enforce"}
             or not signals):
         raise ValueError("breaker transition decision is malformed")
+    from_idx = _BREAKER_LEVELS.index(from_level)
+    to_idx = _BREAKER_LEVELS.index(to_level)
+    if abs(to_idx - from_idx) != 1:
+        raise ValueError("breaker transition must be single-step adjacent")
+    escalating = to_idx > from_idx
+    allow_stop = bool(decision.get("allow_stop"))
+    if to_level == "stopped" and not allow_stop:
+        raise ValueError("breaker stop transition requires allow_stop=True")
     now_fn = wall_clock or time.time
     with _exclusive_control_lock(path):
         existing, state = _jobs._read(path)
@@ -557,7 +684,8 @@ def _append_breaker_command(path: str, job_id: str, nonce: str,
         elif existing.get("schema") == "summon.job-control/v1":
             raise ValueError(
                 "legacy job control cannot be upgraded while its job is live")
-        commands, integrity = _validated_commands(existing, job_id, nonce)
+        commands, integrity = _validated_commands(
+            existing, job_id, nonce, allow_stop=allow_stop or None)
         if commands is None or integrity != "authenticated":
             raise ValueError("job control identity mismatch")
         if len(commands) >= MAX_COMMANDS:
@@ -575,12 +703,16 @@ def _append_breaker_command(path: str, job_id: str, nonce: str,
             "signals": signals[:8],
             "mode": mode,
         }
-        if to_level == "steering":
+        if to_level == "stopped":
+            command["allow_stop"] = True
+        if to_level == "steering" and escalating:
             msg = fixed_steering_message(signals[:8])
             command["message"] = msg
             command["message_sha256"] = hashlib.sha256(
                 msg.encode("utf-8")).hexdigest()
         command["auth"] = command_auth(nonce, job_id, command)
+        if not _valid_command_shape(command, authenticated=True):
+            raise ValueError("breaker transition command failed validation")
         commands.append(command)
         existing["generation"] = generation
         _write_control_json(path, existing)
@@ -781,6 +913,54 @@ class RuntimeControl:
         self.breaker_transitions: int = 0
         self.constrained: bool = False
         self.breaker_stopped: bool = False
+        self._sealed_generation: int = 0
+        self._load_prior_high_water()
+
+    def _load_prior_high_water(self) -> None:
+        """Restore committed high-water marks so control rollback across restarts fails closed."""
+        seal, seal_state = _load_control_seal(self.path, self.job_id, self.nonce)
+        if seal_state == _jobs._CORRUPT:
+            self.control_untrusted = True
+            return
+        if seal_state == _jobs._OK and isinstance(seal, dict):
+            self._sealed_generation = int(seal["generation"])
+            self._command_digests.update(seal["parsed_digests"])
+            if seal.get("constrained"):
+                self.constrained = True
+            if seal.get("breaker_stopped"):
+                self.breaker_stopped = True
+            if seal.get("cancel_requested"):
+                self.cancel_requested = True
+            if isinstance(seal.get("breaker_level"), str):
+                self.breaker_level = seal["breaker_level"]
+            if isinstance(seal.get("breaker_transitions"), int):
+                self.breaker_transitions = seal["breaker_transitions"]
+        # Cross-check authenticated prior heartbeat if available.
+        hb, hb_state = _read_control_json(self.heartbeat)
+        if hb_state == _jobs._OK and isinstance(hb, dict) and hb.get("schema") == "summon.job-heartbeat/v2":
+            hb_auth = hb.get("auth")
+            hb_body = {k: v for k, v in hb.items() if k != "auth"}
+            try:
+                expected_hb_auth = heartbeat_auth(self.nonce, hb_body)
+            except (TypeError, ValueError, OverflowError, UnicodeError):
+                expected_hb_auth = None
+            if (isinstance(hb_auth, str) and expected_hb_auth is not None
+                    and hmac.compare_digest(hb_auth, expected_hb_auth)
+                    and hb.get("job_id") == self.job_id):
+                hb_gen = hb.get("control_generation")
+                if isinstance(hb_gen, int) and not isinstance(hb_gen, bool) and hb_gen > self._sealed_generation:
+                    self._sealed_generation = hb_gen
+                if hb.get("cancel_requested") is True:
+                    self.cancel_requested = True
+                if hb.get("control_untrusted") is True:
+                    self.control_untrusted = True
+                hb_breaker = hb.get("breaker")
+                if isinstance(hb_breaker, dict) and hb_breaker.get("enforced") is True:
+                    b_level = hb_breaker.get("level")
+                    if b_level == "constrained":
+                        self.constrained = True
+                    elif b_level == "stopped":
+                        self.breaker_stopped = True
 
     def checkpoint_due(self) -> bool:
         """Whether ``checkpoint`` would act now (lets callers measure lazily)."""
@@ -825,7 +1005,10 @@ class RuntimeControl:
         if state == _jobs._CORRUPT:
             self.control_untrusted = True
             return 0
+        min_expected_generation = max(self.generation, self._sealed_generation)
         if not isinstance(data, dict):
+            if min_expected_generation > 0:
+                self.control_untrusted = True
             return 0
         try:
             commands, _integrity = _validated_commands(data, self.job_id, self.nonce)
@@ -836,7 +1019,7 @@ class RuntimeControl:
             self.control_untrusted = True
             return 0
         declared_generation = data["generation"]
-        if declared_generation < self.generation:
+        if declared_generation < min_expected_generation:
             # A deleted/recreated or truncated control file must not make a
             # previously observed cancel/extend/steer disappear.
             self.control_untrusted = True
@@ -849,10 +1032,11 @@ class RuntimeControl:
             except (TypeError, ValueError, OverflowError, UnicodeError):
                 self.control_untrusted = True
                 return 0
+            known_digest = self._command_digests.get(generation)
+            if known_digest is not None and known_digest != command_digest:
+                self.control_untrusted = True
+                return 0
             if generation <= self.generation:
-                if self._command_digests.get(generation) != command_digest:
-                    self.control_untrusted = True
-                    return 0
                 continue
             pending.append((command, command_digest))
 
@@ -913,6 +1097,18 @@ class RuntimeControl:
                             self.constrained = False
             self.generation = generation
             self._command_digests[generation] = command_digest
+        if self.generation > self._sealed_generation:
+            self._sealed_generation = self.generation
+            _write_control_seal(
+                self.path, self.job_id, self.nonce,
+                generation=self.generation,
+                digests=self._command_digests,
+                constrained=self.constrained,
+                breaker_stopped=self.breaker_stopped,
+                cancel_requested=self.cancel_requested,
+                breaker_level=self.breaker_level,
+                breaker_transitions=self.breaker_transitions,
+            )
         if added:
             self.extension_ms += added
             self.attention_required = False

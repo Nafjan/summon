@@ -259,6 +259,49 @@ class StreamProcessor:
         self.last_request_usage = None   # latest ROOT per-request usage (not cumulative)
         self.last_request_model = None
         self.context_window = None       # provider-reported window for that model, if any
+        self._live_claude_usage: dict[str, dict] = {}
+        self._live_claude_anon_seq: int = 0
+
+    def live_work_tokens(self, cli: str | None = None) -> dict | None:
+        """Return deduplicated live or terminal work-token accounting, if available."""
+        from _usage_metrics import work_tokens as _calc_work_tokens
+        effective_cli = cli or self._declared_cli
+        if effective_cli is None:
+            if self.is_codex:
+                effective_cli = "codex"
+            elif self.is_gemini:
+                effective_cli = "gemini"
+            elif self.is_agy:
+                effective_cli = "agy"
+            elif self.is_opencode:
+                effective_cli = "opencode"
+            elif self.is_kimi:
+                effective_cli = "kimi"
+            elif self._claude_session_id or self._live_claude_usage:
+                effective_cli = "claude"
+        best_tokens: int | None = None
+        best_record: dict | None = None
+        for usage_obj in (self.usage, self.progress_usage):
+            if isinstance(usage_obj, dict):
+                rec = _calc_work_tokens(usage_obj, cli=effective_cli)
+                wt = rec.get("work_tokens")
+                if isinstance(wt, int) and not isinstance(wt, bool):
+                    if best_tokens is None or wt > best_tokens:
+                        best_tokens = wt
+                        best_record = rec
+        if self._live_claude_usage:
+            claude_sum = 0
+            claude_any = False
+            for u in self._live_claude_usage.values():
+                rec = _calc_work_tokens(u, cli="claude")
+                wt = rec.get("work_tokens")
+                if isinstance(wt, int) and not isinstance(wt, bool):
+                    claude_sum += wt
+                    claude_any = True
+            if claude_any and (best_tokens is None or claude_sum > best_tokens):
+                best_tokens = claude_sum
+                best_record = {"work_tokens": claude_sum, "evidence": "derived"}
+        return best_record
 
     def _signal_tool(self, name, payload, call_id=None) -> None:
         try:
@@ -536,6 +579,15 @@ class StreamProcessor:
                 and self._declared_cli in (None, "claude")):
             message = data["message"]
             content = message.get("content")
+            if isinstance(message.get("usage"), dict):
+                msg_id = message.get("id")
+                if isinstance(msg_id, str) and msg_id.strip():
+                    msg_key = msg_id.strip()
+                else:
+                    self._live_claude_anon_seq += 1
+                    msg_key = f"_anon_{self._live_claude_anon_seq}"
+                if msg_key in self._live_claude_usage or len(self._live_claude_usage) < 4096:
+                    self._live_claude_usage[msg_key] = message["usage"]
             if data.get("parent_tool_use_id") is None and isinstance(message.get("usage"), dict):
                 # Per-request usage of the root conversation: the context-occupancy
                 # input. Sub-agent requests have their own, separate windows.
@@ -602,8 +654,27 @@ class StreamProcessor:
                 except Exception:
                     pass
 
+        if self.is_codex and data.get("type") in {"token_count", "event_msg"}:
+            info = data.get("info") if isinstance(data.get("info"), dict) else {}
+            payload = data.get("payload") if isinstance(data.get("payload"), dict) else {}
+            p_info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
+            mid_usage = (
+                data.get("usage")
+                or info.get("total_token_usage")
+                or p_info.get("total_token_usage")
+                or payload.get("usage")
+            )
+            if isinstance(mid_usage, dict):
+                self.progress_usage = mid_usage
+                self._liveness("stream_event", data)
+                return False
+
         if self.is_codex and data.get("type") == "item.completed":
+            if isinstance(data.get("usage"), dict):
+                self.progress_usage = data["usage"]
             item = data.get("item", {})
+            if isinstance(item, dict) and isinstance(item.get("usage"), dict):
+                self.progress_usage = item["usage"]
             if item.get("type") == "agent_message" and isinstance(item.get("text"), str):
                 self.codex_messages.append(item["text"])
                 self._liveness("output_text", data,

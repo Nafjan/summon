@@ -54,7 +54,9 @@ _MAX_TOKENS = (1 << 53) - 1
 def _number(value) -> int | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    if not math.isfinite(value) or value < 0 or value > _MAX_TOKENS:
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if value < 0 or value > _MAX_TOKENS:
         return None
     return int(value)
 
