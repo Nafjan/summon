@@ -14,6 +14,7 @@ import copy
 from contextlib import contextmanager
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -185,6 +186,61 @@ def _redacted_bounded_text(value: Any, label: str) -> str:
     return _redact_text(_bounded_text(value, label))
 
 
+_BREAKER_TELEMETRY_LEVELS = frozenset({"healthy", "steering", "constrained", "stopped"})
+_TURN_TELEMETRY_KEYS = frozenset({
+    "work_tokens",
+    "context_occupancy_ratio",
+    "breaker_level",
+    "breaker_enforced",
+    "handoff_triggered",
+})
+
+
+def _validate_turn_telemetry_summary(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ConversationError("invalid turn telemetry summary")
+    raw = dict(value)
+    if set(raw) - _TURN_TELEMETRY_KEYS:
+        raise ConversationError("invalid turn telemetry summary")
+    work_tokens = raw.get("work_tokens")
+    if work_tokens is not None and (
+        not isinstance(work_tokens, int)
+        or isinstance(work_tokens, bool)
+        or not 0 <= work_tokens <= 10**12
+    ):
+        raise ConversationError("invalid turn telemetry summary")
+    ratio = raw.get("context_occupancy_ratio")
+    norm_ratio: float | None = None
+    if ratio is not None:
+        if (
+            not isinstance(ratio, (int, float))
+            or isinstance(ratio, bool)
+            or not math.isfinite(float(ratio))
+            or not 0.0 <= float(ratio) <= 10.0
+        ):
+            raise ConversationError("invalid turn telemetry summary")
+        norm_ratio = round(float(ratio), 6)
+    breaker_level = raw.get("breaker_level")
+    if breaker_level is not None and (
+        not isinstance(breaker_level, str)
+        or breaker_level not in _BREAKER_TELEMETRY_LEVELS
+    ):
+        raise ConversationError("invalid turn telemetry summary")
+    breaker_enforced = raw.get("breaker_enforced", False)
+    if not isinstance(breaker_enforced, bool):
+        raise ConversationError("invalid turn telemetry summary")
+    handoff_triggered = raw.get("handoff_triggered", False)
+    if not isinstance(handoff_triggered, bool):
+        raise ConversationError("invalid turn telemetry summary")
+    return {
+        "work_tokens": work_tokens,
+        "context_occupancy_ratio": norm_ratio,
+        "breaker_level": breaker_level,
+        "breaker_enforced": breaker_enforced,
+        "handoff_triggered": handoff_triggered,
+    }
+
+
 def _project_participant(value: Mapping[str, Any]) -> dict[str, str]:
     if not isinstance(value, Mapping) or len(value) > 16:
         raise ConversationError("invalid participant")
@@ -331,7 +387,7 @@ def _public_payload(event_type: str, payload: Mapping[str, Any]) -> dict[str, An
             keys += ("status", "provider", "model_target", "model_served", "permission",
                      "transport", "prompt_sha256", "result_sha256", "prompt_chars", "resumed",
                      "refusal_reason", "context_policy", "context_selected_count",
-                     "context_omitted_count", "turn_economics_summary")
+                     "context_omitted_count", "turn_economics_summary", "turn_telemetry_summary")
         for key in keys:
             value = data.get(key)
             if key.endswith("_sha256"):
@@ -386,6 +442,10 @@ def _public_payload(event_type: str, payload: Mapping[str, Any]) -> dict[str, An
                     out[key] = _conversation_economics.validate_public_summary(value)
                 except _conversation_economics.TurnEconomicsError as exc:
                     raise ConversationError("invalid turn economics summary") from exc
+            elif key == "turn_telemetry_summary":
+                if value is None:
+                    continue
+                out[key] = _validate_turn_telemetry_summary(value)
             elif value is not None:
                 if key in {"turn_id", "participant", "asker", "target", "command_id"}:
                     out[key] = _safe_id(value, key)

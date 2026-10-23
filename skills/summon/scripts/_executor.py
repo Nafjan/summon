@@ -4136,6 +4136,15 @@ def _drive_process_loop(
                     or ((breaker is None or getattr(breaker, "mode", None) == "enforce")
                         and getattr(runtime_control, "constrained", False))
                 )
+                try:
+                    live_wt_fn = getattr(processor, "live_work_tokens", None)
+                    if callable(live_wt_fn):
+                        runtime_control.usage_metrics = live_wt_fn(cli=cli)
+                    live_occ_fn = getattr(processor, "live_context_occupancy", None)
+                    if callable(live_occ_fn):
+                        runtime_control.context_occupancy = live_occ_fn(cli=cli)
+                except Exception:  # noqa: BLE001 - advisory telemetry only
+                    pass
                 if not saw_terminal and (_enforced_stop or _enforced_constrain):
                     _b_stage = "breaker_stopped" if _enforced_stop else "breaker_constrained"
                     runtime_control.publish(liveness.snapshot())

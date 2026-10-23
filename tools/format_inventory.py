@@ -1329,6 +1329,8 @@ _add("usage-metrics", "summon.usage-metrics/v1",
      fixtures=[_test("long_horizon_signals", "test_claude_shape_excludes_cache_reads_from_work_tokens"),
                _test("long_horizon_signals", "test_openai_shape_subtracts_cached_input_that_is_already_inside_input")],
      gaps=["Derived work tokens are advisory accounting projections, not provider billing invoices or spend authorization."])
+next(item for item in _FORMATS if item["id"] == "usage-metrics")["readers"].append(
+    _ref("_job_control", "_sanitize_usage_metrics"))
 _add("context-occupancy", "summon.context-occupancy/v1",
      _ref("_usage_metrics", "context_occupancy"),
      _ref("_executor", "_enrich"),
@@ -1337,6 +1339,8 @@ _add("context-occupancy", "summon.context-occupancy/v1",
      fixtures=[_test("long_horizon_signals", "test_claude_context_occupancy_counts_cache_reads"),
                _test("long_horizon_signals", "test_absent_last_request_yields_absent_occupancy")],
      gaps=["Occupancy is derived from reported single-request input usage and declared window size; absent provider fields remain unestablished."])
+next(item for item in _FORMATS if item["id"] == "context-occupancy")["readers"].append(
+    _ref("_job_control", "_sanitize_context_occupancy"))
 _add("progress-signals", "summon.progress-signals/v1",
      _ref("_progress_signals", "ProgressSignals.snapshot"),
      _ref("_executor", "_enrich"),
@@ -1413,6 +1417,13 @@ next(item for item in _FORMATS if item["id"] == "context-handoff")["readers"].ex
     _ref("_job_control", "public_heartbeat"),
     _ref("_executor", "_enrich"),
 ])
+_add("jobs-watch", "summon.jobs-watch/v1",
+     _ref("_background", "watch_jobs_snapshot"),
+     _ref("_background", "render_jobs_watch"),
+     authority="public_projection",
+     shape=["schema", "job_dir", "observed_at", "count", "active_count", "jobs"],
+     fixtures=[_test("job_control", "test_watch_jobs_snapshot_projects_authenticated_telemetry_and_rejects_tampered_heartbeat")],
+     gaps=["Watch snapshots are read-only operator projections of background job status and authenticated heartbeats; they confer no execution or continuation authority."])
 
 FORMAT_INVENTORY = {"schema": SCHEMA, "version": VERSION, "formats": _FORMATS}
 

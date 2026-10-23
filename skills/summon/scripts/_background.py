@@ -15,6 +15,7 @@ import copy
 import hashlib
 import hmac
 import json
+import math
 import os
 import shutil
 import stat
@@ -834,6 +835,31 @@ def run_jobs_query(args, emit_error, *, entry_path: str | None = None,
         else:
             print(render_jobs(root, rows))
         return 0
+    if getattr(args, "jobs_watch", False):
+        active_only = bool(getattr(args, "jobs_active_only", False))
+        once = bool(getattr(args, "jobs_watch_once", False))
+        interval = float(getattr(args, "jobs_watch_interval", 2.0) or 2.0)
+        if not math.isfinite(interval) or not 0.1 <= interval <= 3600.0:
+            emit_error("jobs watch interval must be between 0.1s and 3600s")
+            return 1
+        is_tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
+        if args.json or once or not is_tty:
+            snapshot = watch_jobs_snapshot(root, active_only=active_only)
+            if args.json:
+                print(json.dumps(snapshot, ensure_ascii=False))
+            else:
+                print(render_jobs_watch(snapshot))
+            return 0
+        try:
+            while True:
+                snapshot = watch_jobs_snapshot(root, active_only=active_only)
+                sys.stdout.write("\x1b[2J\x1b[H" + render_jobs_watch(snapshot) + "\n")
+                sys.stdout.flush()
+                if snapshot["active_count"] == 0:
+                    return 0
+                time.sleep(interval)
+        except KeyboardInterrupt:
+            return 0
     if args.jobs_status:
         try:
             st = _jobs.job_status(root, args.jobs_status)
@@ -849,44 +875,10 @@ def run_jobs_query(args, emit_error, *, entry_path: str | None = None,
         except (TypeError, ValueError):
             private_result_binding = None
         try:
-            from _job_control import (control_summary, heartbeat_auth,
-                                      heartbeat_path, legacy_heartbeat_auth,
-                                      public_heartbeat)
+            from _job_control import control_summary
             st["control"] = control_summary(root, args.jobs_status)
-            heartbeat, _state = _jobs._read(heartbeat_path(root, args.jobs_status))
             record = st.get("record") if isinstance(st.get("record"), dict) else {}
-            record_nonce = record.get("nonce")
-            auth_ok = False
-            if isinstance(heartbeat, dict) and isinstance(record_nonce, str) and record_nonce:
-                schema = heartbeat.get("schema")
-                auth_value = str(heartbeat.get("auth") or "").encode("utf-8")
-                if schema == "summon.job-heartbeat/v2":
-                    body = {key: value for key, value in heartbeat.items()
-                            if key != "auth"}
-                    expected_auth = heartbeat_auth(
-                        record_nonce, body).encode("ascii")
-                    auth_ok = hmac.compare_digest(auth_value, expected_auth)
-                elif schema == "summon.job-heartbeat/v1":
-                    expected_auth = legacy_heartbeat_auth(
-                        record_nonce, args.jobs_status).encode("ascii")
-                    auth_ok = hmac.compare_digest(auth_value, expected_auth)
-                # Immutable v1 jobs launched by Summon <=3.2.1 wrote the nonce
-                # directly. Accept that legacy shape only for v1 so a v2
-                # payload can never bypass its full-body MAC.
-                if schema == "summon.job-heartbeat/v1":
-                    auth_ok = auth_ok or hmac.compare_digest(
-                        str(heartbeat.get("nonce") or "").encode("utf-8"),
-                        record_nonce.encode("utf-8"))
-            if (not isinstance(heartbeat, dict)
-                    or heartbeat.get("job_id") != args.jobs_status
-                    or not auth_ok):
-                st["heartbeat"] = None
-            else:
-                st["heartbeat"] = public_heartbeat(
-                    heartbeat,
-                    "payload_authenticated"
-                    if heartbeat.get("schema") == "summon.job-heartbeat/v2"
-                    else "legacy_unverified")
+            st["heartbeat"] = _read_authenticated_heartbeat(root, args.jobs_status, record)
             if isinstance(st.get("record"), dict):
                 st["record"] = {key: value for key, value in st["record"].items()
                                 if key != "nonce"}
@@ -1090,6 +1082,224 @@ def run_jobs_query(args, emit_error, *, entry_path: str | None = None,
         return 1
     print(json.dumps(result, ensure_ascii=False))
     return 0 if result.get("status") == "success" else 1
+
+
+def _read_authenticated_heartbeat(root: str, job_id: str,
+                                  record: dict | None) -> dict | None:
+    """Verify and project a job's heartbeat against its private record nonce."""
+    try:
+        from _job_control import (heartbeat_auth, heartbeat_path,
+                                  legacy_heartbeat_auth, public_heartbeat)
+        heartbeat, _state = _jobs._read(heartbeat_path(root, job_id))
+        record_nonce = record.get("nonce") if isinstance(record, dict) else None
+        auth_ok = False
+        if isinstance(heartbeat, dict) and isinstance(record_nonce, str) and record_nonce:
+            schema = heartbeat.get("schema")
+            auth_value = str(heartbeat.get("auth") or "").encode("utf-8")
+            if schema == "summon.job-heartbeat/v2":
+                body = {key: value for key, value in heartbeat.items()
+                        if key != "auth"}
+                expected_auth = heartbeat_auth(record_nonce, body).encode("ascii")
+                auth_ok = hmac.compare_digest(auth_value, expected_auth)
+            elif schema == "summon.job-heartbeat/v1":
+                expected_auth = legacy_heartbeat_auth(
+                    record_nonce, job_id).encode("ascii")
+                auth_ok = hmac.compare_digest(auth_value, expected_auth)
+            if schema == "summon.job-heartbeat/v1":
+                auth_ok = auth_ok or hmac.compare_digest(
+                    str(heartbeat.get("nonce") or "").encode("utf-8"),
+                    record_nonce.encode("utf-8"))
+        if (not isinstance(heartbeat, dict)
+                or heartbeat.get("job_id") != job_id
+                or not auth_ok):
+            return None
+        return public_heartbeat(
+            heartbeat,
+            "payload_authenticated"
+            if heartbeat.get("schema") == "summon.job-heartbeat/v2"
+            else "legacy_unverified",
+        )
+    except (OSError, TypeError, ValueError, OverflowError, UnicodeError):
+        return None
+
+
+def watch_jobs_snapshot(root: str, *, active_only: bool = False) -> dict:
+    """Return a redacted, HMAC-verified operator snapshot of background jobs."""
+    rows = _jobs.list_jobs(root)
+    if active_only:
+        rows = [row for row in rows if row.get("state") in ("running", "prepared")]
+    watched = []
+    active_count = 0
+    for row in rows:
+        jid = row.get("job_id")
+        if not isinstance(jid, str) or not _jobs.valid_job_id(jid):
+            continue
+        try:
+            st = _jobs.job_status(root, jid)
+        except (OSError, ValueError):
+            st = None
+        if not isinstance(st, dict):
+            continue
+        raw_record = st.get("record") if isinstance(st.get("record"), dict) else {}
+        hb = _read_authenticated_heartbeat(root, jid, raw_record)
+        pub = _jobs.public_job_status(dict(st))
+        state = str(pub.get("state") or row.get("state") or "unknown")
+        if state in ("running", "prepared"):
+            active_count += 1
+        trusted = bool(pub.get("trusted"))
+        res = pub.get("result") if (trusted and isinstance(pub.get("result"), dict)) else {}
+        rec = pub.get("record") if isinstance(pub.get("record"), dict) else {}
+        agent = res.get("agent") or rec.get("agent") or row.get("agent")
+        cli = res.get("cli") or rec.get("cli")
+        hb_live = (
+            hb.get("liveness")
+            if isinstance(hb, dict) and isinstance(hb.get("liveness"), dict)
+            else {}
+        )
+        res_live = res.get("liveness") if isinstance(res.get("liveness"), dict) else {}
+        phase = str(hb_live.get("phase") or res_live.get("phase") or state)
+        elapsed_ms = None
+        if isinstance(hb, dict) and isinstance(hb.get("job_elapsed_ms"), int):
+            elapsed_ms = hb["job_elapsed_ms"]
+        elif isinstance(hb_live.get("elapsed_ms"), int):
+            elapsed_ms = hb_live["elapsed_ms"]
+        elif isinstance(res.get("elapsed_ms"), int) and not isinstance(res.get("elapsed_ms"), bool):
+            elapsed_ms = res["elapsed_ms"]
+        elif isinstance(res_live.get("elapsed_ms"), int) and not isinstance(res_live.get("elapsed_ms"), bool):
+            elapsed_ms = res_live["elapsed_ms"]
+        hb_breaker = (
+            hb.get("breaker")
+            if isinstance(hb, dict) and isinstance(hb.get("breaker"), dict)
+            else {}
+        )
+        res_breaker = res.get("breaker") if isinstance(res.get("breaker"), dict) else {}
+        if not res_breaker and isinstance(res.get("runtime_control"), dict):
+            rc_breaker = res["runtime_control"].get("breaker")
+            if isinstance(rc_breaker, dict):
+                res_breaker = rc_breaker
+        breaker_level = hb_breaker.get("level") or res_breaker.get("level")
+        breaker_mode = hb_breaker.get("mode") or res_breaker.get("mode")
+        hb_occ = (
+            hb.get("context_occupancy")
+            if isinstance(hb, dict) and isinstance(hb.get("context_occupancy"), dict)
+            else {}
+        )
+        hb_handoff = (
+            hb.get("context_handoff")
+            if isinstance(hb, dict) and isinstance(hb.get("context_handoff"), dict)
+            else {}
+        )
+        res_occ = res.get("context_occupancy") if isinstance(res.get("context_occupancy"), dict) else {}
+        context_ratio = None
+        for candidate_ratio in (hb_occ.get("ratio"), hb_handoff.get("ratio"), res_occ.get("ratio")):
+            if (isinstance(candidate_ratio, (int, float))
+                    and not isinstance(candidate_ratio, bool)
+                    and math.isfinite(candidate_ratio)):
+                context_ratio = float(candidate_ratio)
+                break
+        hb_prog = (
+            hb.get("progress")
+            if isinstance(hb, dict) and isinstance(hb.get("progress"), dict)
+            else {}
+        )
+        res_prog = res.get("progress_judgement") if isinstance(res.get("progress_judgement"), dict) else {}
+        progress_reason = hb_prog.get("reason") or res_prog.get("reason")
+        hb_um = (
+            hb.get("usage_metrics")
+            if isinstance(hb, dict) and isinstance(hb.get("usage_metrics"), dict)
+            else {}
+        )
+        res_um = res.get("usage_metrics") if isinstance(res.get("usage_metrics"), dict) else {}
+        work_tokens = None
+        for candidate_wt in (hb_um.get("work_tokens"), res_um.get("work_tokens")):
+            if isinstance(candidate_wt, int) and not isinstance(candidate_wt, bool) and candidate_wt >= 0:
+                work_tokens = candidate_wt
+                break
+        rc_proj = res.get("runtime_control") if isinstance(res.get("runtime_control"), dict) else {}
+        attention_required = bool(
+            (hb.get("attention_required") if isinstance(hb, dict) else False)
+            or rc_proj.get("attention_required")
+        )
+        sub_sum = res.get("submission_summary") if isinstance(res.get("submission_summary"), dict) else {}
+        unknown_spend = bool(
+            sub_sum.get("unknown_spend")
+            or state in ("running", "unverified", "stale")
+        )
+        raw_cost = res.get("cost_usd")
+        cost_usd = (
+            float(raw_cost)
+            if (isinstance(raw_cost, (int, float))
+                and not isinstance(raw_cost, bool)
+                and math.isfinite(raw_cost)
+                and raw_cost >= 0.0)
+            else None
+        )
+        watched.append({
+            "job_id": jid,
+            "state": state,
+            "trusted": trusted,
+            "agent": agent if isinstance(agent, str) else None,
+            "cli": cli if isinstance(cli, str) else None,
+            "phase": phase,
+            "elapsed_ms": elapsed_ms,
+            "breaker_level": breaker_level if isinstance(breaker_level, str) else None,
+            "breaker_mode": breaker_mode if isinstance(breaker_mode, str) else None,
+            "context_ratio": context_ratio,
+            "progress_reason": progress_reason if isinstance(progress_reason, str) else None,
+            "work_tokens": work_tokens,
+            "attention_required": attention_required,
+            "unknown_spend": unknown_spend,
+            "cost_usd": cost_usd,
+            "heartbeat_authenticated": hb is not None,
+        })
+    return {
+        "schema": "summon.jobs-watch/v1",
+        "job_dir": root,
+        "observed_at": time.time(),
+        "count": len(watched),
+        "active_count": active_count,
+        "jobs": watched,
+    }
+
+
+def render_jobs_watch(snapshot: dict) -> str:
+    """ASCII table of watched jobs with breaker, context%, progress, and work tokens."""
+    jobs = snapshot.get("jobs") if isinstance(snapshot.get("jobs"), list) else []
+    lines = [
+        f"job dir: {snapshot.get('job_dir', '?')}  (active: {snapshot.get('active_count', 0)}/{len(jobs)})",
+        "  JOB_ID        STATE           AGENT             PHASE         ELAPSED   BREAKER       CTX%    PROGRESS                  WORK_TOK    SPEND",
+    ]
+    if not jobs:
+        lines.append("  (no matching background jobs)")
+        return "\n".join(lines)
+    for item in jobs:
+        jid = str(item.get("job_id") or "?")[:12]
+        state = str(item.get("state") or "?")[:14]
+        if item.get("attention_required"):
+            state = (state[:12] + " !")
+        agent = str(item.get("agent") or "?")[:16]
+        phase = str(item.get("phase") or "?")[:12]
+        elapsed_ms = item.get("elapsed_ms")
+        elapsed_str = f"{elapsed_ms / 1000.0:.1f}s" if isinstance(elapsed_ms, int) else "-"
+        breaker = str(item.get("breaker_level") or "-")[:12]
+        ctx_ratio = item.get("context_ratio")
+        ctx_str = f"{ctx_ratio * 100.0:.0f}%" if isinstance(ctx_ratio, (int, float)) else "-"
+        progress = str(item.get("progress_reason") or "-")[:24]
+        wt = item.get("work_tokens")
+        wt_str = str(wt) if isinstance(wt, int) else "-"
+        cost = item.get("cost_usd")
+        if isinstance(cost, (int, float)):
+            spend_str = f"${cost:.4f}" + ("?" if item.get("unknown_spend") else "")
+        elif item.get("unknown_spend"):
+            spend_str = "unknown"
+        else:
+            spend_str = "settled"
+        lines.append(
+            f"  {jid:<12}  {state:<14}  {agent:<16}  {phase:<12}  "
+            f"{elapsed_str:<8}  {breaker:<12}  {ctx_str:<6}  {progress:<24}  "
+            f"{wt_str:<10}  {spend_str}"
+        )
+    return "\n".join(lines)
 
 
 def render_jobs(root: str, rows: list) -> str:

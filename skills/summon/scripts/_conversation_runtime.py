@@ -43,6 +43,7 @@ from _conversation import (  # noqa: E402
     _sha256,
     _safe_id,
     _safe_display,
+    _validate_turn_telemetry_summary,
     continuation_decision,
 )
 from _builder import clamp_permission  # noqa: E402
@@ -71,6 +72,56 @@ PROCESS_RECORD_SCHEMA_VERSION = 2
 SUPPORTED_PROCESS_RECORD_SCHEMA_VERSIONS = frozenset({1, PROCESS_RECORD_SCHEMA_VERSION})
 _STATUS_VALUES = frozenset({"success", "partial", "blocked", "error", "cancelled", "timeout"})
 _PERMISSION_VALUES = frozenset({"read-only", "safe-edit", "yolo"})
+
+
+def _extract_turn_telemetry_summary(envelope: Mapping[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(envelope, Mapping):
+        return None
+    rc = envelope.get("runtime_control")
+    rc_map = rc if isinstance(rc, Mapping) else {}
+    usage = envelope.get("usage_metrics")
+    if not isinstance(usage, Mapping):
+        usage = rc_map.get("usage_metrics")
+    occ = envelope.get("context_occupancy")
+    if not isinstance(occ, Mapping):
+        occ = rc_map.get("context_occupancy")
+    breaker = envelope.get("breaker")
+    if not isinstance(breaker, Mapping):
+        breaker = rc_map.get("breaker")
+    handoff = envelope.get("context_handoff")
+    if not isinstance(handoff, Mapping):
+        handoff = rc_map.get("context_handoff")
+    work_tokens = usage.get("work_tokens") if isinstance(usage, Mapping) else None
+    ratio = occ.get("ratio") if isinstance(occ, Mapping) else None
+    breaker_level = breaker.get("level") if isinstance(breaker, Mapping) else None
+    breaker_enforced = (
+        bool(breaker.get("enforced", False))
+        if isinstance(breaker, Mapping) and isinstance(breaker.get("enforced", False), bool)
+        else False
+    )
+    handoff_triggered = (
+        bool(handoff.get("triggered", False))
+        if isinstance(handoff, Mapping) and isinstance(handoff.get("triggered", False), bool)
+        else False
+    )
+    if (
+        work_tokens is None
+        and ratio is None
+        and breaker_level is None
+        and not breaker_enforced
+        and not handoff_triggered
+    ):
+        return None
+    try:
+        return _validate_turn_telemetry_summary({
+            "work_tokens": work_tokens,
+            "context_occupancy_ratio": ratio,
+            "breaker_level": breaker_level,
+            "breaker_enforced": breaker_enforced,
+            "handoff_triggered": handoff_triggered,
+        })
+    except ConversationError:
+        return None
 
 
 class ConversationRuntimeError(ConversationError):
@@ -2318,6 +2369,9 @@ class ConversationRuntime:
                 payload["turn_economics"] = economics
             if economics_summary is not None:
                 payload["turn_economics_summary"] = economics_summary
+            telemetry_summary = _extract_turn_telemetry_summary(envelope)
+            if telemetry_summary is not None:
+                payload["turn_telemetry_summary"] = telemetry_summary
             if _valid_stored_launch_observation(launch_observation):
                 payload["launch_observation"] = dict(launch_observation)
             if refusal is not None:

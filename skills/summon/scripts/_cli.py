@@ -106,6 +106,27 @@ def parse_quorum(value: str) -> int | str:
         "quorum must be an integer, 'all', or a positive fraction such as 2/3")
 
 
+def parse_watch_interval(value: str) -> float:
+    """Parse a jobs-watch refresh interval in seconds (0.1s .. 3600s)."""
+    text = str(value).strip().lower()
+    multiplier = 1.0
+    if text.endswith("ms"):
+        text, multiplier = text[:-2].strip(), 0.001
+    elif text.endswith("s"):
+        text, multiplier = text[:-1].strip(), 1.0
+    elif text.endswith("m"):
+        text, multiplier = text[:-1].strip(), 60.0
+    try:
+        seconds = float(text) * multiplier
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"invalid watch interval {value!r}: expected seconds (0.1..3600)") from exc
+    if not math.isfinite(seconds) or not 0.1 <= seconds <= 3600.0:
+        raise argparse.ArgumentTypeError(
+            f"invalid watch interval {value!r}: must be between 0.1s and 3600s")
+    return seconds
+
+
 # --- Fan-out mode flag matrix --------------------------------------------------
 # The flags each fan-out mode actually CONSUMES. --manifest and --council branch
 # out of main() before most dispatch flags are read, so anything outside these
@@ -185,6 +206,8 @@ MODE_FLAGS = {
                    "json", "job_file"},
     # jobs read commands: registry query only.
     "jobs-list": {"jobs_list", "job_dir", "json", "job_file"},
+    "jobs-watch": {"jobs_watch", "jobs_watch_once", "jobs_watch_interval",
+                   "jobs_active_only", "job_dir", "json", "job_file"},
     "jobs-status": {"jobs_status", "job_dir", "json", "job_file"},
     "jobs-wait": {"jobs_wait", "jobs_wait_all", "jobs_wait_ids", "jobs_active_only", "job_dir", "timeout", "json", "job_file"},
     "jobs-extend": {"jobs_extend", "job_duration", "job_dir", "json", "job_file"},
@@ -269,6 +292,8 @@ MODE_HINTS = {
                    "workers or providers, and stops on Ctrl+C; inspect is read-only and "
                    "emits only bounded counts."),
     "jobs-list": ("jobs list is read-only: it takes only --job-dir and --json."),
+    "jobs-watch": ("jobs watch is read-only: it takes only --job-dir, --active-only, "
+                   "--once, --interval, and --json."),
     "jobs-status": ("jobs status is read-only: it takes only the job id, --job-dir, "
                     "and --json."),
     "jobs-wait": ("jobs wait is read-only: it takes only the job id, --job-dir, "
@@ -304,12 +329,16 @@ FLAG_NAMES = {
     "sets": "--set",
     "list_for": "--for",
     "jobs_active_only": "--active-only",
+    "jobs_watch_once": "--once",
+    "jobs_watch_interval": "--interval",
     # Never expose the private parser destination in user-facing whitelist
     # errors. It is only the rewritten representation of `dispatch --lane`.
     "fleet_dispatch_lane": "--lane",
 }  # dests whose public spelling isn't dest.replace('_','-')
 TOKEN_DESTS = {"set": "sets", "from": "bug_report_from", "for": "list_for",
                "active-only": "jobs_active_only",
+               "once": "jobs_watch_once",
+               "interval": "jobs_watch_interval",
                # private parser spelling produced only by `dispatch --lane`;
                # mapping it here makes every fan-out whitelist reject a lane
                # before entering its handler.
@@ -328,6 +357,8 @@ def fanout_mode(args: argparse.Namespace) -> str | None:
         return "manifest"
     if getattr(args, "jobs_list", None):
         return "jobs-list"
+    if getattr(args, "jobs_watch", None):
+        return "jobs-watch"
     if getattr(args, "jobs_status", None):
         return "jobs-status"
     if getattr(args, "jobs_wait", None) or getattr(args, "jobs_wait_all", False):
@@ -485,6 +516,8 @@ Commands:
   role approve ALIAS                              activate a proposed role alias
   role list|resolve ALIAS                         inspect approved/proposed aliases
   jobs list|status [ID] [--job-dir D] [--json]      inspect background jobs
+  jobs watch [--active-only] [--once] [--interval S] [--job-dir D] [--json]
+                                                  live-watch background job telemetry
   jobs wait ID [--job-dir D] [--timeout T]          wait for one background job
   worktree gc [--cwd DIR] [--base REV] [--min-age-hours N] [--apply] [--json]
                                                   reclaim clean, merged, idle agent worktrees
@@ -967,6 +1000,20 @@ def rewrite_subcommand(argv: list) -> tuple:
             return argv, "help"       # bare `summon jobs` -> usage, not a silent list
         if rest[0] == "list":
             return ["--jobs-list", *rest[1:]], None
+        if rest[0] == "watch":
+            translated = ["--jobs-watch"]
+            for tok in rest[1:]:
+                if tok in ("--active-only", "--jobs-active-only"):
+                    translated.append("--jobs-active-only")
+                elif tok in ("--once", "--jobs-watch-once"):
+                    translated.append("--jobs-watch-once")
+                elif tok == "--interval":
+                    translated.append("--jobs-watch-interval")
+                elif tok.startswith("--interval="):
+                    translated.append("--jobs-watch-interval=" + tok[len("--interval="):])
+                else:
+                    translated.append(tok)
+            return translated, None
         if rest[0] == "wait" and ("--all" in rest[1:] or "--active-only" in rest[1:] or "--jobs-active-only" in rest[1:]):
             translated = ["--jobs-wait-all"]
             idx = 1
@@ -1824,6 +1871,13 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                              "(default {tempdir}/subagents_jobs; env SUMMON_JOBS_DIR)")
     parser.add_argument("--jobs-list", dest="jobs_list", action="store_true",
                         help="List background jobs in the job dir (read-only; add --json)")
+    parser.add_argument("--jobs-watch", dest="jobs_watch", action="store_true",
+                        help="Watch background jobs with authenticated heartbeat/breaker/context telemetry")
+    parser.add_argument("--jobs-watch-once", "--once", dest="jobs_watch_once", action="store_true",
+                        help="With --jobs-watch: emit one snapshot and exit")
+    parser.add_argument("--jobs-watch-interval", "--interval", dest="jobs_watch_interval",
+                        type=parse_watch_interval, default=2.0, metavar="SECONDS",
+                        help="With --jobs-watch: poll interval in seconds (0.1..3600, default 2.0)")
     parser.add_argument("--jobs-status", dest="jobs_status", metavar="JOB_ID",
                         help="Print one background job's record + result (read-only)")
     parser.add_argument("--jobs-wait", dest="jobs_wait", metavar="JOB_ID",

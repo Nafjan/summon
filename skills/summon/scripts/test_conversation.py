@@ -716,6 +716,97 @@ class ConversationPolicyTests(unittest.TestCase):
         for forbidden in ("subprocess", "socket", "requests", "Popen", "execute_agent"):
             self.assertNotIn(forbidden, source)
 
+    def test_turn_telemetry_summary_allowlist_and_atlas_badges(self):
+        import _conversation_page
+        import _conversation_runtime
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "project"
+            project.mkdir()
+            root = Path(tmp) / "rooms"
+            room = ConversationJournal.create(
+                root, session_id="telemetry-room", project_id="summon", project_root=project,
+                initiator_host="codex", initiator_agent="sol", mode="chat",
+                participants=[{"agent": "sol", "role": "reviewer", "model": "gpt-6.1-sol"}],
+            )
+            envelope = {
+                "usage_metrics": {
+                    "schema": "summon.usage-metrics/v1",
+                    "work_tokens": 3450,
+                },
+                "context_occupancy": {
+                    "schema": "summon.context-occupancy/v1",
+                    "ratio": 0.82,
+                },
+                "breaker": {
+                    "schema": "summon.breaker/v1",
+                    "level": "steering",
+                    "enforced": True,
+                    "steering_message": "PRIVATE_STEER_MESSAGE",
+                },
+                "context_handoff": {
+                    "schema": "summon.context-handoff/v1",
+                    "triggered": True,
+                    "steering_message": "PRIVATE_HANDOFF_MESSAGE",
+                },
+            }
+            extracted = _conversation_runtime._extract_turn_telemetry_summary(envelope)
+            self.assertEqual(extracted, {
+                "work_tokens": 3450,
+                "context_occupancy_ratio": 0.82,
+                "breaker_level": "steering",
+                "breaker_enforced": True,
+                "handoff_triggered": True,
+            })
+            room.append(
+                "turn_finished",
+                actor_kind="system",
+                actor_id="owner",
+                payload={
+                    "turn_id": "turn-1",
+                    "participant": "sol",
+                    "status": "success",
+                    "model_target": "gpt-6.1-sol",
+                    "model_served": "gpt-6.1-sol",
+                    "turn_telemetry_summary": extracted,
+                },
+            )
+            events = room.events()
+            finished = events[-1]["payload"]
+            self.assertEqual(finished["turn_telemetry_summary"], extracted)
+            self.assertNotIn("PRIVATE_STEER_MESSAGE", json.dumps(events))
+
+            with self.assertRaises(ConversationError):
+                room.append(
+                    "turn_finished",
+                    actor_kind="system",
+                    actor_id="owner",
+                    payload={
+                        "turn_id": "turn-2",
+                        "participant": "sol",
+                        "status": "success",
+                        "turn_telemetry_summary": {
+                            "work_tokens": 100,
+                            "unexpected_secret": "leak",
+                        },
+                    },
+                )
+            with self.assertRaises(ConversationError):
+                room.append(
+                    "turn_finished",
+                    actor_kind="system",
+                    actor_id="owner",
+                    payload={
+                        "turn_id": "turn-3",
+                        "participant": "sol",
+                        "status": "success",
+                        "turn_telemetry_summary": {
+                            "breaker_level": "invalid-level",
+                        },
+                    },
+                )
+            self.assertIn("telemetryBadges", _conversation_page._JS)
+            self.assertIn("telemetry-badges", _conversation_page._CSS)
+
     def test_cli_subcommand_is_provider_inert_and_grouped(self):
         script = HERE / "run_subagent.py"
         with tempfile.TemporaryDirectory() as cli_tmp:

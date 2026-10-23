@@ -187,6 +187,66 @@ def public_heartbeat(value: dict, integrity: str) -> dict | None:
         context_handoff = None
     if context_handoff is not None:
         out["context_handoff"] = context_handoff
+    usage_metrics = _sanitize_usage_metrics(value.get("usage_metrics"))
+    if usage_metrics is not None:
+        out["usage_metrics"] = usage_metrics
+    context_occupancy = _sanitize_context_occupancy(value.get("context_occupancy"))
+    if context_occupancy is not None:
+        out["context_occupancy"] = context_occupancy
+    return out
+
+
+def _sanitize_usage_metrics(value: object) -> dict | None:
+    if not isinstance(value, dict) or value.get("schema") != "summon.usage-metrics/v1":
+        return None
+    out: dict = {"schema": "summon.usage-metrics/v1"}
+    for key in ("work_tokens", "input_tokens", "output_tokens",
+                "cache_read_tokens", "cache_write_tokens"):
+        item = value.get(key)
+        if item is None or (isinstance(item, int) and not isinstance(item, bool)
+                            and 0 <= item <= 2 ** 63 - 1):
+            out[key] = item
+        else:
+            return None
+    semantics = value.get("input_semantics")
+    if semantics in {"includes_cache", "excludes_cache", "unknown"}:
+        out["input_semantics"] = semantics
+    scope = value.get("observation_scope")
+    if scope is None or scope in {"attempt_total", "last_turn", "accumulated",
+                                  "unknown", "single_request"}:
+        out["observation_scope"] = scope
+    evidence = value.get("evidence")
+    if evidence in {"derived", "partial", "absent"}:
+        out["evidence"] = evidence
+    return out
+
+
+def _sanitize_context_occupancy(value: object) -> dict | None:
+    if not isinstance(value, dict) or value.get("schema") != "summon.context-occupancy/v1":
+        return None
+    out: dict = {"schema": "summon.context-occupancy/v1"}
+    for key in ("occupied_tokens", "window_tokens"):
+        item = value.get(key)
+        if item is None or (isinstance(item, int) and not isinstance(item, bool)
+                            and 0 <= item <= 2 ** 63 - 1):
+            out[key] = item
+        else:
+            return None
+    ratio = value.get("ratio")
+    if ratio is None or (isinstance(ratio, (int, float)) and not isinstance(ratio, bool)
+                         and math.isfinite(ratio) and 0.0 <= ratio <= 10.0):
+        out["ratio"] = float(ratio) if ratio is not None else None
+    else:
+        return None
+    over_window = value.get("over_window")
+    if over_window is None or isinstance(over_window, bool):
+        out["over_window"] = over_window
+    semantics = value.get("input_semantics")
+    if semantics in {"includes_cache", "excludes_cache", "unknown"}:
+        out["input_semantics"] = semantics
+    evidence = value.get("evidence")
+    if evidence in {"reported", "window_only", "occupied_only", "absent"}:
+        out["evidence"] = evidence
     return out
 
 
@@ -988,6 +1048,9 @@ class RuntimeControl:
         # Context-aware handoff state (Phase 5).
         self.context_handoff: dict | None = None
         self.handoff_triggered: bool = False
+        # Live advisory usage/context snapshots (Phase 7).
+        self.usage_metrics: dict | None = None
+        self.context_occupancy: dict | None = None
         self._sealed_generation: int = 0
         self._sealed_breaker_transitions: int = 0
         self._load_prior_high_water()
@@ -1431,6 +1494,10 @@ class RuntimeControl:
             payload["breaker"] = self.breaker
         if self.context_handoff is not None:
             payload["context_handoff"] = self.context_handoff
+        if self.usage_metrics is not None:
+            payload["usage_metrics"] = self.usage_metrics
+        if self.context_occupancy is not None:
+            payload["context_occupancy"] = self.context_occupancy
         payload["auth"] = heartbeat_auth(self.nonce, payload)
         try:
             _write_control_json(self.heartbeat, payload)

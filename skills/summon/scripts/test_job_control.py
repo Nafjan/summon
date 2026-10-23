@@ -1412,3 +1412,124 @@ def test_cancelled_is_absorbing_state():
     assert tracker.snapshot()["phase"] == "cancelled"
     emit.emit("output_text", output_chars=5)
     assert tracker.snapshot()["phase"] == "cancelled"
+
+
+def test_watch_jobs_snapshot_projects_authenticated_telemetry_and_rejects_tampered_heartbeat(
+        tmp_path, capsys):
+    root, job_id = _prepared(tmp_path)
+    record_path = _jobs.record_path(root, job_id)
+    record = _jobs.read_json(record_path)
+    record["flags"].update({"cli": "claude", "model": "claude-opus-5"})
+    _jobs._atomic_write_json(record_path, record)
+
+    monotonic = Clock()
+    wall = Clock()
+    wall.value = 25.0
+    control = _job_control.RuntimeControl(
+        path=_job_control.control_path(root, job_id),
+        heartbeat=_job_control.heartbeat_path(root, job_id),
+        job_id=job_id, nonce="nonce", checkpoint_ms=10_000,
+        max_runtime_ms=120_000, attempt_id=job_id,
+        attempt_kind="initial", attempt_ordinal=1,
+        job_started_at=10.0, clock=monotonic, wall_clock=wall)
+    control.usage_metrics = {
+        "schema": "summon.usage-metrics/v1",
+        "work_tokens": 4200,
+        "input_tokens": 5200,
+        "output_tokens": 1000,
+        "cache_read_tokens": 2000,
+        "cache_write_tokens": 0,
+        "input_semantics": "uncached_only",
+        "observation_scope": "turn_sum",
+        "evidence": "reported",
+        "secret_raw": "MUST_NOT_LEAK",
+    }
+    control.context_occupancy = {
+        "schema": "summon.context-occupancy/v1",
+        "occupied_tokens": 150000,
+        "window_tokens": 200000,
+        "ratio": 0.75,
+        "over_window": False,
+        "input_semantics": "uncached_only",
+        "evidence": "last_request_input_plus_cache",
+        "secret_raw": "MUST_NOT_LEAK",
+    }
+    control.breaker = {
+        "schema": "summon.breaker/v1",
+        "mode": "enforce",
+        "allow_stop": False,
+        "level": "steering",
+        "action": "steer",
+        "enforced": True,
+        "signals": ["tool_loop"],
+        "transitions": 1,
+        "checkpoints": 2,
+        "compaction_grace": False,
+        "steering_message": "PRIVATE_STEER_PROSE",
+    }
+    control.context_handoff = {
+        "schema": "summon.context-handoff/v1",
+        "mode": "enforce",
+        "triggered": True,
+        "newly_triggered": False,
+        "enforced": True,
+        "action": "steer_handoff",
+        "reason": "context_occupancy_threshold",
+        "evidence": "last_request_input_plus_cache",
+        "occupied_tokens": 170000,
+        "window_tokens": 200000,
+        "ratio": 0.85,
+        "threshold": 0.80,
+        "headroom_tokens": 30000,
+        "headroom_ratio": 0.15,
+        "trigger_count": 1,
+        "evaluations": 2,
+        "handoff_note_present": True,
+        "handoff_note_sha256": "e" * 64,
+        "steering_message": "PRIVATE_HANDOFF_PROSE",
+    }
+    control.publish({"phase": "generation"}, force=True)
+
+    snap = _background.watch_jobs_snapshot(root, active_only=False)
+    assert snap["schema"] == "summon.jobs-watch/v1"
+    assert snap["count"] == 1
+    row = snap["jobs"][0]
+    assert row["job_id"] == job_id
+    assert row["heartbeat_authenticated"] is True
+    assert row["work_tokens"] == 4200
+    assert row["context_ratio"] == 0.75
+    assert row["breaker_level"] == "steering"
+    assert row["breaker_mode"] == "enforce"
+    assert "MUST_NOT_LEAK" not in json.dumps(snap)
+    assert "PRIVATE_STEER_PROSE" not in json.dumps(snap)
+    assert "PRIVATE_HANDOFF_PROSE" not in json.dumps(snap)
+
+    rendered = _background.render_jobs_watch(snap)
+    assert job_id[:12] in rendered
+    assert "steering" in rendered
+    assert "75%" in rendered
+    assert "4200" in rendered
+
+    args = SimpleNamespace(
+        job_dir=root, jobs_extend=None, jobs_cancel=None, jobs_steer=None,
+        jobs_list=False, jobs_status=None, jobs_wait=None,
+        jobs_watch=True, jobs_watch_once=True, jobs_watch_interval=2.0,
+        jobs_active_only=False, json=True)
+    assert _background.run_jobs_query(args, lambda *_a, **_kw: None) == 0
+    cli_out = json.loads(capsys.readouterr().out)
+    assert cli_out["schema"] == "summon.jobs-watch/v1"
+    assert cli_out["jobs"][0]["work_tokens"] == 4200
+
+    # Tamper with heartbeat on disk: watch_jobs_snapshot must fail-closed on
+    # unauthenticated telemetry and omit unverified heartbeat fields.
+    hb_path = _job_control.heartbeat_path(root, job_id)
+    tampered = _jobs.read_json(hb_path)
+    tampered["usage_metrics"]["work_tokens"] = 999999
+    _jobs._atomic_write_json(hb_path, tampered)
+    snap_tampered = _background.watch_jobs_snapshot(root, active_only=False)
+    row_tampered = snap_tampered["jobs"][0]
+    assert row_tampered["heartbeat_authenticated"] is False
+    assert row_tampered["work_tokens"] is None
+    assert row_tampered["context_ratio"] is None
+    assert row_tampered["breaker_level"] is None
+

@@ -2262,9 +2262,10 @@ def main() -> None:
             _print_error(str(exc))
             sys.exit(1)
 
-    # jobs list/status/wait: read-only registry queries; no dispatch. Answer and
+    # jobs list/status/wait/watch: read-only registry queries; no dispatch. Answer and
     # exit before any agent/prompt/cwd validation.
-    if (args.jobs_list or args.jobs_status or args.jobs_wait
+    if (args.jobs_list or getattr(args, "jobs_watch", False)
+            or args.jobs_status or args.jobs_wait
             or getattr(args, "jobs_wait_all", False)
             or args.jobs_extend or args.jobs_cancel or args.jobs_steer
             or args.jobs_resume or getattr(args, "jobs_revalidate", None)):

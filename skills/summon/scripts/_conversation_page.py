@@ -364,6 +364,12 @@ button:focus-visible, a:focus-visible, summary:focus-visible { outline: 2px soli
 .system-proof.unsealed { color: var(--quiet); }
 .system-proof.awaiting { color: var(--blue); }
 .proof-caption { display: block; margin-top: 2px; color: var(--muted); font-size: 10px; line-height: 1.35; }
+.telemetry-badges { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 5px; }
+.telemetry-badge { display: inline-flex; align-items: center; min-height: 20px; padding: 2px 6px; border: 1px solid var(--line); border-radius: 5px; background: var(--panel-2); color: var(--muted); font: 10px ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: .04em; }
+.telemetry-badge.healthy { border-color: #4c6b59; color: var(--lime); background: #16231b; }
+.telemetry-badge.warning { border-color: #876c3a; color: var(--amber); background: var(--amber-deep); }
+.telemetry-badge.danger { border-color: #78464a; color: var(--coral); background: var(--coral-deep); }
+.telemetry-badge.neutral { border-color: #42647a; color: var(--blue); background: var(--blue-deep); }
 .turn-recovery { display: grid; gap: 8px; margin: 14px 0 0; padding: 12px; border: 1px solid #705a36; border-radius: 10px; background: #1b1814; }
 .turn-recovery[hidden] { display: none; }
 .turn-recovery strong { color: var(--amber); font-size: 12px; }
@@ -913,6 +919,30 @@ _JS = r'''(() => {
     if (target && target !== served) return {label: 'MODEL DIFFERS · ' + target + ' → ' + served, className: 'drift', caption: 'The provider reported a different model; review before continuing.', title: 'The provider-served identity differs from the roster target.'};
     return {label: 'MODEL MATCH · ' + served, className: 'matched', caption: 'The roster target and provider-served model agree.', title: 'Declared target and provider-served identity match.'};
   }
+  function telemetryBadges(payload) {
+    const summary = payload && typeof payload.turn_telemetry_summary === 'object' ? payload.turn_telemetry_summary : null;
+    if (!summary) return [];
+    const badges = [];
+    const level = typeof summary.breaker_level === 'string' ? summary.breaker_level : '';
+    if (['healthy', 'steering', 'constrained', 'stopped'].includes(level)) {
+      const cls = level === 'healthy' ? 'healthy' : (level === 'steering' ? 'warning' : 'danger');
+      badges.push({label: 'BREAKER · ' + level.toUpperCase() + (summary.breaker_enforced ? ' · ENFORCED' : ''), className: cls, title: 'Graduated circuit breaker level: ' + level});
+    }
+    const ratio = typeof summary.context_occupancy_ratio === 'number' && Number.isFinite(summary.context_occupancy_ratio) ? summary.context_occupancy_ratio : null;
+    if (ratio !== null && ratio >= 0) {
+      const pct = Math.round(ratio * 100);
+      const cls = summary.handoff_triggered || ratio >= 0.85 ? 'danger' : (ratio >= 0.70 ? 'warning' : 'healthy');
+      badges.push({label: 'CTX · ' + String(pct) + '%' + (summary.handoff_triggered ? ' · HANDOFF' : ''), className: cls, title: 'Context window occupancy: ' + String(pct) + '%'});
+    } else if (summary.handoff_triggered) {
+      badges.push({label: 'CTX · HANDOFF', className: 'danger', title: 'Context handoff threshold reached'});
+    }
+    const work = typeof summary.work_tokens === 'number' && Number.isFinite(summary.work_tokens) && summary.work_tokens >= 0 ? Math.floor(summary.work_tokens) : null;
+    if (work !== null) {
+      const fmt = work >= 1000 ? (work / 1000).toFixed(1) + 'k' : String(work);
+      badges.push({label: 'WORK · ' + fmt + ' tok', className: 'neutral', title: 'Non-cached work tokens: ' + String(work)});
+    }
+    return badges;
+  }
   function identityTooltip(participant) {
     const item = identity(participant);
     const facts = ['agent id ' + item.agent, 'role ' + item.role, 'name ' + item.name];
@@ -1110,6 +1140,14 @@ _JS = r'''(() => {
         : modelProof(payload, who);
       const proofNode = document.createElement('span'); proofNode.className = 'system-proof ' + proof.className; proofNode.title = proof.title; proofNode.append(text(proof.label)); copy.append(proofNode);
       const captionNode = document.createElement('span'); captionNode.className = 'proof-caption'; captionNode.append(text(proof.caption)); copy.append(captionNode);
+      const badges = telemetryBadges(payload);
+      if (badges.length) {
+        const badgeRow = document.createElement('div'); badgeRow.className = 'telemetry-badges'; badgeRow.setAttribute('aria-label', 'Turn telemetry');
+        badges.forEach(item => {
+          const pill = document.createElement('span'); pill.className = 'telemetry-badge ' + item.className; pill.title = item.title; pill.append(text(item.label)); badgeRow.append(pill);
+        });
+        copy.append(badgeRow);
+      }
     }
     item.dataset.cursor = String(record.cursor || ''); chip.append(mark, copy, detailFor(record)); item.append(chip); return item;
   }
