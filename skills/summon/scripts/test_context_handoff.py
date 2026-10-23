@@ -613,12 +613,17 @@ def test_round1_sol_review_regressions(tmp_path, monkeypatch):
         "state": "partial",
         "completed": [
             'token="abcd!efgh123456" and secret=\'abcdef!ghijk1234\' and password=unquoted!secret99',
+            'token=abc;defgh123456 and token=abcdef,ghijk123456 and token="esc\\"quote_tail_999" and secret=\'esc\\\'single_888\'',
         ],
     })
     assert punct_note is not None
     assert "abcd!efgh123456" not in punct_note["completed"][0]
     assert "ghijk1234" not in punct_note["completed"][0]
     assert "unquoted!secret99" not in punct_note["completed"][0]
+    assert "defgh123456" not in punct_note["completed"][1]
+    assert "ghijk123456" not in punct_note["completed"][1]
+    assert "quote_tail_999" not in punct_note["completed"][1]
+    assert "single_888" not in punct_note["completed"][1]
 
     # Codex cumulative total_token_usage without last_token_usage does NOT populate last_request_usage
     proc_codex_cum = StreamProcessor(cli="codex")
