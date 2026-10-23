@@ -130,7 +130,7 @@ def _redact_text(value: str) -> str:
     text = re.sub(r"(?<![\w])/(?:[^\r\n,;]*)", "[path]", text)
     text = re.sub(r"(?<![\w])(?:[A-Za-z0-9_.-]+/){1,}[A-Za-z0-9_.-]+", "[path]", text)
     text = re.sub(
-        r"""(?i)["']?(?:token|password|secret|api[_-]?key)["']?\s*[=:]\s*(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^\s'"<>|]+)""",
+        r"""(?i)["']?(?:token|password|secret|api[_-]?key|authorization)["']?\s*[=:]\s*(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|(?:(?:bearer|basic)\s+)?[^\s'"<>|]+)""",
         "[redacted]",
         text,
     )
@@ -550,19 +550,21 @@ def _exclusive_file_lock(lock: Path, busy_message: str):
             return False
         return True
 
+    reclaim_lock = Path(f"{lock}.reclaim")
     try:
         while fd is None:
             try:
                 fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-                marker = json.dumps({"pid": os.getpid(), "token": token,
-                                     "started_at": time.time()},
-                                    sort_keys=True, separators=(",", ":")).encode("ascii")
-                os.write(fd, marker)
+                marker_bytes = json.dumps(
+                    {"pid": os.getpid(), "token": token, "started_at": time.time()},
+                    sort_keys=True, separators=(",", ":"),
+                ).encode("ascii")
+                os.write(fd, marker_bytes)
                 try:
                     os.fsync(fd)
                 except OSError:
                     pass
-            except FileExistsError:
+            except (FileExistsError, PermissionError):
                 try:
                     observed = lock.stat()
                     if time.time() - observed.st_mtime > APPEND_LOCK_STALE_SECONDS:
@@ -571,13 +573,38 @@ def _exclusive_file_lock(lock: Path, busy_message: str):
                         owner_pid = marker.get("pid") if isinstance(marker, dict) else None
                         owner_token = marker.get("token") if isinstance(marker, dict) else None
                         if (isinstance(owner_token, str) and len(owner_token) == 32
-                                and not pid_alive(owner_pid)
-                                and lock.stat().st_mtime_ns == observed.st_mtime_ns):
+                                and not pid_alive(owner_pid)):
+                            reclaim_fd: int | None = None
                             try:
-                                lock.unlink()
-                                continue
+                                reclaim_fd = os.open(
+                                    str(reclaim_lock),
+                                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                                    0o600,
+                                )
+                                current_stat = lock.stat()
+                                current_raw = lock.read_bytes()
+                                if (current_raw == raw
+                                        and current_stat.st_mtime_ns == observed.st_mtime_ns
+                                        and time.time() - current_stat.st_mtime > APPEND_LOCK_STALE_SECONDS):
+                                    lock.unlink()
+                                    continue
+                            except (FileExistsError, PermissionError):
+                                try:
+                                    if time.time() - reclaim_lock.stat().st_mtime > APPEND_LOCK_STALE_SECONDS:
+                                        reclaim_lock.unlink()
+                                except OSError:
+                                    pass
                             except FileNotFoundError:
                                 continue
+                            finally:
+                                if reclaim_fd is not None:
+                                    try:
+                                        os.close(reclaim_fd)
+                                    finally:
+                                        try:
+                                            reclaim_lock.unlink()
+                                        except FileNotFoundError:
+                                            pass
                 except (OSError, UnicodeError, ValueError, TypeError):
                     pass
                 if time.monotonic() >= deadline:

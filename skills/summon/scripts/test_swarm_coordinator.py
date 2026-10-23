@@ -1043,7 +1043,7 @@ class SwarmCoordinatorTests(unittest.TestCase):
             request_sha256=self.request,
             question=(
                 r'Which schema for C:\private\repo with api_key=sk-1234567890abcdef1234 '
-                r'and {"password": "secret meadow 42"}?'
+                r'and {"password": "secret meadow 42", "authorization": "Basic short123"}?'
             ),
             reason="needs_schema_decision",
         )
@@ -1055,11 +1055,13 @@ class SwarmCoordinatorTests(unittest.TestCase):
         self.assertNotIn(r"C:\private\repo", task_view["human_question"])
         self.assertNotIn("sk-1234567890abcdef1234", task_view["human_question"])
         self.assertNotIn("secret meadow 42", task_view["human_question"])
+        self.assertNotIn("Basic short123", task_view["human_question"])
         events = self.coordinator.events()
         self.assertEqual(events[-1]["event"], "human_question")
         self.assertIn("question", events[-1])
         self.assertNotIn("sk-1234567890abcdef1234", json_text(events[-1]))
         self.assertNotIn("secret meadow 42", json_text(events[-1]))
+        self.assertNotIn("Basic short123", json_text(events[-1]))
 
         # Human operator authorizes retry after answering question
         recovered = self.coordinator.resolve_blocked(
@@ -1073,6 +1075,12 @@ class SwarmCoordinatorTests(unittest.TestCase):
             "worker-a", task_id="task-a", claim_id=claim_retry["claim_id"],
             attempt=claim_retry["attempt"], lease_generation=claim_retry["lease_generation"],
             request_sha256=self.request, envelope_sha256="e" * 64)
+        self.assertEqual(self.coordinator.status()["tasks"][0]["status"], "completed")
+        # Delayed recovery after a later attempt completed cannot reopen the task
+        with self.assertRaises(SwarmConflictError):
+            self.coordinator.resolve_blocked(
+                "task-a", allow_retry=True, reason="delayed duplicate approval",
+                human_confirmed=True)
         self.assertEqual(self.coordinator.status()["tasks"][0]["status"], "completed")
 
         # Also test direct block() helper on a second run

@@ -824,7 +824,7 @@ def _bounded_reason(value: Any, label: str = "reason") -> str:
     text = re.sub(r"(?<![\w])/(?:[^\r\n,;]*)", "[path]", text)
     text = re.sub(r"(?<![\w])(?:[A-Za-z0-9_.-]+/){1,}[A-Za-z0-9_.-]+", "[path]", text)
     text = re.sub(
-        r"""(?i)["']?(?:token|password|secret|api[_-]?key)["']?\s*[=:]\s*(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^\s'"<>|]+)""",
+        r"""(?i)["']?(?:token|password|secret|api[_-]?key|authorization)["']?\s*[=:]\s*(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|(?:(?:bearer|basic)\s+)?[^\s'"<>|]+)""",
         "[redacted]", text)
     text = re.sub(r"(?i)\b(?:bearer\s+)?(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9_-]{16,}|AKIA[0-9A-Z]{16})\b",
                   "[redacted]", text)
@@ -1677,6 +1677,9 @@ class SwarmCoordinator:
             claim = state["claims"].get(_id(claim_id, "claim id")) if claim_id is not None else None
             if claim is None:
                 raise ValueError("terminal event references unknown claim")
+            task = state["tasks"].get(claim["task_id"])
+            if task is None or not task["attempts"] or task["attempts"][-1] != claim["claim_id"]:
+                raise ValueError("terminal event references superseded claim")
             status = {
                 "claim_released": "released",
                 "claim_indeterminate": "indeterminate",
@@ -1688,23 +1691,29 @@ class SwarmCoordinator:
             }[event]
             claim["status"] = status
             if event in {"task_completed", "task_failed", "task_cancelled", "task_blocked", "human_question"}:
-                state["tasks"][claim["task_id"]]["terminal"] = status
+                task["terminal"] = status
             if event == "claim_indeterminate":
-                state["tasks"][claim["task_id"]]["terminal"] = "indeterminate"
-                state["tasks"][claim["task_id"]]["uncertain_spend"] = True
+                task["terminal"] = "indeterminate"
+                task["uncertain_spend"] = True
             if event in {"task_blocked", "human_question"}:
-                state["tasks"][claim["task_id"]]["uncertain_spend"] = True
+                task["uncertain_spend"] = True
             if event == "task_blocked" and record.get("human_question") is not None:
-                state["tasks"][claim["task_id"]]["human_question"] = _bounded_reason(
+                task["human_question"] = _bounded_reason(
                     record["human_question"], "human question")
             if event == "human_question":
-                state["tasks"][claim["task_id"]]["human_question"] = _bounded_reason(
+                task["human_question"] = _bounded_reason(
                     record.get("question"), "human question")
             return
         if event == "retry_authorized":
             task = state["tasks"].get(task_id)
             if task is None:
                 raise ValueError("retry authorization references unknown task")
+            claim_id = _id(record.get("claim_id"), "claim id")
+            if not task["attempts"] or task["attempts"][-1] != claim_id:
+                raise ValueError("retry authorization references superseded claim")
+            claim = state["claims"].get(claim_id)
+            if claim is None or claim["status"] not in {"indeterminate", "blocked"}:
+                raise ValueError("retry authorization requires indeterminate or blocked claim")
             task["retry_authorized"] = True
             task["terminal"] = None
             task.pop("human_question", None)
@@ -4110,12 +4119,14 @@ class SwarmCoordinator:
             task = state["tasks"].get(task_id)
             if task is None:
                 raise SwarmCoordinatorError("unknown task")
-            claims = [state["claims"][claim_id] for claim_id in task["attempts"]]
-            uncertain = [claim for claim in claims
-                         if claim["status"] in {"active", "indeterminate", "blocked"}]
-            if not uncertain:
+            if not task["attempts"]:
                 raise SwarmConflictError("task has no indeterminate claim")
-            latest = uncertain[-1]
+            latest = state["claims"][task["attempts"][-1]]
+            if (latest["status"] not in {"active", "indeterminate", "blocked"}
+                    or task.get("terminal") in {"completed", "failed", "cancelled"}):
+                raise SwarmConflictError("task has no indeterminate claim")
+            if task.get("retry_authorized") and not allow_retry:
+                raise SwarmConflictError("task retry is already authorized")
             event = "retry_authorized" if allow_retry else "task_blocked"
             # A recovery decision is not permission to append the same
             # uncertainty marker repeatedly.  Once the claim is indeterminate

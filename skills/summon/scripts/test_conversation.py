@@ -578,7 +578,7 @@ class ConversationJournalTests(unittest.TestCase):
         room = self._room()
         event = room.append_memory_proposal(
             "sol",
-            summary='Record retry backoff policy {"password": "secret meadow 42"}',
+            summary='Record retry backoff policy {"password": "secret meadow 42", "authorization": "Basic short123"}',
             proposed_entry="Always cap background retry loops at 3 attempts.",
             rationale="Observed during swarm testing",
             base_memory_sha256=base_sha,
@@ -587,10 +587,11 @@ class ConversationJournalTests(unittest.TestCase):
         self.assertEqual(event["event"], "memory_proposal")
         self.assertEqual(event["payload"]["authority"], "context-only")
         self.assertNotIn("secret meadow 42", json.dumps(event))
+        self.assertNotIn("Basic short123", json.dumps(event))
         # Idempotent retry of the same proposal_id succeeds
         retry_event = room.append_memory_proposal(
             "sol",
-            summary='Record retry backoff policy {"password": "secret meadow 42"}',
+            summary='Record retry backoff policy {"password": "secret meadow 42", "authorization": "Basic short123"}',
             proposed_entry="Always cap background retry loops at 3 attempts.",
             rationale="Observed during swarm testing",
             base_memory_sha256=base_sha,
@@ -609,6 +610,16 @@ class ConversationJournalTests(unittest.TestCase):
             proposal_id="prop-breaker",
         )
         native_second = room.events(native=True)[-1]["payload"]
+        # Plant a stale dead-PID lock file before concurrent promotions so both
+        # workers race to reclaim the same stale lock
+        lock_file = agents_dir / ".memory-promote.lock"
+        stale_marker = json.dumps(
+            {"pid": 99999999, "token": "a" * 32, "started_at": 1.0},
+            sort_keys=True, separators=(",", ":"),
+        ).encode("ascii")
+        lock_file.write_bytes(stale_marker)
+        import os as _os
+        _os.utime(lock_file, (1.0, 1.0))
         # Unconfirmed promotion fails closed
         with self.assertRaises(ConversationError):
             promote_memory_proposal(
