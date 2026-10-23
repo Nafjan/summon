@@ -197,8 +197,14 @@ def running_job_count(job_dir: str | None = None) -> int:
         root = _jobs.resolve_jobs_dir(job_dir)
         records = os.path.join(root, _jobs._RECORDS)
         for directory in (root, records):
-            if os.path.exists(directory):
-                os.listdir(directory)     # raises when present but unreadable
+            # Enumerate directly: os.path.exists() hides access errors, and
+            # list_jobs() swallows listing errors. Only true absence is "no jobs".
+            try:
+                os.listdir(directory)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return -1
         active = 0
         for row in _jobs.list_jobs(root):
             state = row.get("state")

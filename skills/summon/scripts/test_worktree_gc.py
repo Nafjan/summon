@@ -145,7 +145,6 @@ def test_running_job_count_treats_uncertain_states_as_unknown(monkeypatch, tmp_p
 
 
 def test_running_job_count_unreadable_job_dir_is_unknown(monkeypatch, tmp_path):
-    import _jobs
     real_listdir = os.listdir
 
     def denied(path):
@@ -154,7 +153,37 @@ def test_running_job_count_unreadable_job_dir_is_unknown(monkeypatch, tmp_path):
         return real_listdir(path)
 
     monkeypatch.setattr(gc.os, "listdir", denied)
+    # exists() would also hide the error: the check must not depend on it.
+    monkeypatch.setattr(gc.os.path, "exists", lambda _p: False)
     assert gc.running_job_count(str(tmp_path)) == -1
+
+
+def test_running_job_count_absent_dir_means_no_jobs(tmp_path):
+    assert gc.running_job_count(str(tmp_path / "never-created")) == 0
+
+
+def test_per_item_recheck_catches_changes_after_the_fresh_plan(repo, monkeypatch):
+    path = add_wt(repo, "late")
+    planned = gc.plan(str(repo), now=FUTURE, caller_cwd=str(repo))
+    # Simulate a change landing AFTER apply's fresh plan: the fresh plan still
+    # says "remove", so only the per-item branch/HEAD/clean recheck can stop it.
+    monkeypatch.setattr(gc, "plan", lambda *_a, **_k: planned)
+    (path / "z.txt").write_text("late", encoding="utf-8")
+    git(path, "add", "z.txt")
+    git(path, "commit", "-q", "-m", "late commit")
+    report = gc.apply(planned, running_jobs=0, now=FUTURE, caller_cwd=str(repo))
+    assert report["results"][0]["skipped"] == "changed_since_plan"
+    assert path.exists()
+
+
+def test_per_item_recheck_catches_dirty_after_the_fresh_plan(repo, monkeypatch):
+    path = add_wt(repo, "latedirty")
+    planned = gc.plan(str(repo), now=FUTURE, caller_cwd=str(repo))
+    monkeypatch.setattr(gc, "plan", lambda *_a, **_k: planned)
+    (path / "a.txt").write_text("dirty late", encoding="utf-8")
+    report = gc.apply(planned, running_jobs=0, now=FUTURE, caller_cwd=str(repo))
+    assert report["results"][0]["skipped"] == "dirty"
+    assert path.exists()
 
 
 def test_cli_rejects_apply_with_dry_run(repo):

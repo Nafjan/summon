@@ -261,7 +261,53 @@ def test_fingerprint_rejects_malformed_porcelain(tmp_path):
     class Weird:
         returncode = 0
         stdout = b"Z nonsense\0"
-    assert pj.workspace_fingerprint(str(tmp_path), runner=lambda *a, **k: Weird()) is None
+
+    class Top:
+        returncode = 0
+        stdout = str(tmp_path).encode("utf-8") + b"\n"
+
+    calls = []
+
+    def runner(cmd, **_k):
+        calls.append(cmd)
+        return Top() if "rev-parse" in cmd else Weird()
+
+    assert pj.workspace_fingerprint(str(tmp_path), runner=runner) is None
+    assert any("status" in c for c in calls)      # reached porcelain parsing
+
+
+def test_prefetch_recovers_after_thread_start_failure(monkeypatch):
+    j = pj.ProgressJudge(checkpoint_ms=1000, mode="enforce", fingerprint_fn=lambda _c: "fp")
+    assert j.wait_idle()
+    real_start = pj.threading.Thread.start
+
+    def failing_start(self):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(pj.threading.Thread, "start", failing_start)
+    assert j.prefetch() is False
+    assert j.wait_idle() is True                  # no wedged, never-started thread
+    monkeypatch.setattr(pj.threading.Thread, "start", real_start)
+    assert j.prefetch() is True and j.wait_idle()
+
+
+def test_delayed_baseline_completion_is_handled():
+    import threading
+    gate = threading.Event()
+    values = iter(["base", "next"])
+
+    def fp(_cwd):
+        gate.wait(10)
+        return next(values)
+
+    j = pj.ProgressJudge(checkpoint_ms=1000, mode="enforce", fingerprint_fn=fp)
+    applied, rec = j.judge(stream_active=False)   # baseline still pending
+    assert rec["workspace"] == "unmeasured" and applied is False
+    gate.set()
+    assert j.wait_idle()
+    assert j.prefetch() is True and j.wait_idle()
+    _applied, rec = j.judge(stream_active=False)
+    assert rec["workspace"] == "changed"
 
 
 def test_porcelain_parser_handles_rename_records():

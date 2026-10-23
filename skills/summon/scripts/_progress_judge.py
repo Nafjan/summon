@@ -194,14 +194,20 @@ class ProgressJudge:
             thread = threading.Thread(target=self._worker, name="summon-progress-fingerprint",
                                       daemon=True)
             self._thread = thread
-        thread.start()
+        try:
+            thread.start()
+        except Exception:  # noqa: BLE001 - release the reservation so a later checkpoint retries
+            with self._lock:
+                if self._thread is thread:
+                    self._thread = None
+            return False
         return True
 
     def wait_idle(self, timeout: float = 10.0) -> bool:
         """Test/diagnostic helper: wait for an in-flight measurement to finish."""
         with self._lock:
             thread = self._thread
-        if thread is not None:
+        if thread is not None and thread.ident is not None:
             thread.join(timeout)
             return not thread.is_alive()
         return True
