@@ -11,6 +11,58 @@ and [Semantic Versioning](https://semver.org). Versions track the dispatcher
 `envelope` field (currently `1`); it bumps only on a breaking change to the response shape,
 never on added fields.
 
+## [3.7.0] - 2026-10-24
+
+- **Canonical usage accounting and context occupancy (`_usage_metrics.py`):** add
+  provider-neutral `summon.usage-metrics/v1` and `summon.context-occupancy/v1`
+  projections on terminal envelopes (`usage_metrics`, `context_occupancy`),
+  adaptive loop attempt entries, and conversation room turns. Context occupancy
+  separates reported token ratios from byte-estimated prompt budgets and computes
+  `effective_ratio` as `max(reported_token_ratio, estimated_prompt_byte_ratio)`
+  with `normal` / `elevated` (`>= 0.70`) / `critical` (`>= 0.85`) bands.
+- **Deterministic progress telemetry and advisory progress judge
+  (`_progress_signals.py`, `_progress_judge.py`):** add `summon.progress-signals/v1`
+  (`progress_signals`) with output delta hashes, git workspace worktree/index
+  fingerprints, error-signature repeats, and monotonic `progress_score`, plus
+  opt-in `summon.progress-judgement/v1` (`--progress-judge`,
+  `SUMMON_PROGRESS_JUDGE=1`) advisory classification (`progressing`, `stagnant`,
+  `looping_error`, `context_saturated`). Neither surface carries authority or
+  mutates retry budgets.
+- **Safe git worktree garbage collection (`_worktree_gc.py`):** add
+  `summon worktree gc [--apply] [--max-age-hours H] [--json]` with
+  `summon.worktree-gc/v1` receipts. Enforce seven fail-closed skip gates
+  (`active_job_referenced`, `active_conversation_referenced`, `younger_than_ttl`,
+  `dirty_worktree`, `unmerged_commits`, `outside_managed_root`, `lock_held`) and
+  re-verify live job references immediately before executing `git worktree remove`
+  under `--apply`.
+- **Graduated 4-level circuit breaker (`_breaker.py`, `_job_control.py`,
+  `_background.py`):** add `summon.breaker/v1` (`off`, `shadow` default, `enforced`)
+  configurable via `--breaker-mode` or `SUMMON_BREAKER_MODE` / `SUMMON_BREAKER`.
+  Append HMAC-sealed `breaker_transition` records to `control.jsonl` via atomic
+  `control.seal` sidecars (`MAX_BREAKER_COMMANDS = 96` within `MAX_COMMANDS = 128`,
+  reserving 32 slots for operator `pause` / `resume` / `cancel` commands).
+- **Opt-in worktree dependency linking (`_worktree_deps.py`):** add `--link-deps DIRS`
+  with `summon.worktree-deps/v1` receipts, boundary-safe symlink/junction setup
+  for strict allowlisted dependency directories (`node_modules`, `.venv`, `venv`,
+  `target`, `.pnpm-store`, `.mypy_cache`, `.pytest_cache`, `.ruff_cache`), and
+  fail-closed lockfile content digests (`MAX_INLINE_FILE_HASH_BYTES`,
+  `MAX_TREE_HASH_BYTES`).
+- **Compaction-resilient context handoffs (`_context_handoff.py`):** add
+  `summon.context-handoff/v1` (`handoff_note` on terminal envelopes and compacted
+  adaptive loop attempts) and `--handoff-from TASK_ID_OR_RECEIPT` to inject a
+  bounded (`<= 4096` bytes), prompt-injection-sanitized XML continuity block
+  without inheriting parent task authority, permissions, or writable scopes.
+- **Dependency-aware swarm coordinator (`_swarm_protocol.py`,
+  `_swarm_coordinator.py`):** add `depends_on` DAG validation (Kahn's algorithm)
+  to `summon.workspace.plan/v1`, `blocked_by_failed_dependencies` propagation on
+  upstream failure, `resolve_blocked` / `acknowledge_indeterminate` fenced
+  recovery actions, and deterministic file-scope conflict warnings.
+- **Multi-job watch and conversation room liveness (`_jobs.py`,
+  `_conversation.py`, `_conversation_runtime.py`, `_conversation_page.py`):** add
+  `summon jobs watch` (`summon.jobs-watch/v1`), cross-platform Windows/POSIX PID
+  liveness inspection (`OpenProcess` + `GetExitCodeProcess` on Windows), and
+  read-only usage/context/breaker badges in the conversation room snapshot and UI.
+
 ## [3.5.0] - 2026-09-18
 
 The following source changes form the locally committed 3.5.0 provider-free
