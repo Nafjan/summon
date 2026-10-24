@@ -771,10 +771,20 @@ def test_round2_pnpm_depth_incomplete_fingerprint_and_v2_rename_regressions(tmp_
         finally:
             _worktree_deps.os.read = real_os_read
             _worktree_deps.MAX_LOCKFILE_BYTES = orig_max_lock
+
+        # Same-size, timestamp-restored content edit inside bridged package is caught by content digest
+        st_before = pnpm_idx.stat()
+        fp_before = _worktree_deps.fingerprint_dep_target(str(repo), "node_modules")
+        assert fp_before is not None
+        pnpm_idx.write_text("module.exports = 'v2-tamperd';\n", encoding="utf-8")
+        os.utime(pnpm_idx, ns=(st_before.st_atime_ns, st_before.st_mtime_ns))
+        assert pnpm_idx.stat().st_size == st_before.st_size
+        assert pnpm_idx.stat().st_mtime_ns == st_before.st_mtime_ns
+        fp_after = _worktree_deps.fingerprint_dep_target(str(repo), "node_modules")
+        assert fp_after is not None and fp_after != fp_before
     finally:
         if _worktree_deps._is_link_or_junction(os.path.join(wt_path, "node_modules")):
             _worktree_deps._remove_dir_link(os.path.join(wt_path, "node_modules"))
         shutil.rmtree(wt_path, ignore_errors=True)
         subprocess.run(["git", "-C", str(repo), "worktree", "prune"],
                        capture_output=True, text=True, check=False)
-

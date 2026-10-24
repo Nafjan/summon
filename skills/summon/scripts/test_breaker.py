@@ -987,3 +987,55 @@ def test_acp_fast_response_permission_cancel_and_operator_extension(tmp_path: Pa
     finally:
         stdout_w.close()
         stdout_r.close()
+
+
+def test_breaker_mode_env_alias_and_control_headroom_and_seal_retry(tmp_path: Path, monkeypatch):
+    """F1/F2/Sol#1: SUMMON_BREAKER_MODE alias works, seal write failure retries, and breaker cap leaves operator headroom."""
+    assert _breaker.mode_from_environment({"SUMMON_BREAKER_MODE": "enforce"}) == "enforce"
+    assert _breaker.mode_from_environment({"SUMMON_BREAKER": "off", "SUMMON_BREAKER_MODE": "enforce"}) == "off"
+
+    root, job_id, nonce = _prepared_job(tmp_path, job_id="9" * 32)
+    cpath = _job_control.control_path(root, job_id)
+    hbpath = _job_control.heartbeat_path(root, job_id)
+
+    b = _breaker.GraduatedBreaker(mode="shadow")
+    d1 = b.evaluate(extra_triggers=("tool_loop",))
+    _job_control.queue_breaker_transition(root, job_id, d1)
+    # Only breaker transitions in log -> state is empty for operator commands
+    summary = _job_control.control_summary(root, job_id)
+    assert summary["state"] == "empty"
+    assert summary["breaker"]["level"] == "steering"
+
+    rc = _job_control.RuntimeControl(
+        path=cpath,
+        heartbeat=hbpath,
+        job_id=job_id,
+        nonce=nonce,
+        checkpoint_ms=60_000,
+        max_runtime_ms=600_000,
+    )
+    orig_write = _job_control._write_control_json
+    calls = {"seal_fails": 1}
+
+    def _flaky_seal_write(path, value):
+        if path.endswith(".seal") and calls["seal_fails"] > 0:
+            calls["seal_fails"] -= 1
+            raise OSError("transient seal write failure")
+        return orig_write(path, value)
+
+    monkeypatch.setattr(_job_control, "_write_control_json", _flaky_seal_write)
+    rc.refresh(force=True)
+    assert rc._sealed_generation == 0
+    assert not Path(cpath + ".seal").is_file()
+    # Next refresh retries and persists the seal!
+    rc.refresh(force=True)
+    assert rc._sealed_generation == 1
+    assert Path(cpath + ".seal").is_file()
+
+    # Cap MAX_BREAKER_COMMANDS to 1 and verify shadow breaker still updates in-memory while operator cancel succeeds
+    monkeypatch.setattr(_job_control, "MAX_BREAKER_COMMANDS", 1)
+    d2 = b.evaluate(extra_triggers=())
+    assert rc.record_breaker(d2) is None
+    assert rc.breaker_level == "healthy"
+    assert _job_control.queue_command(root, job_id, "cancel")["status"] == "queued"
+    assert _job_control.control_summary(root, job_id)["state"] == "queued"

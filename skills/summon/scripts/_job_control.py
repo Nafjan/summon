@@ -21,6 +21,7 @@ import _jobs
 
 
 MAX_COMMANDS = 128
+MAX_BREAKER_COMMANDS = 96
 MAX_STEER_CHARS = 16_384
 MAX_EXTENSION_MS = 7 * 24 * 60 * 60 * 1000
 LOCK_WAIT_SECONDS = 5.0
@@ -289,14 +290,14 @@ def _write_control_seal(path: str, job_id: str, nonce: str, *,
                         generation: int, digests: dict[int, str],
                         constrained: bool, breaker_stopped: bool,
                         cancel_requested: bool, breaker_level: str,
-                        breaker_transitions: int) -> None:
+                        breaker_transitions: int) -> bool:
     """Persist an authenticated high-water mark so rollback is detected across restarts."""
     if generation < 1:
-        return
+        return False
     ordered = {str(k): digests[k] for k in sorted(digests)
                if isinstance(k, int) and 1 <= k <= generation and _is_sha256(digests[k])}
     if len(ordered) != generation:
-        return
+        return False
     body = {
         "kind": "control_seal_v1",
         "job_id": job_id,
@@ -312,8 +313,9 @@ def _write_control_seal(path: str, job_id: str, nonce: str, *,
     payload["auth"] = _auth(nonce, f"summon-job-control-seal/v1:{job_id}", body)
     try:
         _write_control_json(_seal_path(path), payload)
+        return True
     except OSError:
-        pass
+        return False
 
 
 def _load_control_seal(path: str, job_id: str, nonce: str) -> tuple[dict | None, str]:
@@ -386,8 +388,11 @@ def _canonical_json(value) -> bytes:
 
 
 def _write_control_json(path: str, value: dict) -> None:
-    """Reject non-JSON numeric values before the shared atomic writer runs."""
+    """Reject non-JSON numeric values and oversized payloads before the shared atomic writer runs."""
     _canonical_json(value)
+    serialized = json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    if len(serialized) > MAX_CONTROL_BYTES:
+        raise ValueError("job control command limit reached")
     _jobs._atomic_write_json(path, value)
 
 
@@ -785,6 +790,12 @@ def _append_breaker_command(path: str, job_id: str, nonce: str,
                 raise ValueError("job control identity mismatch")
             if len(commands) >= MAX_COMMANDS:
                 raise ValueError("job control command limit reached")
+            breaker_count = sum(
+                1 for item in commands
+                if isinstance(item, dict) and item.get("action") == "breaker"
+            )
+            if breaker_count >= MAX_BREAKER_COMMANDS:
+                raise ValueError("job control breaker command limit reached")
             generation = existing.get("generation", 0) + 1
             queued_at = now_fn()
             if not _is_finite_number(queued_at):
@@ -916,12 +927,13 @@ def control_summary(root: str, job_id: str) -> dict | None:
         # rewritten in place and status must not promote nonce-bound
         # observations into an authenticated queued-command claim.
         return _invalid_summary(integrity)
+    counts = {action: sum(item.get("action") == action for item in commands)
+              for action in ("extend", "cancel", "steer")}
     summary = {
-        "state": "queued" if commands else "empty",
+        "state": "queued" if any(counts.values()) else "empty",
         "integrity": integrity,
         "generation": data.get("generation"),
-        "counts": {action: sum(item.get("action") == action for item in commands)
-                   for action in ("extend", "cancel", "steer")},
+        "counts": counts,
         "steering_mode": "queued_for_resume",
     }
     breaker_cmds = [item for item in commands if item.get("action") == "breaker"]
@@ -1361,9 +1373,7 @@ class RuntimeControl:
         )
         self.breaker_transitions = max(self._sealed_breaker_transitions, total_breaker_cmds)
         if self.generation > self._sealed_generation:
-            self._sealed_generation = self.generation
-            self._sealed_breaker_transitions = self.breaker_transitions
-            _write_control_seal(
+            if _write_control_seal(
                 self.path, self.job_id, self.nonce,
                 generation=self.generation,
                 digests=self._command_digests,
@@ -1372,7 +1382,9 @@ class RuntimeControl:
                 cancel_requested=self.cancel_requested,
                 breaker_level=self.breaker_level,
                 breaker_transitions=self.breaker_transitions,
-            )
+            ):
+                self._sealed_generation = self.generation
+                self._sealed_breaker_transitions = self.breaker_transitions
         if added:
             self.extension_ms += added
             self.attention_required = False
@@ -1418,17 +1430,27 @@ class RuntimeControl:
                     queued = _append_breaker_command(
                         self.path, self.job_id, self.nonce, decision,
                         wall_clock=self.wall_clock)
+                except ValueError as exc:
+                    if (str(exc) == "job control breaker command limit reached"
+                            and decision.get("mode") == "shadow"):
+                        queued = None
+                    else:
+                        rollback_fn = getattr(decision, "_rollback", None)
+                        if callable(rollback_fn):
+                            rollback_fn()
+                        return None
                 except Exception:  # noqa: BLE001 - a corrupt/legacy control log cannot be appended
                     rollback_fn = getattr(decision, "_rollback", None)
                     if callable(rollback_fn):
                         rollback_fn()
                     return None
-                commit_fn = getattr(decision, "_commit", None)
-                if callable(commit_fn):
-                    commit_fn()
-                self.breaker = sanitized
-                self._refresh_locked(force=True)
-                return queued
+                if queued is not None:
+                    commit_fn = getattr(decision, "_commit", None)
+                    if callable(commit_fn):
+                        commit_fn()
+                    self.breaker = sanitized
+                    self._refresh_locked(force=True)
+                    return queued
             commit_fn = getattr(decision, "_commit", None)
             if callable(commit_fn):
                 commit_fn()

@@ -1071,6 +1071,15 @@ class SwarmCoordinatorTests(unittest.TestCase):
         self.assertNotIn("human_question", status_after["tasks"][0])
         claim_retry = self.coordinator.claim("worker-a", "task-a", request_sha256=self.request)
         self.assertEqual(claim_retry["attempt"], 2)
+        # Delayed resolve_blocked while the retry claim is active or with stale claim_id must refuse!
+        with self.assertRaises(SwarmConflictError):
+            self.coordinator.resolve_blocked(
+                "task-a", allow_retry=True, reason="delayed while active",
+                human_confirmed=True)
+        with self.assertRaises(SwarmConflictError):
+            self.coordinator.resolve_blocked(
+                "task-a", allow_retry=True, reason="stale claim id",
+                human_confirmed=True, claim_id=claim["claim_id"])
         self.coordinator.complete(
             "worker-a", task_id="task-a", claim_id=claim_retry["claim_id"],
             attempt=claim_retry["attempt"], lease_generation=claim_retry["lease_generation"],
@@ -1118,6 +1127,29 @@ class SwarmCoordinatorTests(unittest.TestCase):
                             "question": "late question?",
                         },
                     )
+
+    def test_failed_dependency_surfaces_in_status_and_blocks_downstream_claim(self):
+        request_b = "b" * 64
+        coord = SwarmCoordinator.create(
+            self.temp.name, "swarm-failed-dep", project_root_sha256=self.project,
+            roster_definition_sha256=self.roster,
+            tasks=[
+                {"task_id": "task-a", "request_sha256": self.request},
+                {"task_id": "task-b", "request_sha256": request_b, "depends_on": ["task-a"]},
+            ],
+            max_attempts=1, clock=self.clock)
+        coord.register_worker("worker-a", worker_instance_id="instance-a")
+        claim_a = coord.claim("worker-a", "task-a", request_sha256=self.request)
+        coord.fail(
+            "worker-a", task_id="task-a", claim_id=claim_a["claim_id"],
+            attempt=claim_a["attempt"], lease_generation=claim_a["lease_generation"],
+            request_sha256=self.request, envelope_sha256="f" * 64,
+            reason="upstream failed")
+        with self.assertRaises(SwarmConflictError) as ctx:
+            coord.claim("worker-a", "task-b", request_sha256=request_b)
+        self.assertIn("terminated as failed", str(ctx.exception))
+        tasks_by_id = {t["task_id"]: t for t in coord.status()["tasks"]}
+        self.assertEqual(tasks_by_id["task-b"].get("blocked_by_failed_dependencies"), ["task-a"])
 
 
 def json_text(value):

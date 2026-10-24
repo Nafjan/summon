@@ -654,16 +654,52 @@ def _exclusive_file_lock(lock: Path, busy_message: str):
     fd = None
     token = secrets.token_hex(16)
 
-    def pid_alive(pid: object) -> bool:
+    def pid_liveness(pid: object) -> str:
         if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
-            return False
+            return "dead"
+        if os.name != "nt":
+            try:
+                os.kill(pid, 0)
+                return "alive"
+            except ProcessLookupError:
+                return "dead"
+            except PermissionError:
+                return "alive"
+            except OSError:
+                return "unknown"
         try:
-            os.kill(pid, 0)
-        except PermissionError:
-            return True
-        except (OSError, ProcessLookupError):
-            return False
-        return True
+            import ctypes
+            from ctypes import wintypes
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            open_proc = kernel32.OpenProcess
+            open_proc.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+            open_proc.restype = wintypes.HANDLE
+            get_exit = kernel32.GetExitCodeProcess
+            get_exit.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+            get_exit.restype = wintypes.BOOL
+            close = kernel32.CloseHandle
+            close.argtypes = (wintypes.HANDLE,)
+            close.restype = wintypes.BOOL
+            handle = open_proc(0x1000, False, pid)
+            if not handle:
+                err = ctypes.get_last_error()
+                if err == 87:
+                    return "dead"
+                if err == 5:
+                    return "alive"
+                return "unknown"
+            try:
+                code = wintypes.DWORD()
+                if not get_exit(handle, ctypes.byref(code)):
+                    return "unknown"
+                return "alive" if code.value == 259 else "dead"
+            finally:
+                close(handle)
+        except Exception:  # noqa: BLE001
+            return "unknown"
+
+    def pid_alive(pid: object) -> bool:
+        return pid_liveness(pid) != "dead"
 
     reclaim_lock = Path(f"{lock}.reclaim")
     try:

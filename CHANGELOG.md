@@ -9,54 +9,63 @@ notes, and test evidence, see the [detailed engineering history](docs/ENGINEERIN
 
 - Add budget-grade token accounting, context-window occupancy, and progress-signal
   telemetry to every dispatch envelope: `usage_metrics` (`summon.usage-metrics/v1`)
-  computes `work_tokens` (`uncached_input + cache_write + output + reasoning`,
-  excluding cache reads) with explicit `input_semantics` across Claude, Codex,
-  and Gemini; `context_occupancy` (`summon.context-occupancy/v1`) tracks the
-  input-side fill of the latest root request against the served model's context
-  window; and `progress_signals` (`summon.progress-signals/v1`) records
-  tool-loop and consecutive-failure counters from SHA-256 argument fingerprints
-  without retaining raw tool inputs.
+  computes `work_tokens` (`uncached_input + cache_write + output`, excluding
+  cache reads) with explicit `input_semantics` across `claude`, `codex`, and
+  `openai-compat` (where `output_tokens` already encompasses reasoning output);
+  `context_occupancy` (`summon.context-occupancy/v1`) tracks the input-side fill
+  of the latest root request against the served model's context window; and
+  `progress_signals` (`summon.progress-signals/v1`) records tool-loop and
+  consecutive-failure counters from SHA-256 argument fingerprints without
+  retaining raw tool inputs.
 - Add progress-aware adaptive timeout checkpoints and safe worktree garbage
   collection: adaptive background jobs evaluate a checkpoint-time
   `progress_judgement` (`summon.progress-judgement/v1`, controlled by
   `SUMMON_PROGRESS_JUDGE=off|shadow|enforce`, default `shadow`) that discounts
   stream activity during a detected tool loop, credits a still-running tool for
   up to three checkpoint intervals, and treats a working-tree change as
-  progress. Add `summon worktree gc` (`--worktree-gc`, `summon.worktree-gc/v1`),
-  a dry-run-by-default reclaimer for unlocked, idle (`--min-age-hours`, default
-  `24`), clean, and merged `agents/*` worktrees that revalidates state before
-  acting on `--apply` and refuses while background jobs run unless
-  `--ignore-running-jobs` is given.
+  progress. Add `summon worktree gc` (`--worktree-gc`, `--gc-base REV`,
+  `--gc-min-age-hours N`, `--gc-apply`, `--gc-ignore-running-jobs`,
+  `summon.worktree-gc/v1`), a dry-run-by-default reclaimer for unlocked, idle
+  (default `24` hours), clean, and merged `agents/*` worktrees that revalidates
+  state and running jobs before acting on `--apply` (`--gc-apply`).
 - Add a graduated circuit breaker for adaptive background jobs:
-  `SUMMON_BREAKER_MODE=off|shadow|enforce` (with `SUMMON_BREAKER_ALLOW_STOP=0|1`)
+  `SUMMON_BREAKER=off|shadow|enforce` (alias `SUMMON_BREAKER_MODE`, default
+  `shadow`, with `SUMMON_BREAKER_ALLOW_STOP=0|1` and `SUMMON_MAX_WORK_TOKENS`)
   evaluates a four-level escalation ladder (`healthy` -> `steering` ->
-  `constrained` -> `stopped`, `summon.breaker/v1`) with compaction grace across
-  `PreCompact` / `PostCompact` events, one-level de-escalation on clean
-  checkpoints, and HMAC-authenticated `action: "breaker"` control transitions in
+  `constrained` -> `stopped`, `summon.breaker/v1`) with a 5-minute compaction
+  grace on `work_token_cap` after context compaction (`PreCompact` / `PostCompact`
+  or `system.compact_boundary`), one-level de-escalation on clean checkpoints,
+  and HMAC-authenticated `action: "breaker"` control transitions in
   `summon.job-control/v2`.
-- Add opt-in worktree dependency bridging (`--link-deps {off,auto,symlink,junction}`,
-  default `off`, and `--link-deps-allow-mutation`): bridges `node_modules` and
-  `.venv` into isolated `--worktree` checkouts only when base and target
-  lockfiles match (`summon.worktree-deps/v1`), unlinks bridges before worktree
-  teardown so shared directories are never traversed, and fails closed
-  (`error_kind: "worktree_dependency_drift"`) if a bridged dependency tree
+- Add opt-in worktree dependency bridging (`--link-deps DIRS`, e.g.
+  `--link-deps node_modules,.venv`, and `--link-deps-allow-mutation`): bridges
+  comma-separated repo-relative dependency directories into isolated `--worktree`
+  checkouts via platform-selected POSIX symlinks or Windows directory junctions
+  (`summon.worktree-deps/v1`), hashes nearby lockfiles, inner state files, and
+  bounded directory trees before and after dispatch, unlinks intact bridges
+  before worktree teardown so shared directories are never traversed, and fails
+  closed (`error_kind: "linked_deps_mutated"`) if a bridged dependency tree
   mutates without `--link-deps-allow-mutation`.
 - Add context-window-aware handoffs, structured handoff notes, and headroom
-  routing (`SUMMON_CONTEXT_HANDOFF=off|shadow|enforce`,
-  `SUMMON_CONTEXT_HANDOFF_THRESHOLD`, default `0.80`, `summon.context-handoff/v1`):
+  routing (`SUMMON_CONTEXT_HANDOFF=off|shadow|enforce`, default `shadow`, and
+  `SUMMON_CONTEXT_HANDOFF_THRESHOLD`, defaulting to a window-scaled curve from
+  `0.75` at `<=200k` tokens to `0.50` at `>=1M` tokens, `summon.context-handoff/v1`):
   queues a deterministic at-most-once handoff steering directive when enforced,
   parses and redacts structured `handoff_note` blocks (`HANDOFF_STATE`,
   `COMPLETED`, `NEXT_STEPS`, `OPEN_QUESTIONS`, `ARTIFACTS_TOUCHED`), binds
   sanitized `handoff_note` state into governed background continuation and
-  resume claims, and blocks direct session-handle reuse when
-  `context_handoff_recommended` is set unless `--fresh-handoff` is passed.
+  resume claims, and fails closed (`error_kind: "resume_context_headroom_exhausted"`)
+  on direct `--resume` session-handle reuse when a prior envelope sets
+  `context_handoff_recommended: true`.
 - Extend swarm coordination and conversation memory governance: add task DAG
-  dependencies (`depends_on` with cycle rejection and dependency-gated task
-  readiness/claiming), structured `human_question` task blocking and answer
-  resumption, bounded message `hop_count` / `max_hops` (`12` default) with
-  idempotent retry replay prior to `hop_limit_exceeded` refusal, and attested
-  conversation memory proposals (`summon.conversation-memory-proposal/v1`) with
-  compare-and-swap locked commits.
+  dependencies (`depends_on` with cycle rejection, dependency-gated task
+  claiming, and `blocked_by_failed_dependencies` status reporting), structured
+  `human_question` task blocking and human-confirmed `resolve_blocked`
+  resumption, room-wide agent-to-agent message `hops` tracking (`MAX_AGENT_MESSAGE_HOPS = 12`)
+  that reroutes to `human` with `escalated_to_human: true` when the hop budget is
+  reached while preserving idempotent `message_id` replay, and attested
+  `memory_proposal` conversation events promoted via `promote_memory_proposal`
+  with compare-and-swap `.agents/memory.md` digest verification.
 - Add `summon jobs watch` (`--jobs-watch`, `--once`, `--interval SEC`,
   `--active-only`, `--json`, `summon.jobs-watch/v1`) and Conversation Atlas
   telemetry badges: `jobs watch` renders an operator dashboard of

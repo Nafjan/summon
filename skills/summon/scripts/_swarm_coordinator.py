@@ -3130,6 +3130,10 @@ class SwarmCoordinator:
             raise SwarmConflictError("request digest does not match the task")
         for dep_id in task.get("depends_on", ()):
             dep_task = state["tasks"].get(dep_id)
+            if dep_task is not None and dep_task.get("terminal") in {"failed", "cancelled"}:
+                raise SwarmConflictError(
+                    f"task dependency {dep_id!r} terminated as {dep_task.get('terminal')}"
+                )
             if dep_task is None or dep_task.get("terminal") != "completed":
                 raise SwarmConflictError(f"task dependency {dep_id!r} is not complete")
         active = [state["claims"][claim_id] for claim_id in task["attempts"]
@@ -4116,12 +4120,16 @@ class SwarmCoordinator:
         return self.apply_frame(frame, worker_id="coordinator")
 
     def acknowledge_indeterminate(self, task_id: str, *, allow_retry: bool,
-                                  reason: str, human_confirmed: bool = False) -> dict[str, Any]:
+                                  reason: str, human_confirmed: bool = False,
+                                  claim_id: str | None = None,
+                                  _require_blocked: bool = False) -> dict[str, Any]:
         if not isinstance(allow_retry, bool) or not isinstance(human_confirmed, bool):
             raise SwarmCoordinatorError("indeterminate recovery flags must be boolean")
         if not human_confirmed:
             raise SwarmCoordinatorError("indeterminate recovery requires human confirmation")
         task_id = _id(task_id, "task id")
+        if claim_id is not None:
+            claim_id = _id(claim_id, "claim id")
         reason = _bounded_reason(reason)
         with self._mutation() as (owner, state, _torn):
             if state.get("closed"):
@@ -4130,11 +4138,26 @@ class SwarmCoordinator:
             if task is None:
                 raise SwarmCoordinatorError("unknown task")
             if not task["attempts"]:
-                raise SwarmConflictError("task has no indeterminate claim")
+                raise SwarmConflictError("task has no blocked claim" if _require_blocked else "task has no indeterminate claim")
             latest = state["claims"][task["attempts"][-1]]
+            if claim_id is not None and latest["claim_id"] != claim_id:
+                raise SwarmConflictError("claim id does not match latest claim")
+            if _require_blocked:
+                already_resolved_blocked = (
+                    latest["status"] == "blocked"
+                    and allow_retry
+                    and bool(task.get("retry_authorized"))
+                    and task.get("terminal") is None
+                )
+                if latest["status"] != "blocked" or (
+                    task.get("terminal") != "blocked" and not already_resolved_blocked
+                ):
+                    raise SwarmConflictError("task has no blocked claim")
             if (latest["status"] not in {"active", "indeterminate", "blocked"}
                     or task.get("terminal") in {"completed", "failed", "cancelled"}):
                 raise SwarmConflictError("task has no indeterminate claim")
+            if latest["status"] == "active" and latest["lease_expires_at_ms"] > _now_ms(self.clock):
+                raise SwarmConflictError("task has a live non-expired claim")
             if task.get("retry_authorized") and not allow_retry:
                 raise SwarmConflictError("task retry is already authorized")
             event = "retry_authorized" if allow_retry else "task_blocked"
@@ -4183,10 +4206,12 @@ class SwarmCoordinator:
             return self._response("blocked", task_id=task_id, uncertain_spend=True)
 
     def resolve_blocked(self, task_id: str, *, allow_retry: bool = True,
-                        reason: str, human_confirmed: bool = False) -> dict[str, Any]:
+                        reason: str, human_confirmed: bool = False,
+                        claim_id: str | None = None) -> dict[str, Any]:
         return self.acknowledge_indeterminate(
             task_id, allow_retry=allow_retry, reason=reason,
-            human_confirmed=human_confirmed)
+            human_confirmed=human_confirmed, claim_id=claim_id,
+            _require_blocked=True)
 
     def close(self) -> dict[str, Any]:
         with self._mutation() as (owner, state, _torn):
@@ -4237,6 +4262,12 @@ class SwarmCoordinator:
             }
             if task.get("depends_on"):
                 task_entry["depends_on"] = list(task["depends_on"])
+                failed_deps = [
+                    dep_id for dep_id in task["depends_on"]
+                    if state["tasks"].get(dep_id, {}).get("terminal") in {"failed", "cancelled"}
+                ]
+                if failed_deps:
+                    task_entry["blocked_by_failed_dependencies"] = failed_deps
             if task.get("human_question"):
                 task_entry["human_question"] = task["human_question"]
             tasks.append(task_entry)

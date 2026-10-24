@@ -2171,7 +2171,9 @@ def main() -> None:
                 gc_report = _worktree_gc.apply(
                     gc_report,
                     running_jobs=_worktree_gc.running_job_count(getattr(args, "job_dir", None)),
-                    ignore_running_jobs=bool(args.gc_ignore_running_jobs))
+                    ignore_running_jobs=bool(args.gc_ignore_running_jobs),
+                    job_dir=getattr(args, "job_dir", None),
+                    recheck_running_jobs=True)
         except ValueError as exc:
             _print_error(str(exc))
             sys.exit(1)

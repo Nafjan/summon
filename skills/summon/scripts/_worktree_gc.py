@@ -236,7 +236,8 @@ def _revalidate(item: dict, current: dict | None) -> str | None:
 
 def apply(gc_plan: dict, *, runner: Runner = subprocess.run,
           running_jobs: int = 0, ignore_running_jobs: bool = False,
-          now: Callable[[], float] = time.time, caller_cwd: str | None = None) -> dict:
+          now: Callable[[], float] = time.time, caller_cwd: str | None = None,
+          job_dir: str | None = None, recheck_running_jobs: bool = False) -> dict:
     """Apply a plan produced by :func:`plan`. Uses only non-forcing git commands."""
     if not isinstance(gc_plan, dict) or gc_plan.get("schema") != SCHEMA:
         raise ValueError("not a worktree-gc plan")
@@ -261,6 +262,9 @@ def apply(gc_plan: dict, *, runner: Runner = subprocess.run,
             continue
         entry = {"branch": item["branch"], "action": "remove", "ok": False}
         skip = _revalidate(item, current_by_path.get(os.path.normcase(item["path"])))
+        if skip is None and not ignore_running_jobs and recheck_running_jobs:
+            if running_job_count(job_dir) != 0:
+                skip = "running_jobs_detected"
         if skip is None:
             head = _git(runner, "-C", item["path"], "rev-parse", "HEAD")
             ref = _git(runner, "-C", item["path"], "symbolic-ref", "-q", "HEAD")

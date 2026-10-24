@@ -39,7 +39,10 @@ _MAX_INT = (1 << 63) - 1
 
 def mode_from_environment(env: Mapping[str, str] | None = None) -> str:
     source = env if env is not None else os.environ
-    value = source.get("SUMMON_BREAKER", "").strip().lower()
+    value = (
+        source.get("SUMMON_BREAKER", "").strip().lower()
+        or source.get("SUMMON_BREAKER_MODE", "").strip().lower()
+    )
     return value if value in MODES else DEFAULT_MODE
 
 

@@ -62,6 +62,8 @@ INNER_STATE_FILES = (
 MAX_LOCKFILE_BYTES = 16 * 1024 * 1024
 MAX_TREE_DEPTH = 32
 MAX_TREE_VISITED_ENTRIES = 100_000
+MAX_INLINE_FILE_HASH_BYTES = 65_536
+MAX_TREE_HASH_BYTES = 8 * 1024 * 1024
 _FORBIDDEN_SEGMENTS = frozenset({"", ".", "..", ".git", ".claude"})
 _STRATEGIES = frozenset({"junction", "symlink"})
 _HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -399,10 +401,13 @@ def _scandir_digest(
     *,
     depth: int = MAX_TREE_DEPTH,
     budget: list[int] | None = None,
+    byte_budget: list[int] | None = None,
     incomplete: list[bool] | None = None,
 ) -> str | None:
     if budget is None:
         budget = [MAX_TREE_VISITED_ENTRIES]
+    if byte_budget is None:
+        byte_budget = [MAX_TREE_HASH_BYTES]
     if incomplete is None:
         incomplete = [False]
     h = hashlib.sha256()
@@ -435,6 +440,7 @@ def _scandir_digest(
                         entry.path,
                         depth=depth - 1,
                         budget=budget,
+                        byte_budget=byte_budget,
                         incomplete=incomplete,
                     )
                     if sub_digest is None or incomplete[0]:
@@ -447,7 +453,30 @@ def _scandir_digest(
                     )
                 else:
                     st = entry.stat(follow_symlinks=False)
-                    rec = f"F\0{entry.name}\0{int(is_sym)}\0{st.st_size}\0{st.st_mtime_ns}\n"
+                    mode_oct = f"{stat.S_IMODE(st.st_mode):o}"
+                    sym_target = ""
+                    content_digest = ""
+                    if is_sym:
+                        try:
+                            sym_target = os.readlink(entry.path)
+                        except OSError:
+                            incomplete[0] = True
+                            return None
+                    elif (
+                        stat.S_ISREG(st.st_mode)
+                        and 0 < st.st_size <= MAX_INLINE_FILE_HASH_BYTES
+                        and byte_budget[0] >= st.st_size
+                    ):
+                        byte_budget[0] -= st.st_size
+                        digest = _hash_regular_file(entry.path)
+                        if digest is None or digest == _UNREADABLE_FILE:
+                            incomplete[0] = True
+                            return None
+                        content_digest = digest
+                    rec = (
+                        f"F\0{entry.name}\0{int(is_sym)}\0{mode_oct}\0"
+                        f"{st.st_size}\0{st.st_mtime_ns}\0{sym_target}\0{content_digest}\n"
+                    )
                     h.update(rec.encode("utf-8", errors="surrogateescape"))
             except OSError:
                 incomplete[0] = True

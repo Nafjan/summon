@@ -155,6 +155,7 @@ def _atomic_write_json(path: str, obj: dict) -> None:
 # is refused (never followed), so a record/result cannot be aliased to another
 # job's file.
 _MISSING, _OK, _CORRUPT = "missing", "ok", "corrupt"
+MAX_JOB_JSON_BYTES = 16 * 1024 * 1024
 
 
 def _read(path: str):
@@ -182,10 +183,13 @@ def _read(path: str):
     except OSError:
         return None, _CORRUPT           # ELOOP on a POSIX symlink leaf, or any open error
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            return None, _CORRUPT        # not a regular file (symlink target on Win, fifo, ...)
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_JOB_JSON_BYTES:
+            return None, _CORRUPT        # not a regular file (symlink target on Win, fifo, ...) or oversized
         with os.fdopen(fd, "rb", closefd=False) as fh:
-            raw = fh.read()
+            raw = fh.read(MAX_JOB_JSON_BYTES + 1)
+        if len(raw) > MAX_JOB_JSON_BYTES:
+            return None, _CORRUPT
     except OSError:
         return None, _CORRUPT
     finally:

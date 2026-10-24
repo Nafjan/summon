@@ -610,15 +610,29 @@ class ConversationJournalTests(unittest.TestCase):
             proposal_id="prop-breaker",
         )
         native_second = room.events(native=True)[-1]["payload"]
-        # Plant a stale dead-PID lock file before concurrent promotions so both
-        # workers race to reclaim the same stale lock
-        lock_file = agents_dir / ".memory-promote.lock"
+        import os as _os
+        lock_file = agents_dir / ".memory.md.lock"
+        # An aged lock held by a live PID must NOT be reclaimed or terminate the process on Windows.
+        live_marker = json.dumps(
+            {"pid": _os.getpid(), "token": "b" * 32, "started_at": 1.0},
+            sort_keys=True, separators=(",", ":"),
+        ).encode("ascii")
+        lock_file.write_bytes(live_marker)
+        _os.utime(lock_file, (1.0, 1.0))
+        with self.assertRaisesRegex(ConversationError, "memory.md is busy"):
+            promote_memory_proposal(
+                native_artifact, project_root=self.project, human_confirmed=True,
+                expected_memory_sha256=base_sha)
+        self.assertTrue(lock_file.is_file())
+        lock_file.unlink()
+
+        # Plant a stale dead-PID lock file at the real .memory.md.lock path before
+        # concurrent promotions so both workers race to reclaim the same stale lock
         stale_marker = json.dumps(
             {"pid": 99999999, "token": "a" * 32, "started_at": 1.0},
             sort_keys=True, separators=(",", ":"),
         ).encode("ascii")
         lock_file.write_bytes(stale_marker)
-        import os as _os
         _os.utime(lock_file, (1.0, 1.0))
         # Unconfirmed promotion fails closed
         with self.assertRaises(ConversationError):
