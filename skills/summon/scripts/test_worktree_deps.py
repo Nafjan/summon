@@ -782,6 +782,14 @@ def test_round2_pnpm_depth_incomplete_fingerprint_and_v2_rename_regressions(tmp_
         assert pnpm_idx.stat().st_mtime_ns == st_before.st_mtime_ns
         fp_after = _worktree_deps.fingerprint_dep_target(str(repo), "node_modules")
         assert fp_after is not None and fp_after != fp_before
+
+        # Exhausting MAX_TREE_HASH_BYTES or MAX_INLINE_FILE_HASH_BYTES fails closed (returns None)
+        with monkeypatch.context() as m:
+            m.setattr(_worktree_deps, "MAX_TREE_HASH_BYTES", 4)
+            assert _worktree_deps.fingerprint_dep_target(str(repo), "node_modules") is None
+        with monkeypatch.context() as m:
+            m.setattr(_worktree_deps, "MAX_INLINE_FILE_HASH_BYTES", 4)
+            assert _worktree_deps.fingerprint_dep_target(str(repo), "node_modules") is None
     finally:
         if _worktree_deps._is_link_or_junction(os.path.join(wt_path, "node_modules")):
             _worktree_deps._remove_dir_link(os.path.join(wt_path, "node_modules"))

@@ -51,12 +51,12 @@ notes, and test evidence, see the [detailed engineering history](docs/ENGINEERIN
   `SUMMON_CONTEXT_HANDOFF_THRESHOLD`, defaulting to a window-scaled curve from
   `0.75` at `<=200k` tokens to `0.50` at `>=1M` tokens, `summon.context-handoff/v1`):
   queues a deterministic at-most-once handoff steering directive when enforced,
-  parses and redacts structured `handoff_note` blocks (`HANDOFF_STATE`,
+  parses and redacts structured top-level `handoff_note` blocks (`HANDOFF_STATE`,
   `COMPLETED`, `NEXT_STEPS`, `OPEN_QUESTIONS`, `ARTIFACTS_TOUCHED`), binds
   sanitized `handoff_note` state into governed background continuation and
   resume claims, and fails closed (`error_kind: "resume_context_headroom_exhausted"`)
-  on direct `--resume` session-handle reuse when a prior envelope sets
-  `context_handoff_recommended: true`.
+  during governed `jobs resume` in `enforce` mode when `context_occupancy`
+  exceeds the continuation threshold (`prefer_fresh_lane: true`).
 - Extend swarm coordination and conversation memory governance: add task DAG
   dependencies (`depends_on` with cycle rejection, dependency-gated task
   claiming, and `blocked_by_failed_dependencies` status reporting), structured

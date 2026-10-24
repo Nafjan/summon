@@ -1036,6 +1036,8 @@ def test_breaker_mode_env_alias_and_control_headroom_and_seal_retry(tmp_path: Pa
     monkeypatch.setattr(_job_control, "MAX_BREAKER_COMMANDS", 1)
     d2 = b.evaluate(extra_triggers=())
     assert rc.record_breaker(d2) is None
+    assert b.level == "healthy"
+    assert d2["level"] == "healthy"
     assert rc.breaker_level == "healthy"
     assert _job_control.queue_command(root, job_id, "cancel")["status"] == "queued"
     assert _job_control.control_summary(root, job_id)["state"] == "queued"

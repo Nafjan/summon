@@ -750,7 +750,8 @@ def queue_command(root: str, job_id: str, action: str, *,
 
 
 def _append_breaker_command(path: str, job_id: str, nonce: str,
-                            decision: dict, *, wall_clock=None) -> dict | None:
+                            decision: dict, *, wall_clock=None,
+                            _rollback_on_breaker_limit: bool = True) -> dict | None:
     """Append one authenticated breaker transition to a v2 control log."""
     if not isinstance(decision, dict) or not decision.get("transitioned"):
         return None
@@ -826,7 +827,13 @@ def _append_breaker_command(path: str, job_id: str, nonce: str,
             if checked is None or checked_integrity != "authenticated":
                 raise ValueError("breaker transition command conflicts with control log state")
             _write_control_json(path, existing)
-    except Exception:
+    except Exception as exc:
+        if (
+            not _rollback_on_breaker_limit
+            and isinstance(exc, ValueError)
+            and str(exc) == "job control breaker command limit reached"
+        ):
+            raise
         rollback_fn = getattr(decision, "_rollback", None)
         if callable(rollback_fn):
             rollback_fn()
@@ -1429,7 +1436,8 @@ class RuntimeControl:
                 try:
                     queued = _append_breaker_command(
                         self.path, self.job_id, self.nonce, decision,
-                        wall_clock=self.wall_clock)
+                        wall_clock=self.wall_clock,
+                        _rollback_on_breaker_limit=(decision.get("mode") != "shadow"))
                 except ValueError as exc:
                     if (str(exc) == "job control breaker command limit reached"
                             and decision.get("mode") == "shadow"):

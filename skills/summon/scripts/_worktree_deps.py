@@ -462,11 +462,13 @@ def _scandir_digest(
                         except OSError:
                             incomplete[0] = True
                             return None
-                    elif (
-                        stat.S_ISREG(st.st_mode)
-                        and 0 < st.st_size <= MAX_INLINE_FILE_HASH_BYTES
-                        and byte_budget[0] >= st.st_size
-                    ):
+                    elif stat.S_ISREG(st.st_mode) and st.st_size > 0:
+                        if (
+                            st.st_size > MAX_INLINE_FILE_HASH_BYTES
+                            or byte_budget[0] < st.st_size
+                        ):
+                            incomplete[0] = True
+                            return None
                         byte_budget[0] -= st.st_size
                         digest = _hash_regular_file(entry.path)
                         if digest is None or digest == _UNREADABLE_FILE:
