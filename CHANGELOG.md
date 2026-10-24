@@ -5,26 +5,66 @@ notes, and test evidence, see the [detailed engineering history](docs/ENGINEERIN
 
 ## [Unreleased]
 
-- Long-horizon hardening, Phase 1 (advisory, no behavior change): every dispatch
-  envelope gains `usage_metrics` (budget-grade `work_tokens` that exclude cache
-  reads, with explicit `input_semantics` for Anthropic- vs OpenAI-shaped usage),
-  `context_occupancy` (input-side fill of the latest root Claude request against
-  the served model's reported context window), and `progress_signals`
-  (shadow-mode consecutive identical tool calls and consecutive tool failures for
-  Claude, Codex and Gemini streams; counts only, no tool names or inputs).
-- Long-horizon hardening, Phase 2: adaptive background jobs record a
-  checkpoint-time `progress_judgement` that discounts stream activity during a
-  detected tool loop, credits a still-running tool for up to three checkpoint
-  intervals, and treats a working-tree change (git porcelain plus stat tuples) as
-  progress. `SUMMON_PROGRESS_JUDGE=shadow` (default) publishes the judgement in the
-  authenticated heartbeat while the legacy rule still decides; `enforce` applies
-  it; `off` disables it.
-- Add `summon worktree gc` (flat: `--worktree-gc`): a dry-run-by-default plan for
-  reclaiming Summon `agents/*` worktrees that are unlocked, idle for
-  `--min-age-hours` (default 24), clean, and integrated into `--base` (no commits
-  beyond it, or an identical tree). `--apply` uses `git worktree remove` without
-  `--force` and `git branch -d`, and refuses while background jobs run unless
+## [3.7.0] - 2026-10-24
+
+- Add budget-grade token accounting, context-window occupancy, and progress-signal
+  telemetry to every dispatch envelope: `usage_metrics` (`summon.usage-metrics/v1`)
+  computes `work_tokens` (`uncached_input + cache_write + output + reasoning`,
+  excluding cache reads) with explicit `input_semantics` across Claude, Codex,
+  and Gemini; `context_occupancy` (`summon.context-occupancy/v1`) tracks the
+  input-side fill of the latest root request against the served model's context
+  window; and `progress_signals` (`summon.progress-signals/v1`) records
+  tool-loop and consecutive-failure counters from SHA-256 argument fingerprints
+  without retaining raw tool inputs.
+- Add progress-aware adaptive timeout checkpoints and safe worktree garbage
+  collection: adaptive background jobs evaluate a checkpoint-time
+  `progress_judgement` (`summon.progress-judgement/v1`, controlled by
+  `SUMMON_PROGRESS_JUDGE=off|shadow|enforce`, default `shadow`) that discounts
+  stream activity during a detected tool loop, credits a still-running tool for
+  up to three checkpoint intervals, and treats a working-tree change as
+  progress. Add `summon worktree gc` (`--worktree-gc`, `summon.worktree-gc/v1`),
+  a dry-run-by-default reclaimer for unlocked, idle (`--min-age-hours`, default
+  `24`), clean, and merged `agents/*` worktrees that revalidates state before
+  acting on `--apply` and refuses while background jobs run unless
   `--ignore-running-jobs` is given.
+- Add a graduated circuit breaker for adaptive background jobs:
+  `SUMMON_BREAKER_MODE=off|shadow|enforce` (with `SUMMON_BREAKER_ALLOW_STOP=0|1`)
+  evaluates a four-level escalation ladder (`healthy` -> `steering` ->
+  `constrained` -> `stopped`, `summon.breaker/v1`) with compaction grace across
+  `PreCompact` / `PostCompact` events, one-level de-escalation on clean
+  checkpoints, and HMAC-authenticated `action: "breaker"` control transitions in
+  `summon.job-control/v2`.
+- Add opt-in worktree dependency bridging (`--link-deps {off,auto,symlink,junction}`,
+  default `off`, and `--link-deps-allow-mutation`): bridges `node_modules` and
+  `.venv` into isolated `--worktree` checkouts only when base and target
+  lockfiles match (`summon.worktree-deps/v1`), unlinks bridges before worktree
+  teardown so shared directories are never traversed, and fails closed
+  (`error_kind: "worktree_dependency_drift"`) if a bridged dependency tree
+  mutates without `--link-deps-allow-mutation`.
+- Add context-window-aware handoffs, structured handoff notes, and headroom
+  routing (`SUMMON_CONTEXT_HANDOFF=off|shadow|enforce`,
+  `SUMMON_CONTEXT_HANDOFF_THRESHOLD`, default `0.80`, `summon.context-handoff/v1`):
+  queues a deterministic at-most-once handoff steering directive when enforced,
+  parses and redacts structured `handoff_note` blocks (`HANDOFF_STATE`,
+  `COMPLETED`, `NEXT_STEPS`, `OPEN_QUESTIONS`, `ARTIFACTS_TOUCHED`), binds
+  sanitized `handoff_note` state into governed background continuation and
+  resume claims, and blocks direct session-handle reuse when
+  `context_handoff_recommended` is set unless `--fresh-handoff` is passed.
+- Extend swarm coordination and conversation memory governance: add task DAG
+  dependencies (`depends_on` with cycle rejection and dependency-gated task
+  readiness/claiming), structured `human_question` task blocking and answer
+  resumption, bounded message `hop_count` / `max_hops` (`12` default) with
+  idempotent retry replay prior to `hop_limit_exceeded` refusal, and attested
+  conversation memory proposals (`summon.conversation-memory-proposal/v1`) with
+  compare-and-swap locked commits.
+- Add `summon jobs watch` (`--jobs-watch`, `--once`, `--interval SEC`,
+  `--active-only`, `--json`, `summon.jobs-watch/v1`) and Conversation Atlas
+  telemetry badges: `jobs watch` renders an operator dashboard of
+  HMAC-authenticated `summon.job-heartbeat/v2` and terminal result telemetry
+  (`STATE`, `PHASE`, `ELAPSED`, `BREAKER`, `CTX%`, `PROGRESS`, `WORK_TOK`,
+  `SPEND`) with terminal-result precedence over retained heartbeats and
+  fail-closed `unknown_spend` reporting, while Conversation Atlas turns display
+  allowlisted scalar `turn_telemetry_summary` badges.
 
 ## [3.6.2] - 2026-10-23
 
