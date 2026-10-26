@@ -2395,7 +2395,11 @@ def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, mod
                            allow_tool_credentials=False,
                            require_exact_model=False,
                            link_deps=None,
-                           link_deps_allow_mutation=False) -> dict:
+                           link_deps_allow_mutation=False,
+                           base_commit=None,
+                           upstream_handoffs=None,
+                           files_scope=None,
+                           depends_on=None) -> dict:
     """THE request identity, built in ONE place from RAW inputs.
 
     The dispatcher and the manifest parent each used to build their own dict, so a field
@@ -2558,6 +2562,28 @@ def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, mod
         ) if link_deps else None,
         "link_deps_allow_mutation": (
             "1" if (link_deps_allow_mutation and link_deps) else None
+        ),
+        "base_commit": (str(base_commit).strip() or None) if base_commit else None,
+        "upstream_handoffs_sha256": (
+            hashlib.sha256(
+                json.dumps(
+                    [{"id": str(item.get("id", "")),
+                      "request_sha256": str(item.get("request_sha256", "")),
+                      "handoff_sha256": str(item.get("handoff_sha256", ""))}
+                     for item in sorted(upstream_handoffs, key=lambda x: str(x.get("id", "")))
+                     if isinstance(item, dict)],
+                    sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                ).encode("utf-8")
+            ).hexdigest()
+            if upstream_handoffs else (os.environ.get("SUMMON_UPSTREAM_HANDOFFS_SHA256") or None)
+        ),
+        "manifest_files_scope": (
+            ("," .join(sorted(str(p).strip() for p in files_scope if str(p).strip())) or None)
+            if files_scope else (os.environ.get("SUMMON_MANIFEST_FILES_SCOPE") or None)
+        ),
+        "manifest_depends_on": (
+            ("," .join(sorted(str(d).strip() for d in depends_on if str(d).strip())) or None)
+            if depends_on else (os.environ.get("SUMMON_MANIFEST_DEPENDS_ON") or None)
         ),
         # OpenCode yolo is an explicit isolated-lane operation.  These controls
         # are part of the identity so a cached unrestricted result cannot satisfy

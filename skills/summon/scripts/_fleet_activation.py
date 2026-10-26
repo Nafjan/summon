@@ -54,7 +54,7 @@ _PRIVATE_INVOCATION_FIELDS = frozenset({
     "resume_profile", "extra_args", "base_url", "api_key_env",
     "api_key_fingerprint",
     "agy_account_sha256", "profile", "profile_env", "profile_command",
-    "openrouter_options", "worktree", "read_roots", "attempt_id",
+    "openrouter_options", "worktree", "link_deps", "read_roots", "attempt_id",
     "parent_attempt_id",
 })
 
@@ -64,7 +64,8 @@ _INVOCATION_FIELDS = frozenset({
     "model_exact_source", "effort", "external_cli_version", "resume_id", "resume_profile", "extra_args",
     "base_url", "api_key_env", "api_key_fingerprint", "allow_payg", "agy_account_sha256",
     "agy_account_checked", "permission_forced", "profile", "profile_env",
-    "profile_command", "profile_auth_mode", "openrouter_options", "worktree", "isolated_lane",
+    "profile_command", "profile_auth_mode", "openrouter_options", "worktree",
+    "link_deps", "link_deps_allow_mutation", "isolated_lane",
     "allow_tool_credentials", "transport_capability", "read_roots", "output_contract", "attempt_id",
     "attempt_kind", "attempt_ordinal", "parent_attempt_id",
     "request_sha256",

@@ -1,12 +1,12 @@
 # Phase 1 migration and rollback
 
-Current product version: 3.7.0
+Current product version: 3.8.0
 
 This is the active migration contract for the Phase 1 control plane. Historical 2.x to
 3.0 instructions remain in `VERSIONING_AND_3.0.md`, but a current release must satisfy
 this document and the machine-checked canonical version.
 
-The 3.7.0 release advances the canonical marker to 3.7.0 and ships the
+The 3.8.0 release advances the canonical marker to 3.8.0 and ships the
 compatibility behavior described below as a provider-free workspace preview.
 It neither authorizes live qualification nor waives a fixed publication gate;
 unsupported live adapters and native device acceptance remain separately gated.

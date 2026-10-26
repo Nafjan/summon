@@ -618,6 +618,15 @@ def doctor(agents_dir: str | None = None, cwd: str | None = None,
         "opencode_cwd_policy": _opencode_cwd_policy(cwd),
     }
     try:
+        from _resource_governor import snapshot_host_resources
+        report["resource_governor"] = snapshot_host_resources(cwd=cwd)
+    except Exception as exc:  # noqa: BLE001 - advisory; never break doctor
+        report["resource_governor"] = {
+            "schema": "summon.resource-governor/v1",
+            "admitted": False,
+            "reason": f"{type(exc).__name__}: {exc}",
+        }
+    try:
         from _t3 import t3_status
         report["t3_code"] = t3_status()
     except Exception:  # noqa: BLE001 — advisory; never break doctor
@@ -664,6 +673,27 @@ def render(report: dict) -> str:
     lines = [
         f"platform : {report['platform']}   python {report['python']}",
         f"git      : {'[OK]' if report['git']['found'] else '[--] not found (needed for --worktree)'}",
+    ]
+    rg = report.get("resource_governor") or {}
+    if isinstance(rg, dict) and rg.get("schema") == "summon.resource-governor/v1":
+        mem = rg.get("memory") or {}
+        cpu = rg.get("cpu") or {}
+        dsk = rg.get("disk") or {}
+        ram_str = (f"{mem.get('avail_ram_mb')}MB/{mem.get('total_ram_mb')}MB free"
+                   if mem.get("avail_ram_mb") is not None else "RAM unknown")
+        cpu_str = (f"CPU {cpu.get('cpu_busy_pct')}%"
+                   if cpu.get("cpu_busy_pct") is not None
+                   else (f"load {cpu.get('normalized_load_ratio')}x"
+                         if cpu.get("normalized_load_ratio") is not None else "CPU unknown"))
+        dsk_str = (f"disk {dsk.get('effective_free_gb')}GB free"
+                   if dsk.get("effective_free_gb") is not None else "disk unknown")
+        mark = "[OK]" if rg.get("admitted") else "[!!]"
+        lines.append(
+            f"resources: {mark} {ram_str}, {cpu_str}, {dsk_str}  "
+            f"(active={rg.get('active_leases', 0)}, "
+            f"recommended_slots={rg.get('recommended_total_slots', 0)})"
+        )
+    lines += [
         "",
         "backends:",
     ]

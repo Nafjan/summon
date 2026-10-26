@@ -1561,6 +1561,22 @@ class RuntimeControl:
             # Only the observational file write is fail-soft. Authentication,
             # durable commands and provider launch fences remain strict.
             self.heartbeat_unavailable = True
+        mission_id = os.environ.get("SUMMON_MISSION_ID")
+        if mission_id and self.usage_metrics is not None:
+            try:
+                from _mission_budget import record_heartbeat_usage
+                job_dir = os.environ.get("SUMMON_JOB_DIR") or os.environ.get("SUMMON_JOBS_DIR")
+                eff_job_id = os.environ.get("SUMMON_MISSION_JOB_ID") or self.job_id
+                record_heartbeat_usage(
+                    mission_id,
+                    job_id=eff_job_id,
+                    attempt_id=self.attempt_id,
+                    usage_metrics=self.usage_metrics,
+                    attempt_kind=self.attempt_kind,
+                    job_dir=job_dir,
+                )
+            except Exception:
+                pass
 
     def projection(self) -> dict:
         out = {"enabled": True, "attention_required": self.attention_required,

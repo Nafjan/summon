@@ -102,7 +102,7 @@ from _resolver import discover_models, resolve_cli  # noqa: E402
 # Keep a literal assignment: the release-contract parser uses the dispatcher
 # source as a machine-checkable companion.  `_telemetry.SUMMON_VERSION` must be
 # updated in the same release; the release contract checks both literals.
-__version__ = "3.7.0"  # summon dispatcher version (see CHANGELOG.md)
+__version__ = "3.8.0"  # summon dispatcher version (see CHANGELOG.md)
 
 # When set (a --background child), the final JSON goes to this file (atomically,
 # via .tmp + rename) instead of stdout, so the parent can poll for completion.
@@ -2282,6 +2282,24 @@ def main() -> None:
         from _workspace_entry import run_command as _run_workspace_command
         sys.exit(_run_workspace_command(args))
 
+    if getattr(args, "mission_action", None):
+        from _mission import run_command as _run_mission_command
+        sys.exit(_run_mission_command(args))
+
+    if getattr(args, "memory_action", None):
+        from _memory_index import format_memory_search_human, search_memory
+        _mem_cwd = os.path.abspath(args.cwd or os.getcwd())
+        _mem_res = search_memory(
+            getattr(args, "memory_query", "") or "",
+            cwd=_mem_cwd,
+            limit=int(getattr(args, "memory_limit", 10) or 10),
+        )
+        if args.json:
+            print(json.dumps(_mem_res, ensure_ascii=False))
+        else:
+            print(format_memory_search_human(_mem_res))
+        sys.exit(0)
+
     if getattr(args, "chat_action", None):
         from _conversation import run_command as _run_conversation_command
         sys.exit(_run_conversation_command(args))
@@ -3480,6 +3498,96 @@ def main() -> None:
         _emit(_env, operation=_EMIT_OPERATION, trusted_executor_result=True)
         sys.exit(0)
 
+    _mission_id = getattr(args, "mission_id", None) or os.environ.get("SUMMON_MISSION_ID") or None
+    _mission_max_wt = getattr(args, "mission_max_work_tokens", None)
+    if _mission_max_wt is None and os.environ.get("SUMMON_MISSION_MAX_WORK_TOKENS"):
+        try:
+            _mission_max_wt = int(os.environ["SUMMON_MISSION_MAX_WORK_TOKENS"])
+        except ValueError:
+            pass
+    _mission_max_cost = getattr(args, "mission_max_cost_usd", None)
+    if _mission_max_cost is None and os.environ.get("SUMMON_MISSION_MAX_COST_USD"):
+        try:
+            _mission_max_cost = float(os.environ["SUMMON_MISSION_MAX_COST_USD"])
+        except ValueError:
+            pass
+    if (_mission_max_wt is not None or _mission_max_cost is not None) and not _mission_id:
+        _die("--mission-max-work-tokens and --mission-max-cost-usd require --mission-id",
+             error_kind="invalid_input")
+    _mission_job_id = (
+        os.environ.get("SUMMON_MISSION_JOB_ID")
+        or os.environ.get("SUMMON_JOB_ID")
+        or f"fg-{uuid.uuid4().hex[:24]}"
+    )
+    _mission_reserved_attempt_id = (
+        os.environ.get("SUMMON_MISSION_INITIAL_ATTEMPT_ID")
+        or invocation.attempt_id
+        or _mission_job_id
+    )
+    args._mission_id = _mission_id
+    args._mission_job_id = _mission_job_id
+    args._mission_reserved_attempt_id = _mission_reserved_attempt_id
+    args._mission_max_wt = _mission_max_wt
+    args._mission_max_cost = _mission_max_cost
+    if _mission_id:
+        from _mission_budget import (
+            MissionBudgetError,
+            MissionBudgetExhaustedError,
+            reserve_launch as _mb_reserve_launch,
+        )
+        try:
+            _mb_reserve_launch(
+                _mission_id,
+                job_id=_mission_job_id,
+                attempt_id=_mission_reserved_attempt_id,
+                agent=args.agent,
+                max_work_tokens=_mission_max_wt,
+                max_cost_usd=_mission_max_cost,
+                job_dir=getattr(args, "job_dir", None),
+            )
+        except MissionBudgetExhaustedError as mex:
+            _die(str(mex), error_kind="mission_budget_exhausted",
+                 extra={"provider_contacted": False, "retryable": False,
+                        "result_usable": False})
+        except MissionBudgetError as merr:
+            _die(str(merr), error_kind=merr.kind,
+                 extra={"provider_contacted": False, "retryable": False,
+                        "result_usable": False})
+
+    if getattr(args, "in_flight_hooks", False) and cli != "claude":
+        if _mission_id:
+            try:
+                from _mission_budget import settle_attempt as _mb_settle_attempt
+                _mb_settle_attempt(
+                    _mission_id, job_id=_mission_job_id,
+                    attempt_id=_mission_reserved_attempt_id,
+                    provider_contacted=False, terminal_status="blocked",
+                    agent=args.agent, job_dir=getattr(args, "job_dir", None))
+            except Exception:
+                pass
+        _die("--in-flight-hooks is supported only on the claude backend",
+             error_kind="in_flight_hooks_unsupported",
+             extra={"provider_contacted": False, "retryable": False,
+                    "result_usable": False})
+    if cli == "claude" and getattr(args, "in_flight_hooks", False):
+        if not os.environ.get("SUMMON_CLAUDE_HOOK_SETTINGS_FILE"):
+            _fg_job_id = os.environ.get("SUMMON_JOB_ID")
+            if not _fg_job_id or not _jobs.valid_job_id(_fg_job_id):
+                if _mission_id:
+                    try:
+                        from _mission_budget import settle_attempt as _mb_settle_attempt
+                        _mb_settle_attempt(
+                            _mission_id, job_id=_mission_job_id,
+                            attempt_id=_mission_reserved_attempt_id,
+                            provider_contacted=False, terminal_status="blocked",
+                            agent=args.agent, job_dir=getattr(args, "job_dir", None))
+                    except Exception:
+                        pass
+                _die("--in-flight-hooks requires a background job context (--background)",
+                     error_kind="in_flight_hooks_requires_background_job",
+                     extra={"provider_contacted": False, "retryable": False,
+                            "result_usable": False})
+
     # --gate-with: another agent must APPROVE this dispatch before it runs. Placed
     # BEFORE git_head_before and the dispatch itself so a refused request never
     # touches the tree. Fails closed inside _gate.decide.
@@ -3535,6 +3643,19 @@ def main() -> None:
                         "because removing it could lose work (%s). Inspect %s and branch %s"
                         % (_cleanup["reason"], _cleanup["path"], _cleanup["branch"]))
             finalize_exit_fields(_env)
+            if _mission_id:
+                try:
+                    from _mission_budget import settle_envelope as _mb_settle_envelope
+                    _env["mission_budget"] = _mb_settle_envelope(
+                        _mission_id,
+                        job_id=_mission_job_id,
+                        envelope=_env,
+                        fallback_attempt_id=_mission_reserved_attempt_id,
+                        agent=args.agent,
+                        job_dir=getattr(args, "job_dir", None),
+                    )
+                except Exception:
+                    pass
             if args.out:
                 _write_out(args.out, _env)
             _emit(_env, operation=_EMIT_OPERATION, trusted_executor_result=True)
@@ -3648,6 +3769,20 @@ def main() -> None:
     # the envelope, and this keeps prompt_sha256 bound to the ROOT prompt (the
     # correction prompt must never restamp it).
     result.update(receipt)
+    if _mission_id:
+        try:
+            from _mission_budget import settle_envelope as _mb_settle_envelope
+            _mb_summary = _mb_settle_envelope(
+                _mission_id,
+                job_id=_mission_job_id,
+                envelope=result,
+                fallback_attempt_id=_mission_reserved_attempt_id,
+                agent=args.agent,
+                job_dir=getattr(args, "job_dir", None),
+            )
+            result["mission_budget"] = _mb_summary
+        except Exception:  # noqa: BLE001
+            pass
     # Public accounting is rebuilt from the private per-attempt records only
     # after all retry/repair paths have finished. Replaying the same attempt id
     # cannot inflate it; repeated physical submissions with different ids do.
@@ -4973,6 +5108,49 @@ def _chat_launch_control(invocation):
         before_launch=before_launch, requires_launch_observation=True)
 
 
+def _reserve_secondary_mission_attempt(args, invocation, next_attempt_id: str,
+                                       next_attempt_kind: str,
+                                       prior_result: dict | None = None) -> tuple[bool, str | None]:
+    """Settle prior attempt (if any) and reserve budget for a secondary attempt (`retry`, `acp_fallback`, `schema_correction`, `contract_repair`)."""
+    mid = getattr(args, "_mission_id", None) or getattr(args, "mission_id", None) or os.environ.get("SUMMON_MISSION_ID")
+    if not mid:
+        return True, None
+    jid = getattr(args, "_mission_job_id", None) or os.environ.get("SUMMON_MISSION_JOB_ID") or os.environ.get("SUMMON_JOB_ID") or "fg-job"
+    fallback_aid = getattr(args, "_mission_reserved_attempt_id", None) or invocation.attempt_id or jid
+    job_dir = getattr(args, "job_dir", None)
+    max_wt = getattr(args, "_mission_max_wt", getattr(args, "mission_max_work_tokens", None))
+    max_cost = getattr(args, "_mission_max_cost", getattr(args, "mission_max_cost_usd", None))
+    try:
+        from _mission_budget import (
+            MissionBudgetError,
+            MissionBudgetExhaustedError,
+            reserve_launch,
+            settle_envelope,
+        )
+        if isinstance(prior_result, dict):
+            settle_envelope(
+                mid,
+                job_id=jid,
+                envelope=prior_result,
+                fallback_attempt_id=fallback_aid,
+                agent=getattr(args, "agent", None),
+                job_dir=job_dir,
+            )
+        reserve_launch(
+            mid,
+            job_id=jid,
+            attempt_id=next_attempt_id,
+            agent=getattr(args, "agent", None),
+            attempt_kind=next_attempt_kind,
+            max_work_tokens=max_wt,
+            max_cost_usd=max_cost,
+            job_dir=job_dir,
+        )
+        return True, None
+    except (MissionBudgetExhaustedError, MissionBudgetError) as exc:
+        return False, str(exc)
+
+
 def _dispatch_with_retries(invocation, args, agents_dir=None, *,
                            launch_control=None) -> dict:
     """execute_agent with --retries: exponential backoff on error/partial only
@@ -4999,6 +5177,17 @@ def _dispatch_with_retries(invocation, args, agents_dir=None, *,
         # receive fresh ids and remain visible in ``attempt_history``.
         attempt_id = (invocation.attempt_id if attempt == 0 and invocation.attempt_id
                       else uuid.uuid4().hex)
+        if attempt > 0:
+            _ok_mb, _mb_err = _reserve_secondary_mission_attempt(
+                args, invocation, attempt_id, "transient_retry",
+                prior_result={**_prev_result, "attempt_history": list(_attempt_history)},
+            )
+            if not _ok_mb:
+                result["mission_budget_retry_blocked"] = True
+                result.setdefault("warnings", []).append(
+                    f"mission budget blocked retry attempt {attempt + 1}: {_mb_err}"
+                )
+                break
         attempt_invocation = _replace(
             invocation, attempt_id=attempt_id,
             attempt_kind="initial" if attempt == 0 else "transient_retry",
@@ -5110,6 +5299,20 @@ def _dispatch_with_retries(invocation, args, agents_dir=None, *,
                 next_kind="acp_fallback", attempt_history=_attempt_history)
         from dataclasses import replace as _replace
         _fallback_attempt_id = uuid.uuid4().hex
+        _ok_fb_mb, _fb_mb_err = _reserve_secondary_mission_attempt(
+            args, invocation, _fallback_attempt_id, "acp_fallback", prior_result=result
+        )
+        if not _ok_fb_mb:
+            result["mission_budget_retry_blocked"] = True
+            result["fallback"] = {
+                "to": "acp",
+                "status": "not_attempted",
+                "reason": "mission_budget_exhausted",
+            }
+            result.setdefault("warnings", []).append(
+                f"mission budget blocked ACP fallback: {_fb_mb_err}"
+            )
+            return result
         fb = execute_agent(_replace(invocation, transport="acp",
                                     attempt_id=_fallback_attempt_id,
                                     attempt_kind="acp_fallback",
@@ -5163,6 +5366,7 @@ def _attempt_projection(envelope: dict, attempt_id: str | None) -> dict:
         "model_served": model.get("served"),
         "served_model_evidence": envelope.get("served_model_evidence", "absent"),
         "cost_usd": envelope.get("cost_usd"),
+        "usage_metrics": envelope.get("usage_metrics"),
         "liveness": envelope.get("liveness"),
         "runtime_control": envelope.get("runtime_control"),
     }
@@ -5240,6 +5444,15 @@ def _apply_schema(result: dict, schema: dict, invocation, args, agents_dir=None)
         # already happened, and overwriting it would misreport completed work as denied.
         # The refusal of the CORRECTION is its own fact.
         result["gate_correction_refused"] = _refused
+        return result
+    _ok_sc_mb, _sc_mb_err = _reserve_secondary_mission_attempt(
+        args, invocation, retry_inv.attempt_id, "schema_correction", prior_result=result
+    )
+    if not _ok_sc_mb:
+        result["mission_budget_retry_blocked"] = True
+        result.setdefault("warnings", []).append(
+            f"mission budget blocked schema correction: {_sc_mb_err}"
+        )
         return result
     try:
         retry = execute_agent(retry_inv, timeout_ms=args.timeout, debug_dir=args.debug_dir,
@@ -5426,6 +5639,15 @@ def _apply_contract_repair(result: dict, invocation, args, agents_dir=None) -> d
         return result
     if _perm_warning:                     # approved: the resume is about to actually run
         result.setdefault("warnings", []).append(_perm_warning)
+    _ok_cr_mb, _cr_mb_err = _reserve_secondary_mission_attempt(
+        args, invocation, retry_inv.attempt_id, "contract_repair", prior_result=result
+    )
+    if not _ok_cr_mb:
+        result["mission_budget_retry_blocked"] = True
+        result.setdefault("warnings", []).append(
+            f"mission budget blocked contract repair: {_cr_mb_err}"
+        )
+        return result
     try:
         retry = execute_agent(retry_inv, timeout_ms=args.timeout, debug_dir=args.debug_dir,
                               max_tool_output_bytes=getattr(args, "max_tool_output_bytes", None))

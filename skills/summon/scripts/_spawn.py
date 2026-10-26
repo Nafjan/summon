@@ -95,6 +95,15 @@ _INTERNAL_PROVIDER_ENV_NAMES = frozenset({
     # Legacy chat migration authority is consumed by Summon only; never pass
     # the operator-held key through to a vendor CLI child.
     "SUMMON_CHAT_MIGRATION_KEY",
+    "SUMMON_JOBS_DIR",
+    "SUMMON_MISSION_ID",
+    "SUMMON_MISSION_MAX_WORK_TOKENS",
+    "SUMMON_MISSION_MAX_COST_USD",
+    "SUMMON_MISSION_JOB_ID",
+    "SUMMON_MISSION_INITIAL_ATTEMPT_ID",
+    "SUMMON_UPSTREAM_HANDOFFS_SHA256",
+    "SUMMON_MANIFEST_FILES_SCOPE",
+    "SUMMON_MANIFEST_DEPENDS_ON",
 })
 
 
@@ -110,6 +119,8 @@ def scrub_provider_env(values: dict[str, str]) -> dict[str, str]:
         key: value for key, value in values.items()
         if key not in _INTERNAL_PROVIDER_ENV_NAMES
         and not key.startswith("SUMMON_JOB_")
+        and not key.startswith("SUMMON_MISSION_")
+        and not key.startswith("SUMMON_MANIFEST_")
     }
 
 
