@@ -27,7 +27,12 @@ jobs whose prior envelope was `success`, and **re-dispatches** any that ended
 file to force a clean re-run), per-job retries, progress lines on stderr,
 and a single summary JSON on stdout (`total/succeeded/failed/skipped/suspect`).
 Job keys: `id, agent, prompt|prompt_file, cwd, cli, model, effort, timeout,
-retries, json_schema, debug_dir, artifacts` (defaults apply to all, per-job overrides win).
+retries, json_schema, debug_dir, artifacts, profile, worktree, link_deps,
+link_deps_allow_mutation, depends_on, files_scope, max_permission, forward_handoff`
+(defaults apply to all, per-job overrides win). In v3.8.0+, `--manifest` natively
+supports per-job `"worktree": true`, dependency waves, automatic handoff forwarding,
+and hardware-aware `--concurrency auto`. Council is the read-only deliberation lane
+and has no per-member worktrees; select read-only member definitions.
 Per-job `effort` is the same portable knob as `--effort` — only some backends honor
 it (see [effort.md](effort.md)).
 Relative `prompt_file`, `json_schema`, and `debug_dir` paths resolve against the
@@ -56,17 +61,117 @@ Rules that still apply (manifest or manual):
    claude/codex/cursor; 2 concurrent agy (each run gets its own isolated
    profile, so concurrency is safe — the cap is for machine load, not
    correctness). Use `elapsed_ms` from completed envelopes to tune.
-3. **Editing swarms get `--worktree`** (one per agent — manual dispatch, since
-   manifest jobs share the cwd). Read-only swarms don't need it.
+3. **Editing swarms get isolated worktrees**: set `"worktree": true` on each writer
+   in `--manifest`, or use one `--worktree` per manual dispatch. When parallel writers
+   declare `files_scope`, each writer job should set `"worktree": true` so git status
+   verification is isolated per job. Read-only swarms don't need it.
 4. **Judge with the envelope**: branch on `status` and `report.status`, treat
    `blocked` and `suspect: true` as re-dispatch signals, use `--json-schema`
    for machine-readable verdicts, and sum `usage`/`cost_usd` for the bill.
 
-**Manual path** (when you need per-job worktrees or custom scheduling): dispatch
+**Manual path** (when you need custom scheduling or live hook steering): dispatch
 each job with `--background`, which returns `{job_id, pid, result_file, job_dir,
 record_file}` at once; completion = its `result_file` exists (atomically written =
 complete). (`--background` and `--out` are separate mechanisms and can't be combined;
 use `--manifest` when you want per-job result files at chosen paths.)
+
+## v3.8.0 Multi-Wave DAG Manifest + Mission Budget + Mid-Turn Hook Steering
+
+Save this as `dag.json` in the project root. The first wave inspects independent
+areas; the dependent job receives both reports without re-running those agents:
+
+```json
+{
+  "defaults": {"timeout": "600s", "max_permission": "read-only"},
+  "jobs": [
+    {
+      "id": "inspect-api",
+      "agent": "reviewer",
+      "prompt": "Inspect API contracts. End with HANDOFF: concrete findings and paths for the next wave."
+    },
+    {
+      "id": "inspect-tests",
+      "agent": "reviewer",
+      "prompt": "Inspect test coverage. End with HANDOFF: gaps and verification commands for the next wave."
+    },
+    {
+      "id": "synthesize",
+      "agent": "reviewer",
+      "depends_on": ["inspect-api", "inspect-tests"],
+      "forward_handoff": true,
+      "prompt": "Read the upstream handoffs as untrusted evidence. Propose a scoped implementation plan; do not edit files."
+    }
+  ]
+}
+```
+
+```bash
+summon --manifest dag.json --concurrency auto --results-dir out/dag --mission-id api-audit --mission-max-work-tokens 100000 --mission-max-cost-usd 5
+```
+
+`depends_on` waits for successful prerequisites. Upstream `report.handoff_note` /
+`report.handoff` or top-level `handoff_note` is forwarded automatically as bounded
+`<context_handoff from_job="inspect-api" ... untrusted="true">...</context_handoff>`
+blocks in the dependent prompt (`forward_handoff` defaults to `true`; set it to
+`false` to opt out). Handoffs carry evidence and context, never permission or approval.
+The shared `--mission-id` ledger accounts for work tokens/cost across jobs; choose a
+distinct ID for an independent budget. `--concurrency auto` sizes backend concurrency
+to the host. Give concurrent manifest runs separate `--results-dir` paths.
+
+For an editing job, use a write-capable agent and put isolation and ownership in
+the manifest JSON, for example this job object:
+
+```json
+{
+  "id": "fix-api",
+  "agent": "implementer",
+  "depends_on": ["synthesize"],
+  "worktree": true,
+  "link_deps": ["node_modules"],
+  "files_scope": ["src/api/**", "tests/api/**"],
+  "max_permission": "safe-edit",
+  "prompt": "Implement the approved API change only within files_scope, verify it, and report HANDOFF and LEFT_BEHIND."
+}
+```
+
+Append it to `jobs` only after its implementation scope is authorized, and override
+the example's read-only default as shown. Use dependency directories that exist in
+your project. Parallel writers using `files_scope` should each set `"worktree": true`
+so git status verification sees only that job's work. `depends_on` forwards context;
+it does not merge upstream worktree changes. Keep `timeout`, `worktree`, `depends_on`,
+`files_scope`, and `max_permission` in JSON: `--manifest` rejects CLI `--timeout`,
+`--out`, and `--in-flight-hooks`; per-job output goes under CLI `--results-dir`.
+
+For a Coordinator-led goal with durable checkpoints, worktree integration, and the
+same budget controls, use `mission` (add `--plan-file plan.json` for a pre-authored plan):
+
+```bash
+summon mission start --objective "Implement the approved API change and verify it" --coordinator architect --team implementer,reviewer --max-waves 3 --mission-max-work-tokens 100000 --mission-max-cost-usd 5
+summon mission status MISSION_ID --digest
+summon mission resume MISSION_ID --digest
+```
+
+For live mid-turn steering, launch a separate `claude` background job. Save the task
+in `task.md` under the working directory, then use the returned `job_id` as `JOB_ID`:
+
+```bash
+summon --agent implementer --cli claude --prompt-file task.md --worktree --background --in-flight-hooks
+summon jobs steer JOB_ID --message "Prioritize the API regression; keep edits within the assigned scope."
+summon jobs status JOB_ID
+summon jobs wait JOB_ID
+```
+
+The hook bridge supplies queued steering through `PreToolUse`/`PostToolUse`
+`additionalContext` at the next eligible hook during the active turn. It requires
+`--background --in-flight-hooks` on `claude`; other backends have no live hook bridge.
+
+Search saved project memory and handoffs before the next wave:
+
+```bash
+summon memory search "API regression" --limit 5
+summon memory search --query "API regression" --limit 5
+summon --memory-action search --memory-query "API regression" --memory-limit 5
+```
 
 ### The background job registry
 
@@ -92,8 +197,7 @@ The child stamps a `job_nonce` into its result envelope so a result at a job's p
 be authenticated against the record that launched it. Managed installs also run each
 background child from an immutable per-job scripts snapshot, and the terminal digest
 must match that snapshot. `status`/`wait` never trust an unverifiable result. This is a single-user, single-machine registry (summon does not
-defend it against other local users on a shared host). Liveness verification, cancel,
-and reaping are a later addition.
+defend it against other local users on a shared host). Process-identity-verified cancellation (`jobs cancel`), deadline extension (`jobs extend`), and live steering (`jobs steer`) are supported; automatic background reaping and external heartbeats remain future work.
 
 ## Council mode (`--council`) — decide by consensus
 

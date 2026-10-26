@@ -33,7 +33,7 @@ Use Summon in a goal-directed loop: inspect, delegate, check evidence, then choo
 
 **Script Path**: On Windows, use `{SKILL_DIR}\scripts\summon.cmd` (requires `--prompt-file` for dispatches). On macOS/Linux, use `python3 {SKILL_DIR}/scripts/run_subagent.py` (Python 3.10+).
 
-**Command surface**: accepts git-style subcommands — `dispatch` (default), `list [--for TASK]`, `agents validate`, `models`, `doctor`, `onboard`, `auth status|repair`, `manifest FILE`, `mission start|status|watch|steer|reply|cancel|list`, `memory search QUERY`, `council`, `deliberate`, `workspace`, `chat`, `swarm`, `agent new|set NAME`, `role propose|approve|list|resolve`, `jobs list|status|watch|wait|extend|cancel|steer|resume|revalidate`, `wait [--all]`, `worktree gc`, `telemetry enable|disable|status|clear|stats`, `stats`, `usage status|import|refresh|export|example`, `result project|validate|consume`, `fleet propose|validate|inspect|explain|approval`, `bug-report`, `version`. Legacy flat flags work unchanged.
+**Command surface**: accepts git-style subcommands — `dispatch` (default), `list [--for TASK]`, `agents validate`, `models`, `doctor`, `onboard`, `auth status|repair`, `manifest FILE`, `mission start|status|watch|steer|reply|resume|cancel|list`, `memory search QUERY`, `council`, `deliberate`, `workspace`, `chat`, `swarm`, `agent new|set NAME`, `role propose|approve|list|resolve`, `jobs list|status|watch|wait|extend|cancel|steer|resume|revalidate`, `wait [--all]`, `worktree gc`, `telemetry enable|disable|status|clear|stats`, `stats`, `usage status|import|refresh|export|example`, `result project|validate|consume`, `fleet propose|validate|inspect|explain|approval`, `bug-report`, `version`. Legacy flat flags work unchanged.
 
 ## CLI-Specific Notes
 
@@ -51,6 +51,21 @@ Use Summon in a goal-directed loop: inspect, delegate, check evidence, then choo
 
 1. Request elevated permissions via your CLI's tool parameters when required.
 2. Set your host tool's timeout ABOVE `--timeout` (default `600000ms` = 10m; adaptive foreground timeout scales up to `min(2 * p95, 3600000ms)` from local telemetry when `--timeout` is omitted) plus a few seconds of overhead.
+
+## Orchestration Modes
+
+### When to Use Which Mode
+
+| Mode / entry point | When to use it |
+|---|---|
+| `dispatch --agent <name> --prompt ...` | One agent: read-only analysis or a scoped edit in `--worktree`. |
+| `--background` + `jobs` | Long-running async dispatch. Launch with `--in-flight-hooks` on `claude` for live mid-turn steering via `summon jobs steer <id> --message "..."`. |
+| `--manifest <file>` | Known multi-job or multi-wave DAG: `depends_on`, per-job `worktree`, `files_scope`, `max_permission`, `--concurrency auto`, and automatic `<context_handoff>` forwarding. |
+| `mission` (`start`, `status`, `watch`, `steer`, `reply`, `resume`, `cancel`, `list`) | Autonomous or plan-driven multi-wave goal with a Coordinator agent, durable checkpointing, worktree integration, and a token/cost budget ledger (`--mission-max-work-tokens`, `--mission-max-cost-usd`). |
+| `--council` | Open-ended multi-vendor deliberation: independent Round 1 -> cross-examination Round 2 -> Chairman synthesis. |
+| `deliberate --options A,B --seats ...` | Governed fixed-option ballot with named seats, quorum, and a human approval gate. |
+| `chat` (`open`, `post`, `turn`, `show`) | Multi-turn local conversation room. |
+| `swarm` (`create`, `claim`, `renew`, `status`) | Lease-based task claim/renew pool. |
 
 ## Workflow
 
@@ -80,7 +95,7 @@ Define secondary local account/config profiles in `~/.agents/summon-profiles.jso
 
 ### Recommended cross-vendor roster lanes & decision leads
 
-- **Gemini (`gemini-4-argon-high`, `gemini-3.8-flash-high`)**: `argon-reviewer` targets Gemini 4 Argon (`gemini-4-argon-high`); `flash-reviewer`, `researcher`, `frontend`, `docs-writer`, and `antigravity` target Gemini 3.8 Flash (`gemini-3.8-flash-high`) via `agy`. Because `agy` cannot enforce `read-only`, Summon refuses `agy` at `read-only` and fails closed rather than imply a boundary that does not exist (unless `SUMMON_ALLOW_UNENFORCED_READONLY=1` is set). Run `agy` in a disposable clone/`--worktree` with `yolo`.
+- **Gemini (`gemini-4-argon-high`, `gemini-3.8-flash-high`)**: `argon-reviewer` targets Gemini 4 Argon (`gemini-4-argon-high`); `flash-reviewer`, `researcher`, `frontend`, `docs-writer`, and `antigravity` target Gemini 3.8 Flash (`gemini-3.8-flash-high`) via `agy`. `agy` has no enforced sandbox: declared `safe-edit` runs with full authority, advisory `read-only` requires `SUMMON_ALLOW_UNENFORCED_READONLY=1`, and forced `--max-permission` clamps are refused. Run `agy` in a disposable clone/`--worktree` with `yolo`.
 - **OpenAI Codex (`gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-luna`, `gpt-6-codex`, `gpt-5.4-codex-mini`)**: `astra` pins `gpt-6-astra`, `sol-review` pins `gpt-6.1-sol`, and `luna-review` pins `gpt-6-luna` at high effort with exact-model verification.
 - **Claude (`claude-opus-5`, `claude-sonnet-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`, `claude-fable-5-1`)**: `architect`/`planner`/`deep-debugger`/`security-auditor` pin `claude-opus-5`; `pair`/`editor`/`quick-reviewer`/`pr-prep` pin `claude-sonnet-5`; `fable` pins `claude-fable-5-1` (`--profile fable`) as the escalation decision lead.
 - **BytePlus ModelArk Coding Plan (`deepseek-v4-pro`, `glm-5-3-flash`)**: `byteplus-coder` (`deepseek-v4-pro`) and `byteplus-glm-5-3-flash` (`glm-5-3-flash`) run over the subscription `byteplus-coding` route (`/api/coding/v3`, text-only).
@@ -103,6 +118,27 @@ Branch on `status` (`success`, `blocked`, `partial`, `error`), `execution_status
 | `124` | Timeout | Increase `--timeout` or simplify task |
 | `127` | CLI not found | Install required CLI (`doctor`) |
 | `1` | General error | Check `error` and `error_kind` |
+
+## Connecting Models, Harnesses, Subscriptions & APIs
+
+### 10-Backend Connection, Billing & Capability Matrix
+
+Use an agent's `run-agent` frontmatter or `--cli` to select the backend. Authentication belongs to that CLI/profile or endpoint; a subscription in one harness does not authenticate another. Billing below describes the selected route; the provider/account determines actual charges. See [references/backends.md](references/backends.md) for setup details.
+
+| Backend | Connect / Auth | Billing | Surface (Tools vs Text) | Enforced Permissions | Resume & Live Hooks |
+|---|---|---|---|---|---|
+| `claude` | Claude CLI login/profile or `ANTHROPIC_API_KEY` | Subscription or API; some models depend on plan/credits | Tools | `read-only` (plan), `safe-edit` (acceptEdits), `yolo` | Session ID; `--in-flight-hooks` with `--background` |
+| `codex` | Codex CLI / ChatGPT login | Subscription by default; API key only with explicit billing-guard opt-out | Tools | `read-only` sandbox, `safe-edit` workspace-write, `yolo` bypass | Thread ID; no live hooks |
+| `cursor-agent` | Cursor Agent CLI login or `CURSOR_API_KEY` | Cursor account/plan or API route | Tools | Subprocess: `read-only` plan, `safe-edit` trust, `yolo` force/trust; ACP: `yolo`-only | Subprocess session ID (ACP has no resume handle); no live hooks |
+| `gemini` | Gemini CLI Google login or `GEMINI_API_KEY` | Login quota/subscription or API | Tools | Subprocess: `read-only` plan, `safe-edit` auto_edit, `yolo`; ACP: `yolo`-only | No stable-ID resume; no live hooks |
+| `kimi` | `kimi login` / Kimi CLI provider configuration | Kimi account/plan or configured provider | Tools | Only `yolo`; `read-only` and `safe-edit` are refused (`permission_unsupported`) | No stable-ID resume; no live hooks |
+| `agy` | Antigravity (`agy`) Google login/profile | Subscription/login quota | Tools | None enforced — declared `safe-edit` grants full authority; advisory `read-only` requires `SUMMON_ALLOW_UNENFORCED_READONLY=1`; forced `--max-permission` clamps are refused | Session + `--resume-profile`; no live hooks |
+| `arkcli` | `arkcli auth login`; uses active CLI profile | Active profile billing (Coding Plan `/api/coding/v3` subscription quota when Coding Plan profile is active) | Text-only; requires `--allow-text-only` | No local file/shell tools | Previous response ID; no live hooks |
+| `opencode` | `opencode auth login` / `/connect`; provider key/config | Selected provider's API, credits, or Coding Plan | Tools (model must support them) | Deny-by-default `read-only`/`safe-edit`; `yolo` requires `--worktree` or `--isolated-lane` (bridging a private provider key into `yolo` requires **both** `--isolated-lane` and `--allow-tool-credentials`) | Session ID; no live hooks |
+| `zcode` | Native ZCode CLI login/config (separate from desktop/OpenCode setup) | Native provider/account; not proven by CLI discovery | Tools (experimental native preview) | `safe-edit` rejected; read-only advisory with `SUMMON_ALLOW_UNENFORCED_READONLY=1`; `yolo` requires isolation + credential consent | `sess_` ID; no live hooks |
+| `openai-compat` | Agent `provider` or `base_url` + `api_key_env` (e.g. `BYTEPLUS_CODING_API_KEY`, `OPENROUTER_API_KEY`); local endpoint may need no key | API/credits by default; `byteplus-coding` (`/api/coding/v3`) uses Coding Plan subscription quota with optional `--allow-payg` fallback | Text-only; requires `--allow-text-only` | No local file/shell tools | Stateless; no resume or live hooks |
+
+Advisory `SUMMON_ALLOW_UNENFORCED_READONLY=1` on `agy`/`zcode` does not create an enforced read-only boundary. Text-only seats need self-contained prompt context and cannot inspect files or run tests. Live steering is supported only for `claude` background jobs launched with `--in-flight-hooks`.
 
 ## Parameters
 
@@ -132,6 +168,7 @@ Use an explicit unit in every invocation: `ms` for milliseconds, `s` for seconds
 | `--transport {subprocess,acp}`, `--no-acp-fallback`, `--allow-kimi-acp-fallback` | Select dispatch transport or control automatic ACP recovery fallback. |
 | `--worktree [NAME]`, `--link-deps DIRS`, `--link-deps-allow-mutation`, `--isolated-lane`, `--allow-tool-credentials` | Run in an isolated git worktree, optionally bridge comma-separated repo-relative dependency directories (`--link-deps node_modules,.venv`; unlinked before teardown; fails closed with `linked_deps_mutated` on drift without `--link-deps-allow-mutation`), or acknowledge a disposable OS boundary for broad-authority turns. On gate denial, Summon preserves dirty worktrees (`worktree_preserved:true`) with no force-removal or force branch deletion. |
 | `--background`, `--adaptive-timeout`, `--hard-timeout`, `--max-runtime DURATION`, `--job-dir DIR` | Detached background execution and activity-aware lease controls. |
+| `--in-flight-hooks` | Enable live mid-turn hook bridge (`PreToolUse`/`PostToolUse` `additionalContext`) for `--background` jobs on the `claude` backend; steer via `summon jobs steer <id> --message "..."`. |
 | `--jobs-list`, `--jobs-status ID`, `--jobs-watch`, `--jobs-watch-once` (`--once`), `--jobs-watch-interval SEC` (`--interval SEC`), `--jobs-wait ID`, `--jobs-wait-all`, `--jobs-wait-ids ID`, `--active-only`, `--jobs-active-only` | Inspect, watch (`jobs watch`), or wait on background jobs (`jobs wait`, `wait --all` / `--jobs-wait-all` for fan-in across running jobs; `--active-only` / `--jobs-active-only` filters to running/prepared jobs). |
 | `--jobs-extend ID`, `--job-duration DURATION`, `--jobs-cancel ID`, `--jobs-steer ID`, `--job-message TEXT` | Extend deadline, cancel, or queue steering for a background job. |
 | `--jobs-resume ID`, `--job-message-file FILE`, `--job-request-id ID`, `--jobs-revalidate ID`, `--job-revalidation-file FILE` | Authenticated background continuation for eligible Claude jobs and legacy job revalidation. |
@@ -150,9 +187,9 @@ Use an explicit unit in every invocation: `ms` for milliseconds, `s` for seconds
 | Surface | Flags |
 |---------|-------|
 | **Fleet (`fleet`)** | `--fleet-action`, `--fleet-file`, `--fleet-lane`, `--fleet-seats`, `--fleet-provider-allowlist`, `--fleet-model-allowlist`, `--fleet-required-capabilities`, `--fleet-permission-ceiling`, `--fleet-data-boundary`, `--fleet-allow-contract-repair`, `--fleet-allow-retry`, `--fleet-allow-fallback`, `--fleet-allow-continuation`, `--fleet-allow-subscription`, `--fleet-allow-credit`, `--fleet-allow-payg`, `--fleet-max-provider-contacts`, `--fleet-max-billable-attempts`, `--fleet-max-parallel`, `--fleet-approval-id`, `--fleet-data-proof`, `--fleet-expires-in`, `--fleet-expect-generation`. Private store overrides: `SUMMON_FLEET_APPROVAL_STORE`, `SUMMON_FLEET_APPROVAL_KEY`. |
-| **Manifest (`manifest`)** | `--manifest FILE`, `--concurrency {N,auto}`, `--results-dir`, `--mission-id ID`, `--mission-max-work-tokens N`, `--mission-max-cost-usd USD` (supports `depends_on`, `worktree`, `link_deps`, `forward_handoff`, `files_scope`, and hardware-aware `--concurrency auto`; give each concurrent run its own `--results-dir`). |
-| **Mission (`mission`)** | `mission start --objective TEXT|--objective-file FILE`, `--coordinator AGENT`, `--team AGENTS`, `--max-waves N`, `--plan-file FILE`, `mission status ID [--digest]`, `mission watch ID [--once] [--interval SEC]`, `mission steer ID [--task TASK_ID] --message TEXT`, `mission reply ID --question-id QID --answer TEXT`, `mission cancel ID`, `mission list`, `--mission-dir DIR`, `--mission-max-work-tokens N`, `--mission-max-cost-usd USD`. |
-| **Memory (`memory`)** | `memory search QUERY` (`--memory-search QUERY`), `--memory-source {all,memory,handoffs,councils,missions}`, `--memory-limit N`, `--memory-rebuild` (stdlib SQLite FTS5 / BM25 search with canonical file verification). |
+| **Manifest (`manifest`)** | `--manifest FILE`, `--concurrency auto\|default=N\|BACKEND=N,…`, `--results-dir DIR`, optional `--mission-id ID`, `--mission-max-work-tokens N`, `--mission-max-cost-usd USD`. Put `timeout`, `worktree`, `link_deps`, `depends_on`, `files_scope`, `max_permission`, and `forward_handoff` inside manifest JSON. Rejects CLI `--timeout`, `--out`, and `--in-flight-hooks`; use CLI `--results-dir` for per-job envelopes, with a separate directory for each concurrent run. |
+| **Mission (`mission`)** | `summon mission start --objective "..." [--goal "..."] [--coordinator <agent>] [--team A,B] [--plan-file FILE] [--max-waves N] [--mission-max-work-tokens N] [--mission-max-cost-usd USD]` (`--goal` aliases `--objective`; `--objective-file FILE` also supported). `summon mission status\|watch\|steer\|reply\|resume\|cancel\|list <id> [--digest]` (`list` takes no ID; `steer` needs `--message TEXT`, `reply` needs `--question-id QID --answer TEXT`; `watch` accepts `--once`/`--interval SEC`). |
+| **Memory (`memory`)** | `summon memory search <query> [--query <q>] [--limit N]` (use positional query or `--query`); flat syntax: `summon --memory-action search --memory-query <q> --memory-limit N`. Searches project-local memory and handoffs via SQLite FTS5/BM25 with canonical file verification. |
 | **Council (`council`)** | `--council`, `--question`, `--question-file`, `--members`, `--chairman` (default: `architect`), `--chairman-fallback`, `--rounds`, `--quorum`, `--min-successful-members`, `--member-timeout`, `--chair-timeout`, `--overall-timeout`, `--run-dir`, `--resume-run`, `--council-status`, `--pause-after-round`, `--council-context-submit`, `--council-context-file`, `--council-operation-key`, `--council-expect-generation`, `--council-continue`. |
 | **Deliberate (`deliberate`)** | `--deliberate`, `--seats`, `--options`, `--max-attempts`, `--deadline`, `--require-human-approval`, `--text-only-consent`, `--full-authority-consent`, `--context-file`, `--context-observation-file`, `--accept-stale-file`, `--deliberate-status`, `--deliberate-replay`, `--deliberate-recover`, `--deliberate-cancel`, `--command-id`, `--deliberate-open`, `--browser`, `--deliberate-resume`, `--retry-indeterminate`. |
 | **Chat (`chat`)** | `--chat-action`, `--chat-session`, `--chat-message` (`--message`), `--chat-project-id` (`--project-id`), `--chat-project-root` (`--project-root`), `--chat-initiator-host` (`--initiator-host`), `--chat-initiator-agent` (`--initiator-agent`), `--chat-mode` (`--mode`), `--conversation-dir`, `--chat-browser`, `--chat-participant` (`--participant`), `--chat-participants` (`--participants`), `--chat-to` (`--to`), `--chat-after` (`--after`), `--chat-timeout`, `--chat-confirm`, `--chat-reason`, `--chat-revalidation-file`. |
@@ -178,11 +215,11 @@ Use `examples/document-audit.schema.json` and `examples/document-audit.manifest.
 
 ## Known limitations & caveats
 
-- **agy permission boundary**: `agy` reads `--cwd` via `--add-dir`, but `agy` at `read-only` is refused (Summon fails closed unless `SUMMON_ALLOW_UNENFORCED_READONLY=1`), and `safe-edit` maps to full bypass (`--dangerously-skip-permissions`).
-- **Kimi permission boundary**: Kimi non-interactive mode is `yolo`-only (`read-only` and `safe-edit` are refused). For a review-only Kimi job,
+- **agy permission boundary**: `agy` reads `--cwd` via `--add-dir`, but has no enforced permission boundary. Declared `safe-edit` runs with full authority (`yolo`), advisory `read-only` is refused unless `SUMMON_ALLOW_UNENFORCED_READONLY=1` is set, and forced `--max-permission` clamps are always refused.
+- **Kimi permission boundary**: Kimi non-interactive mode is `yolo`-only (`read-only` and `safe-edit` are refused with `permission_unsupported`). For a review-only Kimi job,
   use `--worktree`, instruct it not to change product files, and inspect the worktree before accepting its report: a review request is not an enforceable read-only boundary.
 - **Windows headless execution**: invoke Summon directly, not through `Start-Process`, `cmd /c start`, or a custom window launcher. Leave `AGY_PTY_WRAPPER` unset so the bundled `agy_stream_proxy.py` is used (`AGY_ALLOW_LEGACY_PTY=1` is explicit opt-in only; if `Start-Process` is unavoidable, pass `-WindowStyle Hidden`).
-- **OpenCode isolation**: headless OpenCode dispatches enforce `--pure` and deny-by-default permissions; `yolo` requires `--worktree` or `--isolated-lane` (plus `--allow-tool-credentials` when bridging credentials).
+- **OpenCode isolation**: headless OpenCode dispatches enforce `--pure` and deny-by-default permissions; `yolo` requires `--worktree` or `--isolated-lane` (bridging a private provider credential into `yolo` requires **both** `--isolated-lane` and `--allow-tool-credentials`, even when `--worktree` is set).
 
 ## Agent Definition Format
 

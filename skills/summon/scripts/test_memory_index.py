@@ -120,3 +120,18 @@ def test_index_workspace_memory_idempotent_sync_and_title_sanitization(tmp_path)
     assert len(res["hits"]) == 1
     assert "sk-secret999999999999" not in res["hits"][0]["title"]
     assert "\x1b" not in res["hits"][0]["title"]
+
+
+def test_cli_memory_search_query_flag_and_mission_goal_alias():
+    import _cli
+    argv, err = _cli.rewrite_subcommand(["memory", "search", "--query", "HOOK_BRIDGE", "--limit", "5"])
+    assert err is None
+    assert argv == ["--memory-action", "search", "--memory-query", "HOOK_BRIDGE", "--memory-limit", "5"]
+
+    argv_eq, err_eq = _cli.rewrite_subcommand(["memory", "search", "--query=HOOK_BRIDGE", "--limit=3"])
+    assert err_eq is None
+    assert argv_eq == ["--memory-action", "search", "--memory-query", "HOOK_BRIDGE", "--memory-limit=3"]
+
+    argv_m, err_m = _cli.rewrite_subcommand(["mission", "start", "--goal", "ship docs"])
+    assert err_m is None
+    assert argv_m == ["--mission-action", "start", "--mission-objective", "ship docs"]

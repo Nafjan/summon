@@ -145,7 +145,7 @@ not installed or required.
 - **Route named local logins:** keep multiple Claude config directories behind private
   profile names, so a public agent definition never carries a machine path or credential.
 
-The workspace and roster changes above ship in **Summon 3.7.0**, whose workspace
+The workspace and roster changes above ship in **Summon 3.8.0**, whose workspace
 features are a preview: provider-free acceptance covers them, but live adapters are
 not stable-certified. See the
 [release gates](docs/planning/EXPECTED_NEXT_RELEASE.md) for what each profile
@@ -229,7 +229,15 @@ is certified only for the named-profile Claude subprocess lane after its evidenc
 and ownership checks pass; other backends are candidates or unsupported and may
 refuse before provider contact. The workspace preview demonstrates simulated
 workers; it does not provide universal native-session attachment. `jobs steer`
-queues guidance for a later eligible continuation, not live mid-turn injection.
+always records a durable advisory note that a later eligible continuation
+(`jobs resume`) consumes. When the target Claude job was launched with
+`--background --in-flight-hooks`, the same note is *also* delivered live
+mid-turn: the HMAC-authenticated hook bridge attaches it as
+`hookSpecificOutput.additionalContext` at the running child's next
+`PreToolUse`/`PostToolUse` boundary, with at-most-once `queued` -> `emitted`
+semantics. Without `--in-flight-hooks`, or on any non-Claude backend, steering
+records a durable note only (`jobs resume` currently consumes queued steering
+only for eligible Claude subprocess jobs and rejects other backends).
 Council recommendations and agent messages remain separate from permissions,
 approvals and deliberation ballots.
 
@@ -356,7 +364,7 @@ python tools/release_gates.py --require-clean --output "${RUNNER_TEMP:-${TMPDIR:
 python tools/release_manifest.py \
   --evidence-file "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/summon-release-evidence.json" \
   --output "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/summon-release-manifest.json" \
-  --expected-version 3.7.0 --check
+  --expected-version 3.8.0 --check
 ```
 
 The runner executes the fixed suites, records output digests, strips backend credentials and
@@ -473,9 +481,9 @@ Git-style subcommands. The old flat `--flag` form still works too:
 | `summon list` | list available agents |
 | `summon agents validate [--cwd D] [--agents-dir D]` | validate provider-inert custom-agent manifests and print redacted identity/digest evidence |
 | `summon models [--cli B] [--refresh]` | invocable models per backend, with a `source` per entry; refresh live provider rosters explicitly |
-| `summon auth status|repair BACKEND` | inspect auth state or run one explicitly authorized vendor login flow; never silently retries |
+| `summon auth status [--cli BACKEND]` · `auth repair BACKEND` | inspect auth state or run one explicitly authorized vendor login flow; never silently retries |
 | `summon doctor [--json]` | backend / setup health check (run this first) |
-| `summon manifest FILE` | run a batch fan-out (per-backend concurrency, resumable) |
+| `summon manifest FILE` | run a batch fan-out, resumable. Jobs that declare `depends_on` run as a multi-wave DAG; each job can take its own `worktree` and a `files_scope` allowlist that is verified against the worktree diff after a success (a violation sets `status: blocked` and `error_kind: scope_violation`). Upstream handoffs are forwarded into downstream prompts as fenced, untrusted `<context_handoff>` blocks, and `--concurrency auto` sizes per-backend caps for you instead of requiring `agy=2,codex=3,default=3` |
 | `summon swarm create|status|claim|renew|cancel|close …` | use the durable local swarm coordinator; provider/IDE adapters remain explicit |
 | `summon council --question "…"` | **explore and synthesize** diverse positions |
 | `summon chat open|post|show|list …` | local shared room for brainstorming and human context; `chat open --chat-browser auto|link` starts/reuses or links the authenticated atlas |
@@ -491,7 +499,9 @@ Git-style subcommands. The old flat `--flag` form still works too:
 | `summon role propose\|approve\|list\|resolve …` | manage private, opt-in role aliases |
 | `summon jobs list\|status [ID]` · `jobs wait ID` | inspect or wait for background jobs (`--json` on list/status). `status` is a redacted, typed projection; `wait` returns the complete private terminal envelope |
 | `summon jobs extend ID --duration 30m` · `jobs cancel ID` | extend an active adaptive job's soft and hard deadlines (bounded to seven days from job start), or request process-tree cancellation |
-| `summon jobs steer ID --message "…"` · `jobs resume ID --message "…"` | queue authenticated guidance for a later eligible continuation, then explicitly create one governed successor; this is not claimed as live mid-turn injection |
+| `summon jobs steer ID --message "…"` · `jobs resume ID --message "…"` | record a durable authenticated advisory note, then explicitly create one governed successor (`jobs resume` is supported only for eligible Claude subprocess jobs). For a Claude job launched with `--background --in-flight-hooks`, `steer` *also* delivers the note live mid-turn as `hookSpecificOutput.additionalContext` at the child's next `PreToolUse`/`PostToolUse` boundary (at-most-once `queued` -> `emitted`); without `--in-flight-hooks` (or on non-Claude backends) the note is stored durably only |
+| `summon mission start --objective "…" [--coordinator <agent>] [--team A,B] [--plan-file <f>] [--max-waves N] [--mission-max-work-tokens N] [--mission-max-cost-usd USD]` · `mission status <id> [--digest]` · `mission watch <id>` · `mission steer <id> --message "…"` · `mission reply <id> --question-id <q> --answer "…"` · `mission resume <id>` · `mission cancel <id>` · `mission list` | coordinator-led or plan-driven multi-wave DAG execution with durable checkpointing, worktree merge gates, and token/cost budget enforcement. Coordinator-proposed task permissions are clamped downward to `--max-permission`, writable tasks run in isolated worktrees, and `files_scope` plus the task verdict must verify before anything integrates into `mission/<id>` |
+| `summon memory search <query> [--limit N]` | local SQLite FTS5 BM25 search across project-local sources under `.agents` (`.agents/memory.md`, `.agents/results/*.json`, `.agents/missions/*/{projection.json,mission.json}`, `.agents/missions/*/results/*.json`, and `.agents/runs/*/receipt.json`; it does not automatically index the temp background-job registry or arbitrary external `--out` paths). Every hit is re-hashed against its authoritative source file before it is served, and snippets come back redacted, injection-fenced, and marked advisory |
 | `summon telemetry enable\|disable\|status\|clear` | manage local opt-in diagnostics; `clear` does not disable |
 | `summon usage status\|import\|refresh\|export\|example …` | inspect, refresh, or exchange bounded usage evidence. Live refresh requires an explicit provider allowlist and account-read consent; usage remains advisory and cannot reroute an exact request |
 | `summon result project --kind dispatch\|job --from PRIVATE.json --repo-root DIR` | derive an experimental redacted compatibility receipt without contacting a provider; only authenticated terminal job records are accepted for `job` |
@@ -517,6 +527,50 @@ providers. The boundary is documented in
 
 `summon` (no args) prints the command list. Everything below is documented in
 [the Summon skill instructions](skills/summon/SKILL.md).
+
+### When to use which orchestration mode
+
+Eight surfaces sound like a lot; in practice the choice falls out of two questions —
+*who decides what the work is*, and *do you need to be there when it finishes*:
+
+| Mode | Reach for it when | What it gives you | What it costs |
+|---|---|---|---|
+| `dispatch` | one task, one agent, you want the answer now | a single foreground envelope you can branch on | you hold the terminal until it finishes |
+| `--background` + `jobs` | one task that outlives your attention span (long review, big refactor) | detached execution with an adaptive lease: `jobs watch/wait`, `extend`, `cancel`, `steer`, `resume` | you poll or wait; mid-turn steering needs `--in-flight-hooks` |
+| `--manifest` DAG | **you** already know the jobs and their order | N jobs with per-backend concurrency, `depends_on` waves, per-job `worktree`/`files_scope`, resumable after a crash | you author and maintain the plan file |
+| `mission` | you know the **objective** but not the task breakdown | a coordinator plans the DAG, re-plans across waves, asks you questions, and merges passing worktrees under pre-launch token/cost budget admission and attempt-level accounting (overshoot depends on when provider usage telemetry arrives, and interrupted attempts record unknown spend) | the coordinator itself spends tokens, and its plan is only as good as your objective |
+| `--council` | an open-ended judgment call ("monorepo or polyrepo?") | diverse independent positions, anonymized peer ranking, a chairman's call with confidence and named dissents | N× the cost of one opinion, with no accumulated spend ceiling (`--overall-timeout` enforces a wall-clock cap) |
+| `deliberate` | a governed decision with **fixed options** that must be auditable | quorum, hard attempt/deadline bounds, durable replay, explicit human-approval policy | you must supply every policy field up front; nothing is inferred |
+| `chat` | you want to think *with* the models, not just dispatch to them | a persistent project room mixing human context with explicit, bounded roster-agent turns | it is a room, not authority: a chat turn never becomes an approval or a ballot |
+| `swarm` | external workers must claim and renew work durably | owner/lease/claim/cancel state with explicit uncertain-spend recovery | adapters must authenticate and pass the protocol gates; it is not host-native IDE swarm attachment |
+
+Rule of thumb: **you plan it → `--manifest`; the coordinator plans it → `mission`.**
+Independent work → fan out; a judgment call → `council`; an auditable decision →
+`deliberate`.
+
+### Connecting harnesses, subscriptions, and APIs at a glance
+
+Each backend keeps its own login, billing, and permission boundary. "Enforceable tiers"
+is the one column worth reading before you trust a `read-only` label:
+
+| Backend | Auth / setup | Billing | Surface | Enforceable permission tiers |
+|---|---|---|---|---|
+| `claude` | `claude auth login`; extra local logins via `--profile <name>` | Subscription (Max/Pro) or API | Toolful | `read-only` (+ `--read-root`), `safe-edit`, `yolo` — all enforced |
+| `codex` | `codex login` | ChatGPT subscription by default (`OPENAI_API_KEY` is stripped unless `SUBAGENTS_ALLOW_OPENAI_KEY=1` explicitly disables the billing guard) | Toolful | `read-only`, `safe-edit`, `yolo` — all enforced |
+| `cursor-agent` | `cursor-agent login` or `CURSOR_API_KEY` (also forwarded from `CLI_API_KEY`) | Cursor subscription or API | Toolful | all three enforced over subprocess; ACP transport is `yolo`-only with no resume handle |
+| `gemini` | first interactive `gemini` run completes login (no stable `login` subcommand, so Summon will not auto-start it), or `GEMINI_API_KEY` | Google login quota/subscription or API | Toolful | subprocess enforces `read-only` (+ `--read-root`), `safe-edit`, `yolo`; ACP transport is `yolo`-only; headless sessions cannot be resumed |
+| `kimi` | `kimi login` | Moonshot subscription | Toolful | **`yolo` only** — `read-only` / `safe-edit` are refused as `permission_unsupported` |
+| `agy` | `agy login` (tokens copied into a locked per-invocation profile) | Antigravity subscription | Toolful | **none** — `safe-edit` is the same full bypass as `yolo`, and `read-only` is refused unless `SUMMON_ALLOW_UNENFORCED_READONLY=1` marks it advisory |
+| `arkcli` | `arkcli auth login` (uses active CLI profile; select Coding Plan profile via `arkcli profile`) | Active profile billing (Coding Plan subscription when Coding Plan profile is active) | Text-only (needs `--allow-text-only`) | n/a — no filesystem access, so tiers do not apply |
+| `opencode` | `opencode auth login` plus the chosen provider's own credential (e.g. `OPENROUTER_API_KEY`) | whatever the configured provider bills (usually API) | Toolful gateway | `read-only` / `safe-edit` via deny-by-default `OPENCODE_PERMISSION` + `--auto`; `yolo` requires `--worktree` or `--isolated-lane` (bridging a private provider credential into `yolo` requires **both** `--isolated-lane` and `--allow-tool-credentials`, even with `--worktree`) |
+| `zcode` | `zcode login` (bundle discovered via `ZCODE_CLI`, PATH, or app metadata); the separate direct Z.AI text seat uses `ZAI_CODING_API_KEY` | Native provider/account; billing unverified (direct Z.AI text route uses Coding Plan subscription) | Native tool loop (**preview**) | refuses `safe-edit`; advisory `read-only` needs the unenforced-read-only opt-in; `yolo` needs a worktree/isolated lane **and** `--allow-tool-credentials` |
+| `openai-compat` | no login — set the provider's `api_key_env` (`OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `BYTEPLUS_CODING_API_KEY`, …), or leave it empty for local Ollama / LM Studio | API credits by default (`byteplus-coding` `/api/coding/v3` uses Coding Plan subscription quota; PAYG `/api/v3` fallback requires `--allow-payg`) | Text-only (needs `--allow-text-only`) | n/a — one stateless HTTP request, no tools |
+
+`billing.source` in the envelope is a best-effort classification, not a bill: Summon treats
+non-Coding-Plan direct API routes as API billing and cannot see your plan's inclusions.
+Run `summon doctor` for what is installed, `doctor --probe` to spend one small live call per
+backend confirming sign-in and eligibility, and `summon auth status --cli <backend>` to inspect
+setup and auth-repair guidance without launching a task (without `--probe`, live authentication remains unverified).
 
 For a copy-paste path through fleet approval, usage evidence, context compilation,
 adaptive jobs, and portable results, use the
@@ -754,7 +808,7 @@ vendors.
   "raw_backend_exit_code": null,
   "normalized_exit_code": null,
   "exit_code": null,
-  "summon":  { "version": "3.7.0", "scripts_sha256": "<sha256>" },
+  "summon":  { "version": "3.8.0", "scripts_sha256": "<sha256>" },
   "permission": "safe-edit", "permission_flags": ["--permission-mode", "acceptEdits"],
   "usage": { "input_tokens": 12038, "output_tokens": 981 }, "cost_usd": 0.084,
   "billing": { "source": "subscription", "note": "Claude login" },
@@ -1124,26 +1178,55 @@ The release-facing product plan, readiness matrix, test gates, and live-provider
 The roadmap records validated requests and their current status. It is ordered by priority
 and is not a delivery commitment.
 
-**Shipped since this roadmap was written:** council quorum + `--chairman-fallback` +
-per-stage timeouts; the background job registry read path (`jobs list` / `status` / `wait`
-with nonce-verified results); install-drift detection in `doctor` and `install.py`;
-`--gate-with` approval gating across every execution path; and the argv preflight that
-turned an OS command-line overflow from a bogus `CLI not found` into an accurate error.
+### Shipped (3.0 -> 3.8)
+
+Council quorum + `--chairman-fallback` + per-stage timeouts; the background job registry
+read path (`jobs list` / `status` / `wait` with nonce-verified results); install-drift
+detection in `doctor` and `install.py`; `--gate-with` approval gating across every
+execution path; and the argv preflight that turned an OS command-line overflow from a
+bogus `CLI not found` into an accurate error.
 The bundled roster now also includes explicit target seats for Sol, Terra, and Luna reviews;
 the dispatch receipt must carry `reported` evidence and `named_model_verified: true`
 before an exact served-model claim is accepted. `--list --json` shows each
 seat's declared model and effort. Luna is deliberately separate from Sol and Terra, so a
 cost-efficient Luna turn cannot be mistaken for a Sol review.
 
-**Next (scoped):**
+Landed in **3.8.0**:
+- **Mission-scoped spend governance**: `--mission-max-work-tokens` and
+  `--mission-max-cost-usd` enforce pre-launch budget admission and attempt-scoped token and
+  USD accounting across every job sharing a `--mission-id`, settling each attempt so a crash
+  cannot lose the spend (in-flight overshoot depends on when provider usage telemetry is reported,
+  and interrupted attempts fail closed on unknown spend).
+- **Destructive job control**: `jobs cancel` terminates the whole child process tree,
+  gated on real OS process identity so a reused PID is never killed by mistake.
+- **Multi-wave DAG manifests**: manifest jobs take `depends_on` (executed as dependency
+  waves), a per-job `worktree`, and a `files_scope` allowlist verified against the worktree
+  diff after a success. Upstream handoffs are forwarded into downstream prompts as fenced,
+  untrusted `<context_handoff>` blocks, and `--concurrency auto` sizes per-backend caps.
+- **Live in-flight steering**: `--in-flight-hooks` runs a zero-socket, HMAC-authenticated
+  hook bridge so `jobs steer` reaches a running `--background` Claude child as
+  `hookSpecificOutput.additionalContext` at its next tool boundary, with at-most-once
+  delivery and synchronous `PreToolUse` write denial when the job is constrained.
+- **`summon mission`**: coordinator-led or plan-driven multi-wave missions with durable
+  checkpointing, downward permission clamping, operator questions/replies, worktree merge
+  gates, and `resume` / `cancel`.
+- **`summon memory search`**: local SQLite FTS5 / BM25 search over project-local `.agents/memory.md`,
+  `.agents/results/*.json`, `.agents/missions/*/{projection.json,mission.json}`,
+  `.agents/missions/*/results/*.json`, and `.agents/runs/*/receipt.json`, with every hit
+  re-hashed against its authoritative source before it is served.
+
+### Next (scoped)
+
 - **Honest fan-out rollups**: a durable attempt journal (already present for councils)
   extended to manifests, so `usage`/`cost_usd` totals count every round, retry, and
   correction instead of undercounting after a crash.
-- **Destructive job registry**: `jobs cancel` / `jobs reap` + heartbeats + orphan
-  envelopes, gated on real OS process identity (start-time via ctypes / `/proc`) so a
-  reused PID is never killed by mistake.
+- **Job reaping and heartbeats**: `jobs reap` plus heartbeats and orphan envelopes, so a
+  job whose parent died is reconciled rather than left active in the registry. (The
+  destructive half — process-tree `jobs cancel` on verified OS process identity — shipped
+  in 3.8.0.)
 
-**Later:**
+### Later
+
 - **Error taxonomy + `doctor --live`**: distinct statuses (`transport_unreachable`,
   `sandbox_network_denied`, `authentication_failed`, `quota_exhausted`, …) that fail fast
   instead of retrying, plus a live doctor that probes reachability/auth and warns when a
@@ -1151,11 +1234,14 @@ cost-efficient Luna turn cannot be mistaken for a Sol review.
 - **Layered roster resolution**: merge `--agents-dir` / `SUB_AGENTS_DIR` > project
   `.agents` > user `~/.agents` > bundled, with a `source` per agent, plus neutral
   model-tier seats for additional providers and model families to layer task personas on.
-- **Spend governance**: `--max-cost-usd` / `--max-tokens` accumulated caps with
-  stop-before-chair behavior. (Pre-dispatch cost *estimates* are declined: summon has no
-  pricing table and won't guess a bill.)
+- **Dispatch- and council-level spend governance**: `--max-cost-usd` / `--max-tokens`
+  accumulated caps with stop-before-chair behavior, generalizing the mission-scoped
+  ceilings that shipped in 3.8.0. (Pre-dispatch cost *estimates* are still declined:
+  summon has no pricing table and won't guess a bill.)
 - **`--verify-no-mutations`**: hash git status/diff before and after a read-only agent and
-  fail the envelope if it changed anything, backstopping the `yolo` + "do not modify" pattern.
+  fail the envelope if it changed anything, backstopping the `yolo` + "do not modify"
+  pattern. Manifest/mission `files_scope` verification covers the worktree case; this
+  would cover an ordinary in-place dispatch.
 - **Capability-aware rosters**: declare `repo-read` / `vision` / `web` / `enforces-read-only`
   capabilities so a council can reject an unsuitable member before spending time. The
   original motivation (agy cannot read `--cwd`) is obsolete -- agy is repo-capable at

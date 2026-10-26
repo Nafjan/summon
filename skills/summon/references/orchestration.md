@@ -9,7 +9,7 @@ Project-agnostic and host-agnostic. Adopt the parts you need; every section is
 written so a single orchestrator (human or agent) can act on it without a
 house style guide.
 
-Semantics below were verified against summon **3.7.0**. Model ids and alias
+Semantics below were verified against summon **3.8.0**. Model ids and alias
 behaviour are volatile: re-check with `doctor`, `list`, `models`, and
 `--dry-run` before a run you care about.
 
@@ -243,9 +243,10 @@ alias in a governance-critical reviewer definition is a silent downgrade.
 **Least privilege, and verify the mapping.** Permission labels are *not*
 equivalent across backends. Summon normalizes the names, not the semantics.
 
-The trap worth knowing: **agy has no workspace-write tier, so `safe-edit` maps
-to the same full bypass as `yolo`.** Summon surfaces a warning, but a policy
-that says "reviewers get `safe-edit`" grants a full bypass on that backend.
+The trap worth knowing: **kimi only enforces `yolo` (`read-only` and `safe-edit` are
+refused), and agy has no enforced boundary** (declared `safe-edit` runs with full
+authority, advisory `read-only` requires `SUMMON_ALLOW_UNENFORCED_READONLY=1`, and
+forced `--max-permission` clamps are refused).
 Confirm the real flags with `--dry-run` before trusting any permission label.
 
 Defaults that hold up:
@@ -287,9 +288,15 @@ without editing it.
 
 ### Worktrees: know what summon does and does not isolate
 
-`--worktree` isolates a **single dispatch**. Council and manifest modes do
-**not** provide per-member worktrees. For parallel *editing* agents you must
-dispatch manually, one `--worktree` each.
+`--worktree` isolates a **single dispatch**. Council is the read-only deliberation
+lane and has no per-member worktrees; use read-only member definitions. In v3.8.0+,
+`--manifest` natively supports per-job `"worktree": true`, `"link_deps"`,
+`"depends_on"`, `"files_scope"`, `"max_permission"`, `"forward_handoff"`, and
+hardware-aware `--concurrency auto`. When using `files_scope` with parallel writers,
+each writer job should set `"worktree": true` so git status verification is isolated
+per job. Manual parallel editing dispatches likewise need one `--worktree` each.
+See [fan-out.md](fan-out.md#v380-multi-wave-dag-manifest--mission-budget--mid-turn-hook-steering)
+for DAG, budget, and live-steering examples.
 
 For repository deliberation (read-only council over a codebase):
 
@@ -570,7 +577,7 @@ Two host-independent rules:
 | Reporting a model you did not confirm | `served` may be inferred or absent. Say "unverified". |
 | Cross-model but same-backend "independence" | Shared transport, auth, billing, and remap surface. |
 | Aliases in reviewer definitions | Silent downgrade when the alias lags. |
-| `safe-edit` assumed to mean workspace-write | On agy it is a full bypass. |
+| `safe-edit` assumed to mean workspace-write | On agy a declared `safe-edit` grants full authority (and a forced `--max-permission` clamp is refused). |
 | Councils over a dirty workspace | Members read inconsistent state; results are unreproducible. |
 | Parallel writers on overlapping files | Lost work. Partition by file ownership. |
 | Re-running a whole council after a kill | Use `--out` and `council resume`. |

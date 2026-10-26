@@ -315,8 +315,10 @@ MODE_HINTS = {
     "jobs-extend": ("jobs extend queues a bounded deadline extension; it never "
                     "contacts a provider."),
     "jobs-cancel": ("jobs cancel queues cancellation for the active child."),
-    "jobs-steer": ("jobs steer queues a follow-up. Subprocess turns apply it only "
-                   "through an explicit resumed turn; no live injection is claimed."),
+    "jobs-steer": ("jobs steer queues a steering directive. Claude --background jobs "
+                   "launched with --in-flight-hooks receive it live mid-turn via "
+                   "PreToolUse/PostToolUse additionalContext; standard subprocess turns "
+                   "apply it through an explicit jobs resume turn."),
     "jobs-resume": ("jobs resume creates one authenticated background successor for "
                     "an eligible terminal Claude job. It consumes queued steering, "
                     "uses fresh spend consent, disables retries/fallback/repair, and "
@@ -1301,6 +1303,7 @@ def rewrite_subcommand(argv: list) -> tuple:
             tail = list(rest[1:])
         aliases = {
             "--objective": "--mission-objective",
+            "--goal": "--mission-objective",
             "--objective-file": "--mission-objective-file",
             "--coordinator": "--mission-coordinator",
             "--team": "--mission-team",
@@ -1332,15 +1335,36 @@ def rewrite_subcommand(argv: list) -> tuple:
         action = rest[0]
         if action != "search":
             return argv, f"error: unknown 'memory' action {action!r} (use search)"
-        if len(rest) < 2 or rest[1].startswith("-"):
-            return argv, "error: 'memory search' needs a query string"
-        tail = list(rest[2:])
-        rewritten = ["--memory-action", "search", "--memory-query", rest[1]]
-        for token in tail:
+        tail = list(rest[1:])
+        query = None
+        extra_tokens: list[str] = []
+        i = 0
+        while i < len(tail):
+            token = tail[i]
+            if token == "--query":
+                if i + 1 >= len(tail):
+                    return argv, "error: 'memory search' needs a query string"
+                query = tail[i + 1]
+                i += 2
+                continue
+            if token.startswith("--query="):
+                query = token[len("--query="):]
+                i += 1
+                continue
             if token == "--limit" or token.startswith("--limit="):
                 token = "--memory-limit" + token[len("--limit"):]
-            rewritten.append(token)
-        return rewritten, None
+                extra_tokens.append(token)
+                i += 1
+                continue
+            if query is None and not token.startswith("-"):
+                query = token
+                i += 1
+                continue
+            extra_tokens.append(token)
+            i += 1
+        if not query:
+            return argv, "error: 'memory search' needs a query string"
+        return ["--memory-action", "search", "--memory-query", query] + extra_tokens, None
     return argv, None
 
 

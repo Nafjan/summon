@@ -421,3 +421,12 @@ def test_manifest_files_scope_subdirectory_and_non_git_and_rename(tmp_path, monk
     assert env_sub["status"] == "blocked"
     assert env_sub["error_kind"] == "scope_violation"
     assert "outside.py" in env_sub["scope_violations"]
+
+
+def test_extract_handoff_payload_agent_fallback():
+    payload = _manifest._extract_handoff_payload(
+        {"status": "success", "target": "scout", "result": "Scout summary"},
+        "wave1_scout",
+    )
+    assert payload is not None
+    assert payload["agent"] == "scout"

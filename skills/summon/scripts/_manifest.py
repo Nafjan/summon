@@ -668,9 +668,16 @@ def _extract_handoff_payload(env: dict, dep_id: str) -> dict | None:
     )
     req_sha = str(env.get("request_sha256") or "")
     h_sha = hashlib.sha256(handoff_text.encode("utf-8")).hexdigest()
+    agent_val = (
+        env.get("agent")
+        or env.get("agent_name")
+        or (env.get("agent_definition", {}).get("name") if isinstance(env.get("agent_definition"), dict) else "")
+        or env.get("target")
+        or ""
+    )
     return {
         "id": dep_id,
-        "agent": str(env.get("agent") or ""),
+        "agent": str(agent_val),
         "request_sha256": req_sha,
         "handoff_sha256": h_sha,
         "text": handoff_text,
@@ -1132,6 +1139,9 @@ def run_manifest(args) -> int:
                                 pass
         if not skipped and isinstance(envelope, dict):
             envelope_dirty = not os.path.exists(out_file)
+            if not envelope.get("agent") and job.get("agent"):
+                envelope["agent"] = job["agent"]
+                envelope_dirty = True
             if _dag_fp is not None and envelope.get("manifest_dag_sha256") != _dag_fp:
                 envelope["manifest_dag_sha256"] = _dag_fp
                 envelope_dirty = True
