@@ -141,12 +141,12 @@ def _acquire_execution_lease(entry_path: str) -> tuple[str, str] | None:
     sleep_s = 0.05
     fd = None
     while True:
-        if os.path.lexists(install_lock):
-            raise ValueError("managed Summon install is in progress; retry the background dispatch shortly")
         try:
             fd = os.open(lease, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             break
         except (FileExistsError, PermissionError) as exc:
+            if os.path.lexists(install_lock):
+                raise ValueError("managed Summon install is in progress; retry the background dispatch shortly") from exc
             if time.monotonic() >= deadline:
                 raise ValueError(
                     "another managed Summon background launch is preparing an immutable bundle; retry shortly"
@@ -321,6 +321,14 @@ def child_argv(args: argparse.Namespace, result_file: str, *, private_resume: bo
         out += ["--isolated-lane"]
     if getattr(args, "allow_tool_credentials", False):
         out += ["--allow-tool-credentials"]
+    if getattr(args, "mission_id", None):
+        out += ["--mission-id", str(args.mission_id)]
+    if getattr(args, "mission_max_work_tokens", None) is not None:
+        out += ["--mission-max-work-tokens", str(int(args.mission_max_work_tokens))]
+    if getattr(args, "mission_max_cost_usd", None) is not None:
+        out += ["--mission-max-cost-usd", str(float(args.mission_max_cost_usd))]
+    if getattr(args, "in_flight_hooks", False):
+        out += ["--in-flight-hooks"]
     for artifact in getattr(args, "artifacts", ()) or ():
         out += ["--artifact", artifact]
     if isinstance(getattr(args, "_context_compilation", None), dict):
@@ -456,6 +464,23 @@ def spawn_background(args: argparse.Namespace, entry_path: str, summon: dict, *,
     _jobs.ensure_jobs_dir(root)
     job_id = (resume_reservation.successor_job_id
               if resume_reservation is not None else _jobs.new_job_id())
+    mission_id = getattr(args, "mission_id", None)
+    max_wt = getattr(args, "mission_max_work_tokens", None)
+    max_cost = getattr(args, "mission_max_cost_usd", None)
+    if (max_wt is not None or max_cost is not None) and not mission_id:
+        raise ValueError("--mission-max-work-tokens and --mission-max-cost-usd require --mission-id")
+    if mission_id:
+        from _mission_budget import reserve_launch
+        reserve_launch(
+            mission_id,
+            job_id=job_id,
+            attempt_id=job_id,
+            agent=args.agent,
+            attempt_kind="initial",
+            max_work_tokens=max_wt,
+            max_cost_usd=max_cost,
+            job_dir=root,
+        )
     result_file = _jobs.result_path(root, job_id)
     nonce = uuid.uuid4().hex
     prompt_sha = (hashlib.sha256(args.prompt.encode("utf-8")).hexdigest()
@@ -520,6 +545,15 @@ def spawn_background(args: argparse.Namespace, entry_path: str, summon: dict, *,
         # Preparation has not crossed a Popen boundary. Keep an unprepared claim
         # reserved so the exact same request can retry safely. If an immutable
         # record already exists, the next call verifies and finishes it in place.
+        if mission_id:
+            try:
+                from _mission_budget import settle_attempt
+                settle_attempt(
+                    mission_id, job_id=job_id, attempt_id=job_id,
+                    provider_contacted=False, terminal_status="prepare_failed",
+                    agent=args.agent, job_dir=root)
+            except Exception:
+                pass
         if lease is not None:
             _release_execution_lease(*lease)
         raise ValueError(f"cannot write the background launch record: {e}") from e
@@ -532,8 +566,17 @@ def spawn_background(args: argparse.Namespace, entry_path: str, summon: dict, *,
         child_env = {**os.environ, "SUMMON_JOB_NONCE": nonce,
                      "SUMMON_JOB_ID": job_id,
                      "SUMMON_JOB_DIR": root,
+                     "SUMMON_JOBS_DIR": root,
                      "SUMMON_JOB_STARTED_AT": str(time.time()),
                      "SUMMON_JOB_SCRIPTS_SHA256": execution_summon["scripts_sha256"]}
+        if mission_id:
+            child_env["SUMMON_MISSION_ID"] = str(mission_id)
+            child_env["SUMMON_MISSION_JOB_ID"] = str(job_id)
+            child_env["SUMMON_MISSION_INITIAL_ATTEMPT_ID"] = str(job_id)
+            if max_wt is not None:
+                child_env["SUMMON_MISSION_MAX_WORK_TOKENS"] = str(max_wt)
+            if max_cost is not None:
+                child_env["SUMMON_MISSION_MAX_COST_USD"] = str(max_cost)
         if resume_reservation is not None:
             from _job_resume import claim_transition
             child_env["SUMMON_RESUME_CLAIM_FILE"] = resume_prepared["claim_file"]
@@ -560,6 +603,33 @@ def spawn_background(args: argparse.Namespace, entry_path: str, summon: dict, *,
             child_env["SUMMON_MAX_RUNTIME_MS"] = str(int(args.max_runtime))
             child_env["SUMMON_JOB_CONTROL_FILE"] = control_path(root, job_id)
             child_env["SUMMON_JOB_HEARTBEAT_FILE"] = heartbeat_path(root, job_id)
+        hook_mode = "off"
+        try:
+            from _hook_bridge import prepare_claude_hook_settings, resolve_hook_mode
+            hook_mode = resolve_hook_mode(getattr(args, "in_flight_hooks", False), env=child_env)
+            if hook_mode in {"on", "auto"}:
+                bridge_script = os.path.join(os.path.dirname(child_entry), "_hook_bridge.py")
+                hook_info = prepare_claude_hook_settings(
+                    root, job_id, script_path=bridge_script, python_exe=sys.executable,
+                    worker_cwd=getattr(args, "cwd", None),
+                    read_roots=getattr(args, "_read_roots_cli", None),
+                )
+                child_env["SUMMON_IN_FLIGHT_HOOKS"] = hook_mode
+                child_env["SUMMON_CLAUDE_HOOK_SETTINGS_FILE"] = hook_info["settings_file"]
+        except Exception as hook_exc:
+            if hook_mode == "on" or getattr(args, "in_flight_hooks", False):
+                if mission_id:
+                    try:
+                        from _mission_budget import settle_attempt
+                        settle_attempt(
+                            mission_id, job_id=job_id, attempt_id=job_id,
+                            provider_contacted=False, terminal_status="hook_setup_failed",
+                            agent=args.agent, job_dir=root)
+                    except Exception:
+                        pass
+                if lease is not None:
+                    _release_execution_lease(*lease)
+                raise ValueError(f"cannot prepare in-flight hooks: {hook_exc}") from hook_exc
         child_env.pop("SUMMON_CMD_LAUNCHER", None)
         if prompt_sha:
             child_env["SUMMON_JOB_PROMPT_SHA"] = prompt_sha   # lets the crash path verify
@@ -582,6 +652,15 @@ def spawn_background(args: argparse.Namespace, entry_path: str, summon: dict, *,
                     pass
             raise
         except OSError:
+            if mission_id:
+                try:
+                    from _mission_budget import settle_attempt
+                    settle_attempt(
+                        mission_id, job_id=job_id, attempt_id=job_id,
+                        provider_contacted=False, terminal_status="spawn_failed",
+                        agent=args.agent, job_dir=root)
+                except Exception:
+                    pass
             if resume_reservation is not None:
                 try:
                     claim_transition(
@@ -830,21 +909,29 @@ def run_jobs_query(args, emit_error, *, entry_path: str | None = None,
         return 0
     if args.jobs_list:
         rows = _jobs.list_jobs(root)
+        mission_filter = getattr(args, "mission_id", None)
+        if mission_filter:
+            rows = [r for r in rows if r.get("mission_id") == mission_filter]
         if args.json:
-            print(json.dumps({"job_dir": root, "jobs": rows}, ensure_ascii=False))
+            payload = {"job_dir": root, "jobs": rows}
+            if mission_filter:
+                payload["mission_id"] = mission_filter
+            print(json.dumps(payload, ensure_ascii=False))
         else:
             print(render_jobs(root, rows))
         return 0
     if getattr(args, "jobs_watch", False):
         active_only = bool(getattr(args, "jobs_active_only", False))
         once = bool(getattr(args, "jobs_watch_once", False))
+        mission_filter = getattr(args, "mission_id", None)
         interval = float(getattr(args, "jobs_watch_interval", 2.0) or 2.0)
         if not math.isfinite(interval) or not 0.1 <= interval <= 3600.0:
             emit_error("jobs watch interval must be between 0.1s and 3600s")
             return 1
         is_tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
         if args.json or once or not is_tty:
-            snapshot = watch_jobs_snapshot(root, active_only=active_only)
+            snapshot = watch_jobs_snapshot(
+                root, active_only=active_only, mission_id=mission_filter)
             if args.json:
                 print(json.dumps(snapshot, ensure_ascii=False))
             else:
@@ -852,7 +939,8 @@ def run_jobs_query(args, emit_error, *, entry_path: str | None = None,
             return 0
         try:
             while True:
-                snapshot = watch_jobs_snapshot(root, active_only=active_only)
+                snapshot = watch_jobs_snapshot(
+                    root, active_only=active_only, mission_id=mission_filter)
                 sys.stdout.write("\x1b[2J\x1b[H" + render_jobs_watch(snapshot) + "\n")
                 sys.stdout.flush()
                 if snapshot["active_count"] == 0:
@@ -1123,7 +1211,8 @@ def _read_authenticated_heartbeat(root: str, job_id: str,
         return None
 
 
-def watch_jobs_snapshot(root: str, *, active_only: bool = False) -> dict:
+def watch_jobs_snapshot(root: str, *, active_only: bool = False,
+                        mission_id: str | None = None) -> dict:
     """Return a redacted, HMAC-verified operator snapshot of background jobs."""
     from _breaker import sanitize_record as _sanitize_breaker
     from _context_handoff import sanitize_record as _sanitize_context_handoff
@@ -1157,6 +1246,8 @@ def watch_jobs_snapshot(root: str, *, active_only: bool = False) -> dict:
         return reason if isinstance(reason, str) and reason else None
 
     rows = _jobs.list_jobs(root)
+    if mission_id:
+        rows = [row for row in rows if row.get("mission_id") == mission_id]
     if active_only:
         rows = [row for row in rows if row.get("state") in ("running", "prepared")]
     watched = []
@@ -1342,6 +1433,7 @@ def watch_jobs_snapshot(root: str, *, active_only: bool = False) -> dict:
                 cost_usd = None
         watched.append({
             "job_id": jid,
+            "mission_id": st.get("mission_id"),
             "state": state,
             "trusted": trusted,
             "agent": agent if isinstance(agent, str) else None,
@@ -1358,7 +1450,14 @@ def watch_jobs_snapshot(root: str, *, active_only: bool = False) -> dict:
             "cost_usd": cost_usd,
             "heartbeat_authenticated": hb_authenticated,
         })
-    return {
+    mission_budget_summary = None
+    if mission_id:
+        try:
+            from _mission_budget import read_mission_budget
+            mission_budget_summary = read_mission_budget(mission_id, job_dir=root)
+        except Exception:
+            mission_budget_summary = None
+    out_snap = {
         "schema": "summon.jobs-watch/v1",
         "job_dir": root,
         "observed_at": time.time(),
@@ -1366,6 +1465,10 @@ def watch_jobs_snapshot(root: str, *, active_only: bool = False) -> dict:
         "active_count": active_count,
         "jobs": watched,
     }
+    if mission_id:
+        out_snap["mission_id"] = mission_id
+        out_snap["mission_budget"] = mission_budget_summary
+    return out_snap
 
 
 def render_jobs_watch(snapshot: dict) -> str:
@@ -1373,8 +1476,35 @@ def render_jobs_watch(snapshot: dict) -> str:
     jobs = snapshot.get("jobs") if isinstance(snapshot.get("jobs"), list) else []
     lines = [
         f"job dir: {snapshot.get('job_dir', '?')}  (active: {snapshot.get('active_count', 0)}/{len(jobs)})",
-        "  JOB_ID        STATE           AGENT             PHASE         ELAPSED   BREAKER       CTX%    PROGRESS                  WORK_TOK    SPEND",
     ]
+    mb = snapshot.get("mission_budget")
+    if isinstance(mb, dict):
+        caps = mb.get("caps") if isinstance(mb.get("caps"), dict) else {}
+        cap_wt = caps.get("max_work_tokens")
+        cap_cost = caps.get("max_cost_usd")
+        wt_part = (
+            f"{mb.get('total_known_work_tokens', 0)}/{cap_wt}"
+            if isinstance(cap_wt, int)
+            else str(mb.get("total_known_work_tokens", 0))
+        )
+        cost_part = (
+            f"${mb.get('total_known_cost_usd', 0.0):.4f}/${float(cap_cost):.4f}"
+            if isinstance(cap_cost, (int, float))
+            else f"${mb.get('total_known_cost_usd', 0.0):.4f}"
+        )
+        top = mb.get("top_spender")
+        top_str = (
+            f"  top_spender={top.get('job_id', '?')[:8]}({top.get('work_tokens', 0)} tok)"
+            if isinstance(top, dict)
+            else ""
+        )
+        exh_str = "  [EXHAUSTED]" if mb.get("exhausted") else ""
+        lines.append(
+            f"mission: {mb.get('mission_id', '?')}  work_tokens={wt_part}  cost={cost_part}{top_str}{exh_str}"
+        )
+    lines.append(
+        "  JOB_ID        STATE           AGENT             PHASE         ELAPSED   BREAKER       CTX%    PROGRESS                  WORK_TOK    SPEND"
+    )
     if not jobs:
         lines.append("  (no matching background jobs)")
         return "\n".join(lines)

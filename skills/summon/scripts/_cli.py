@@ -138,7 +138,8 @@ def parse_watch_interval(value: str) -> float:
 MODE_FLAGS = {
     "manifest": {"manifest", "concurrency", "results_dir", "cwd", "agents_dir",
                  "retries", "retry_nonretryable", "job_file", "strict_agents_dir",
-                 "enable_roles", "allow_kimi_acp_fallback"},
+                 "enable_roles", "allow_kimi_acp_fallback",
+                 "mission_id", "mission_max_work_tokens", "mission_max_cost_usd"},
     # Operation-level rows: a fresh council, a resume, and a read-only status
     # each consume a DIFFERENT set (v3.1). Changing members/rounds/question on a
     # resume would be a new run, so they are rejected there; status takes only
@@ -205,9 +206,9 @@ MODE_FLAGS = {
                    "workspace_operation_key", "workspace_actions",
                    "json", "job_file"},
     # jobs read commands: registry query only.
-    "jobs-list": {"jobs_list", "job_dir", "json", "job_file"},
+    "jobs-list": {"jobs_list", "job_dir", "mission_id", "json", "job_file"},
     "jobs-watch": {"jobs_watch", "jobs_watch_once", "jobs_watch_interval",
-                   "jobs_active_only", "job_dir", "json", "job_file"},
+                   "jobs_active_only", "job_dir", "mission_id", "json", "job_file"},
     "jobs-status": {"jobs_status", "job_dir", "json", "job_file"},
     "jobs-wait": {"jobs_wait", "jobs_wait_all", "jobs_wait_ids", "jobs_active_only", "job_dir", "timeout", "json", "job_file"},
     "jobs-extend": {"jobs_extend", "job_duration", "job_dir", "json", "job_file"},
@@ -244,6 +245,19 @@ MODE_FLAGS = {
                      "bug_description", "json", "job_file"},
     "auth": {"auth_action", "auth_backend", "allow_auth_repair", "auth_timeout",
               "probe", "cli", "profile", "json", "job_file"},
+    "mission": {"mission_action", "mission_id", "mission_objective", "mission_objective_file",
+                "mission_coordinator", "mission_team", "mission_plan_file",
+                "mission_max_waves", "mission_no_integrate", "mission_digest",
+                "mission_question_id", "mission_answer", "mission_message",
+                "mission_task_id", "mission_reason",
+                "mission_max_work_tokens", "mission_max_cost_usd",
+                "concurrency", "max_permission", "run_dir", "results_dir",
+                "cwd", "agents_dir", "strict_agents_dir", "enable_roles",
+                "retries", "prompt", "prompt_file",
+                "jobs_watch_once", "jobs_watch_interval", "job_message",
+                "json", "job_file"},
+    "memory": {"memory_action", "memory_query", "memory_limit",
+               "cwd", "json", "job_file"},
 }
 MODE_HINTS = {
     "manifest": ("Put per-job settings (model, effort, timeout, json_schema, "
@@ -324,6 +338,11 @@ MODE_HINTS = {
     "auth": ("auth status is read-only. auth repair never runs unless --allow-auth-repair "
              "is explicit; a successful login still requires an explicit retry of the "
              "original dispatch."),
+    "mission": ("mission coordinates a multi-task DAG under a Coordinator Agent, clamps "
+                "all proposed task permissions downward to --max-permission, verifies "
+                "files_scope, and integrates passing worktrees into mission/<id>."),
+    "memory": ("memory search queries project-local .agents/memory.md, handoff notes, "
+               "and run/mission syntheses via SQLite FTS5 / BM25 with strict source verification."),
 }
 FLAG_NAMES = {
     "sets": "--set",
@@ -415,6 +434,10 @@ def fanout_mode(args: argparse.Namespace) -> str | None:
         return "bug-report"
     if getattr(args, "auth_action", None):
         return "auth"
+    if getattr(args, "mission_action", None):
+        return "mission"
+    if getattr(args, "memory_action", None):
+        return "memory"
     return None
 
 
@@ -461,7 +484,8 @@ def unsupported_mode_flags(argv: list, args: argparse.Namespace) -> str | None:
 SUBCOMMANDS = {"dispatch", "run", "list", "agents", "ls", "models", "doctor",
                "onboard", "manifest", "council", "deliberate", "agent", "jobs", "wait",
                "version", "chat", "swarm", "role", "telemetry", "stats", "usage", "bug-report",
-               "auth", "fleet", "result", "workspace", "worktree", "help", "--help", "-h"}
+               "auth", "fleet", "result", "workspace", "worktree", "mission", "memory",
+               "help", "--help", "-h"}
 
 USAGE = """summon — cross-vendor sub-agents for any AI CLI
 
@@ -538,6 +562,10 @@ Commands:
   bug-report [--from FILE] [--output FILE] [--json] create a sanitized report
              [--bug-title TEXT] [--bug-description TEXT]
              --submit-github --from REVIEWED.md [--github-repo OWNER/REPO]
+  mission start --objective TEXT [--coordinator NAME] [--team A,B] [--digest]
+  mission status|watch|steer|reply|resume|cancel|list [MISSION_ID] [--digest]
+                                                  coordinator-led long-horizon missions
+  memory search QUERY [--limit N] [--json]        search project memory & handoff notes
   version                                         print version
 
 Legacy flat flags still work: `summon --agent NAME --prompt … --cwd …`,
@@ -736,6 +764,26 @@ summon auth repair BACKEND [--profile NAME] [--allow-auth-repair] [--auth-timeou
 Show provider authentication state without exposing credentials. `repair` is blocked
 unless `--allow-auth-repair` is explicit; it starts only the vendor login command,
 may open a browser, never captures credentials, and never retries the original task.
+""",
+    "mission": """summon mission start --objective TEXT [--coordinator NAME] [--team A,B] [--max-permission TIER] [--max-waves N] [--digest]
+summon mission status MISSION_ID [--digest] [--json]
+summon mission watch MISSION_ID [--once] [--interval SEC]
+summon mission steer MISSION_ID --message TEXT [--task-id ID]
+summon mission reply MISSION_ID --question-id ID --answer TEXT
+summon mission resume MISSION_ID [--max-waves N] [--digest]
+summon mission cancel MISSION_ID [--reason TEXT]
+summon mission list [--json]
+
+Run and monitor coordinator-led long-horizon missions. Coordinator plans are
+clamped downward against `--max-permission`, roster permission tiers, and `--team`.
+Writable tasks execute in isolated git worktrees and require post-run scope and
+verdict verification before integration.
+""",
+    "memory": """summon memory search QUERY [--cwd DIR] [--limit N] [--json]
+
+Search project-local `.agents/memory.md`, completed `handoff_note` artifacts, and
+council/mission syntheses using SQLite FTS5/BM25 (with pure-Python fallback).
+Hits are verified against live source files on disk and sanitized before display.
 """,
 }
 
@@ -1238,6 +1286,61 @@ def rewrite_subcommand(argv: list) -> tuple:
         return rewritten, None
     if head == "bug-report":
         return ["--bug-report", *rest], None
+    if head == "mission":
+        if not rest:
+            return argv, "help:mission"
+        action = rest[0]
+        if action not in ("start", "status", "watch", "steer", "reply", "resume", "cancel", "list"):
+            return argv, f"error: unknown 'mission' action {action!r} (use start/status/watch/steer/reply/resume/cancel/list)"
+        if action in ("status", "watch", "steer", "reply", "resume", "cancel"):
+            if len(rest) >= 2 and not rest[1].startswith("-"):
+                tail = ["--mission-id", rest[1], *rest[2:]]
+            else:
+                tail = list(rest[1:])
+        else:
+            tail = list(rest[1:])
+        aliases = {
+            "--objective": "--mission-objective",
+            "--objective-file": "--mission-objective-file",
+            "--coordinator": "--mission-coordinator",
+            "--team": "--mission-team",
+            "--plan-file": "--mission-plan-file",
+            "--plan": "--mission-plan-file",
+            "--max-waves": "--mission-max-waves",
+            "--no-integrate": "--mission-no-integrate",
+            "--digest": "--mission-digest",
+            "--question-id": "--mission-question-id",
+            "--answer": "--mission-answer",
+            "--message": "--mission-message",
+            "--task-id": "--mission-task-id",
+            "--reason": "--mission-reason",
+            "--runs-root": "--run-dir",
+            "--once": "--jobs-watch-once",
+            "--interval": "--jobs-watch-interval",
+        }
+        rewritten = ["--mission-action", action]
+        for token in tail:
+            if token.startswith("--"):
+                name, separator, value = token.partition("=")
+                name = aliases.get(name, name)
+                token = name + (separator + value if separator else "")
+            rewritten.append(token)
+        return rewritten, None
+    if head == "memory":
+        if not rest:
+            return argv, "help:memory"
+        action = rest[0]
+        if action != "search":
+            return argv, f"error: unknown 'memory' action {action!r} (use search)"
+        if len(rest) < 2 or rest[1].startswith("-"):
+            return argv, "error: 'memory search' needs a query string"
+        tail = list(rest[2:])
+        rewritten = ["--memory-action", "search", "--memory-query", rest[1]]
+        for token in tail:
+            if token == "--limit" or token.startswith("--limit="):
+                token = "--memory-limit" + token[len("--limit"):]
+            rewritten.append(token)
+        return rewritten, None
     return argv, None
 
 
@@ -1682,7 +1785,7 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                         help=argparse.SUPPRESS)
     parser.add_argument("--job-file", dest="job_file", help=argparse.SUPPRESS)  # internal
     parser.add_argument("--manifest", help="Run a batch of jobs from a JSON manifest (see SKILL.md)")
-    parser.add_argument("--concurrency", help="With --manifest: per-backend caps, e.g. agy=2,codex=3,default=3")
+    parser.add_argument("--concurrency", help="With --manifest: per-backend caps, e.g. agy=2,codex=3,default=3 or 'auto'")
     parser.add_argument("--results-dir", dest="results_dir",
                         help="With --manifest: per-job envelope dir (default {cwd}/.agents/results). "
                              "With --council: alias for --run-dir (same precedence, above "
@@ -1908,4 +2011,51 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                         help="With jobs resume: stable 32-hex idempotency key")
     parser.add_argument("--job-revalidation-file", dest="job_revalidation_file",
                         help="With jobs revalidate: private JSON observation/qualification packet")
+    parser.add_argument("--mission-id", dest="mission_id", default=None, metavar="ID",
+                        help="Shared mission identifier for attempt-scoped budget tracking and job filtering")
+    parser.add_argument("--mission-max-work-tokens", dest="mission_max_work_tokens",
+                        type=int, default=None, metavar="N",
+                        help="Hard attempt-scoped mission work-token ceiling across all jobs in --mission-id")
+    parser.add_argument("--mission-max-cost-usd", dest="mission_max_cost_usd",
+                        type=float, default=None, metavar="USD",
+                        help="Hard attempt-scoped mission cost ceiling (USD) across all jobs in --mission-id")
+    parser.add_argument("--in-flight-hooks", dest="in_flight_hooks", action="store_true",
+                        help="Enable zero-socket HMAC-authenticated subprocess hooks for in-flight "
+                             "steering delivery and PreToolUse write denial (env: SUMMON_IN_FLIGHT_HOOKS=on)")
+    parser.add_argument("--mission-action", dest="mission_action",
+                        choices=("start", "status", "watch", "steer", "reply", "resume", "cancel", "list"),
+                        help="Coordinator-led long-horizon mission action")
+    parser.add_argument("--mission-objective", dest="mission_objective",
+                        help="With mission start: high-level mission objective")
+    parser.add_argument("--mission-objective-file", dest="mission_objective_file",
+                        help="With mission start: UTF-8 file containing the mission objective")
+    parser.add_argument("--mission-coordinator", dest="mission_coordinator", default="architect",
+                        help="With mission start: coordinator agent name (default: architect)")
+    parser.add_argument("--mission-team", dest="mission_team",
+                        help="With mission start: comma-separated allowed team agents")
+    parser.add_argument("--mission-plan-file", dest="mission_plan_file",
+                        help="With mission start: pre-authored summon.mission-plan/v1 JSON file")
+    parser.add_argument("--mission-max-waves", dest="mission_max_waves", type=int, default=3,
+                        help="With mission start: maximum planning/execution waves (default: 3)")
+    parser.add_argument("--mission-no-integrate", dest="mission_no_integrate", action="store_true",
+                        help="With mission start: disable automatic git integration branch merging")
+    parser.add_argument("--mission-digest", dest="mission_digest", action="store_true",
+                        help="With mission start/status/watch: render a concise operator digest")
+    parser.add_argument("--mission-question-id", dest="mission_question_id",
+                        help="With mission reply: open question_id to answer")
+    parser.add_argument("--mission-answer", dest="mission_answer",
+                        help="With mission reply: answer text for the specified question_id")
+    parser.add_argument("--mission-message", dest="mission_message",
+                        help="With mission steer: steering message for the mission or task")
+    parser.add_argument("--mission-task-id", dest="mission_task_id",
+                        help="With mission steer: optional specific task_id to steer")
+    parser.add_argument("--mission-reason", dest="mission_reason",
+                        help="With mission cancel: bounded cancellation reason")
+    parser.add_argument("--memory-action", dest="memory_action",
+                        choices=("search",),
+                        help="Project-local memory & handoff search action")
+    parser.add_argument("--memory-query", dest="memory_query",
+                        help="With memory search: query string")
+    parser.add_argument("--memory-limit", dest="memory_limit", type=int, default=10,
+                        help="With memory search: maximum number of verified hits (default: 10)")
     return parser

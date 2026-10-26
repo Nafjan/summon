@@ -217,7 +217,8 @@ _FLAG_ALLOWLIST = ("agent", "cli", "model", "effort", "timeout", "cwd",
                    "agents_dir", "worktree", "profile", "allow_text_only", "require_tools",
                    "strict_agents_dir", "enable_roles", "read_root", "isolated_lane",
                    "allow_tool_credentials", "adaptive_timeout", "hard_timeout",
-                   "max_runtime")
+                   "max_runtime", "mission_id", "mission_max_work_tokens",
+                   "mission_max_cost_usd")
 
 
 def flags_projection(args) -> dict:
@@ -609,10 +610,13 @@ def job_status(root: str, job_id: str) -> dict | None:
     recorded_attempt = (rec or {}).get("attempt_id")
     if not valid_job_id(recorded_attempt):
         recorded_attempt = job_id if rec_state == _OK else None
+    rec_flags = (rec or {}).get("flags") if isinstance((rec or {}).get("flags"), dict) else {}
+    mission_id = (rec or {}).get("mission_id") or rec_flags.get("mission_id")
     return {
         "job_id": job_id, "state": state, "trusted": trusted,
         "attempt_id": recorded_attempt,
         "agent": (rec or {}).get("agent"),
+        "mission_id": mission_id if isinstance(mission_id, str) else None,
         "pid": (rec or {}).get("pid"),
         "prepared_at": (rec or {}).get("prepared_at"),
         "spawned_at": (rec or {}).get("spawned_at"),
@@ -766,8 +770,12 @@ def public_job_status(status: dict) -> dict:
                         "enable_roles", "isolated_lane", "allow_tool_credentials",
                         "adaptive_timeout"):
                 _put_typed(public_flags, key, flags.get(key), "bool")
-            for key in ("timeout", "hard_timeout", "max_runtime"):
+            for key in ("timeout", "hard_timeout", "max_runtime", "mission_max_work_tokens"):
                 _put_typed(public_flags, key, flags.get(key), "int")
+            _put_typed(public_flags, "mission_max_cost_usd", flags.get("mission_max_cost_usd"), "number")
+            mid_val = _safe_public_token(flags.get("mission_id"))
+            if mid_val is not None:
+                public_flags["mission_id"] = mid_val
             if public_flags:
                 public_record["flags"] = public_flags
         summon = _public_summon(record.get("summon"))
@@ -947,9 +955,12 @@ def list_jobs(root: str) -> list[dict]:
     for jid in ids:
         st = job_status(root, jid)
         if st:
-            rows.append({k: st[k] for k in ("job_id", "attempt_id", "state", "trusted", "agent",
-                                            "pid", "prepared_at", "result_status",
-                                            "liveness")})
+            row = {k: st[k] for k in ("job_id", "attempt_id", "state", "trusted", "agent",
+                                      "pid", "prepared_at", "result_status",
+                                      "liveness")}
+            if st.get("mission_id"):
+                row["mission_id"] = st["mission_id"]
+            rows.append(row)
     rows.sort(key=lambda r: r.get("prepared_at") or 0, reverse=True)
     return rows
 

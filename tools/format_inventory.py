@@ -92,6 +92,8 @@ _add("submission-summary", "summon.submission-summary/v1",
      authority="public_projection", shape=["candidate_records", "physical_attempts", "reported", "unknown_spend"],
      fixtures=[_test("submission_accounting", "test_public_summary_ignores_numeric_metrics_not_marked_reported"),
                _test("submission_accounting_public_acceptance", "test_review_private_history_projections_and_durable_preservation")])
+next(item for item in _FORMATS if item["id"] == "submission-summary")["readers"].append(
+    _ref("_background", "watch_jobs_snapshot"))
 _add("context-policy", "summon.context-policy/v1",
      _ref("_context_policy", "make"),
      _ref("_context_policy", "validate"),
@@ -1424,6 +1426,65 @@ _add("jobs-watch", "summon.jobs-watch/v1",
      shape=["schema", "job_dir", "observed_at", "count", "active_count", "jobs"],
      fixtures=[_test("job_control", "test_watch_jobs_snapshot_projects_authenticated_telemetry_and_rejects_tampered_heartbeat")],
      gaps=["Watch snapshots are read-only operator projections of background job status and authenticated heartbeats; they confer no execution or continuation authority."])
+_add("resource-governor", "summon.resource-governor/v1",
+     _ref("_resource_governor", "snapshot_host_resources"),
+     _ref("_doctor", "doctor"),
+     authority="public_projection",
+     shape=["schema", "pressure", "recommended_total_slots", "memory", "cpu", "disk", "active_leases"],
+     fixtures=[_test("resource_governor", "test_windows_cpu_busy_pct_accounts_for_idle_inside_kernel")],
+     gaps=["Resource governor snapshots are advisory host telemetry and concurrency pacing inputs; they confer no execution authority."])
+next(item for item in _FORMATS if item["id"] == "resource-governor")["readers"].append(
+    _ref("_doctor", "render"))
+_add("host-resource-leases", "summon.host-resource-leases/v1",
+     _ref("_resource_governor", "_write_registry_unlocked"),
+     _ref("_resource_governor", "_read_registry_unlocked"),
+     authority="private_evidence",
+     shape=["schema", "generation", "leases", "mac"],
+     fixtures=[_test("resource_governor", "test_parse_linux_meminfo_with_and_without_memavailable")],
+     gaps=["Cross-process slot leases coordinate local concurrency pacing only and are never treated as security boundaries."])
+_add("manifest-dag", "summon.manifest-dag/v1",
+     _ref("_manifest", "run_manifest"),
+     _ref("_manifest", "_normalize_jobs"),
+     authority="public_projection",
+     shape=["schema", "waves", "total_jobs", "succeeded", "blocked_by_dependencies"],
+     fixtures=[_test("manifest_dag", "test_normalize_jobs_detects_cycles_and_unknown_deps"),
+               _test("manifest_dag", "test_dag_handoff_forwarding_and_identity_matching")],
+     gaps=["Manifest DAG summaries report topological wave execution and upstream handoff forwarding; they confer no independent authority."])
+_add("mission-budget", "summon.mission-budget/v1",
+     _ref("_mission_budget", "configure_mission_budget"),
+     _ref("_mission_budget", "read_mission_budget"),
+     authority="private_authority",
+     shape=["schema", "mission_id", "max_work_tokens", "max_cost_usd", "total_known_work_tokens", "reserved_in_flight_work_tokens", "committed_work_tokens", "exhausted", "top_spender"],
+     fixtures=[_test("mission_budget", "test_mission_budget_attempt_scoped_accounting_no_double_counting")],
+     gaps=["Mission budget ledgers enforce attempt-scoped local admission and soft stop signals; provider-side billing remains authoritative for actual spend."])
+_add("hook-bridge", "summon.hook-bridge/v1",
+     _ref("_hook_bridge", "prepare_claude_hook_settings"),
+     _ref("_hook_bridge", "evaluate_hook_event"),
+     authority="private_authority",
+     shape=["schema", "job_id", "emitted_generations", "emitted_commands", "denied_tool_events", "last_event", "generation", "mac"],
+     fixtures=[_test("hook_bridge", "test_hook_bridge_host_secret_isolation_and_claude_args_preservation")],
+     gaps=["Subprocess hook state tracks HMAC-verified in-flight steering delivery and PreToolUse write denial for supported backends."])
+_add("memory-search", "summon.memory-search/v1",
+     _ref("_memory_index", "search_memory"),
+     _ref("_memory_index", "format_memory_search_human"),
+     authority="public_projection",
+     shape=["schema", "query", "sanitized_tokens", "engine", "indexed_chunks", "hits"],
+     fixtures=[_test("memory_index", "test_memory_index_fts5_and_bm25_fallback_and_operator_safety")],
+     gaps=["Memory search hits are source-verified, sanitized advisory snippets and never grant execution or configuration authority."])
+_add("mission-plan", "summon.mission-plan/v1",
+     _ref("_mission", "validate_mission_plan"),
+     _ref("_mission", "_load_plan_from_coordinator_or_file"),
+     authority="private_authority",
+     shape=["schema", "status", "summary", "tasks", "waves", "questions", "clamped_permissions"],
+     fixtures=[_test("mission", "test_validate_mission_plan_clamps_permissions_and_enforces_team")],
+     gaps=["Coordinator mission plans are untrusted proposals until validated and downward-clamped against the operator's team allowlist and permission ceiling."])
+_add("mission", "summon.mission/v1",
+     _ref("_mission", "project_mission_status"),
+     _ref("_mission", "render_mission_digest"),
+     authority="public_projection",
+     shape=["schema", "mission_id", "status", "objective", "coordinator", "team", "max_permission", "tasks", "open_questions", "answers", "steering", "integration", "budget", "resources"],
+     fixtures=[_test("mission", "test_mission_cli_needs_human_reply_steer_digest_and_cancel")],
+     gaps=["Mission status projections summarize journal and task state for operators and calling agents; durable envelopes and git commits remain authoritative."])
 
 FORMAT_INVENTORY = {"schema": SCHEMA, "version": VERSION, "formats": _FORMATS}
 

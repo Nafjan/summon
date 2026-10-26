@@ -4156,7 +4156,18 @@ class SwarmCoordinator:
             if (latest["status"] not in {"active", "indeterminate", "blocked"}
                     or task.get("terminal") in {"completed", "failed", "cancelled"}):
                 raise SwarmConflictError("task has no indeterminate claim")
-            if latest["status"] == "active" and latest["lease_expires_at_ms"] > _now_ms(self.clock):
+            has_interrupted_delivery = any(
+                isinstance(d, dict)
+                and isinstance(d.get("selection"), dict)
+                and d["selection"].get("claim_id") == latest["claim_id"]
+                and d.get("state") in {"held_for_recovery", "dead_lettered"}
+                for d in ((state.get("workspace") or {}).get("deliveries") or {}).values()
+            )
+            if (
+                latest["status"] == "active"
+                and latest["lease_expires_at_ms"] > _now_ms(self.clock)
+                and not has_interrupted_delivery
+            ):
                 raise SwarmConflictError("task has a live non-expired claim")
             if task.get("retry_authorized") and not allow_retry:
                 raise SwarmConflictError("task retry is already authorized")

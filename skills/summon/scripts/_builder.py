@@ -1378,10 +1378,17 @@ def _build_claude_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
     # the ambient/default profile is isolated.
     setting_sources = (account_flags if inv.profile_auth_mode == "login" else
                        [] if inv.profile_env is not None else ["--setting-sources", ""])
+    hook_settings_flags: list[str] = []
+    hook_settings_file = os.environ.get("SUMMON_CLAUDE_HOOK_SETTINGS_FILE")
+    if (isinstance(hook_settings_file, str) and hook_settings_file.strip()
+            and os.path.isfile(hook_settings_file.strip())
+            and not os.path.islink(hook_settings_file.strip())):
+        hook_settings_flags = ["--settings", hook_settings_file.strip()]
     common = (perm + model_flag + effort_flag
               + strip_boundary_flags(inv.cli, inv.extra_args)
               + root_flags
-              + setting_sources)
+              + setting_sources
+              + hook_settings_flags)
 
     if inv.resume_id:
         # Resume: the session already carries the agent definition, so we don't
