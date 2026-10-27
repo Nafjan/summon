@@ -209,9 +209,9 @@ Every dispatch envelope emits a single JSON object on stdout with top-level orch
 
 See [references/reference-manual.md](references/reference-manual.md) for the complete field-by-field dictionary.
 
-## Large document audit quick path & ACP transport
+## Ready-to-copy templates & ACP transport
 
-Use `examples/document-audit.schema.json` and `examples/document-audit.manifest.json` for claim-ledger audits (`--json-schema` enforces `type`, `properties`, `required`, `items`, `enum`, `const`, `additionalProperties`, `minItems`/`maxItems`, `minLength`/`maxLength`, `minimum`/`maximum`, `pattern`). Native ACP transport (`--transport acp`) is supported on `gemini`, `kimi`, and `cursor-agent` (`yolo`-only).
+Use `examples/v380-manifest-dag.json` (2-wave DAG with `depends_on`, `worktree`, `files_scope`, `max_permission`) and `examples/v380-mission-plan.json` (`summon.mission-plan/v1` for `summon mission start --plan-file`) for `v3.8.0` orchestration, or `examples/document-audit.schema.json` and `examples/document-audit.manifest.json` for claim-ledger audits (`--json-schema` enforces `type`, `properties`, `required`, `items`, `enum`, `const`, `additionalProperties`, `minItems`/`maxItems`, `minLength`/`maxLength`, `minimum`/`maximum`, `pattern`). Native ACP transport (`--transport acp`) is supported on `gemini`, `kimi`, and `cursor-agent` (`yolo`-only).
 
 ## Known limitations & caveats
 

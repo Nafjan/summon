@@ -35,9 +35,9 @@ run_subagent.py --set-agent reviewer --set 'args=-c model_reasoning_effort="high
 run_subagent.py --set-agent probe --set model=        # empty value REMOVES the key
 ```
 
-Settable keys: `run-agent` (claude/codex/cursor-agent/gemini/agy), `model`,
-`permission` (`read-only`/`safe-edit`/`yolo`), `args` (extra backend flags), and
-`profile` (a private registry name) —
+Settable keys: `run-agent` (`claude`, `codex`, `cursor-agent`, `gemini`, `kimi`, `agy`, `arkcli`, `opencode`, `zcode`, `openai-compat`), `model`, `model-policy` (`exact`),
+`permission` (`read-only`/`safe-edit`/`yolo`), `args` (extra backend flags),
+`profile` (a private registry name), `lifecycle`, and `successor` —
 values are validated before anything is written. `--new-agent` never overwrites;
 `--set-agent` edits frontmatter only, leaving the body byte-identical.
 

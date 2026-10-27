@@ -1,0 +1,32 @@
+{
+  "defaults": {
+    "cwd": "C:/absolute/path/to/repo",
+    "timeout": "15m",
+    "max_permission": "safe-edit",
+    "forward_handoff": true
+  },
+  "jobs": [
+    {
+      "id": "wave1-backend-patch",
+      "agent": "implementer",
+      "worktree": true,
+      "link_deps": ["node_modules", ".venv"],
+      "files_scope": ["src/api/**", "tests/api/**"],
+      "prompt": "Implement the pagination cursor fix in src/api/ and add unit tests in tests/api/. Do not touch files outside your files_scope."
+    },
+    {
+      "id": "wave1-docs-sync",
+      "agent": "docs-writer",
+      "worktree": true,
+      "files_scope": ["docs/**"],
+      "prompt": "Document the pagination cursor query parameters and error codes in docs/api.md."
+    },
+    {
+      "id": "wave2-cross-vendor-review",
+      "agent": "sol-review",
+      "max_permission": "read-only",
+      "depends_on": ["wave1-backend-patch", "wave1-docs-sync"],
+      "prompt": "Review the <context_handoff> summaries from wave1-backend-patch and wave1-docs-sync, verify schema consistency and edge-case coverage, and emit VERDICT: APPROVE or VERDICT: BLOCK."
+    }
+  ]
+}

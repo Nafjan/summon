@@ -1,0 +1,38 @@
+{
+  "schema": "summon.mission-plan/v1",
+  "status": "ready",
+  "summary": "Two-wave implementation and cross-vendor verification plan with disjoint files_scope.",
+  "tasks": [
+    {
+      "id": "implement-feature",
+      "agent": "implementer",
+      "permission": "safe-edit",
+      "worktree": true,
+      "files_scope": ["src/feature/**", "tests/feature/**"],
+      "depends_on": [],
+      "forward_handoff": true,
+      "prompt": "Implement the requested feature inside src/feature/ and add unit tests under tests/feature/. Emit a complete Final report block."
+    },
+    {
+      "id": "update-reference-docs",
+      "agent": "docs-writer",
+      "permission": "safe-edit",
+      "worktree": true,
+      "files_scope": ["docs/**"],
+      "depends_on": [],
+      "forward_handoff": true,
+      "prompt": "Update docs/ to match the new feature interface and configuration flags. Emit a complete Final report block."
+    },
+    {
+      "id": "verify-and-audit",
+      "agent": "reviewer",
+      "permission": "read-only",
+      "worktree": false,
+      "files_scope": [],
+      "depends_on": ["implement-feature", "update-reference-docs"],
+      "forward_handoff": true,
+      "prompt": "Audit the integrated changes and <context_handoff> notes from implement-feature and update-reference-docs. Emit VERDICT: APPROVE or VERDICT: BLOCK."
+    }
+  ],
+  "questions": []
+}

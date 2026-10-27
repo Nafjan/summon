@@ -81,11 +81,14 @@ plugin package with `plugin.json` at the repo root — no separate install step.
 `python install.py` from the repo instead.
 
 **Command surface**: the script accepts git-style **subcommands** — `dispatch` (the
-default action), `list`, `agents validate`, `models`, `doctor`, `manifest FILE`, `council`,
-`chat`, `swarm`, `deliberate QUESTION`, `deliberate status|replay|recover|cancel|open|resume RUN_ID`,
-`agent
-new|set NAME`, `role propose|approve|list|resolve`, `telemetry enable|disable|status|clear`,
-`usage status|import`, `fleet propose|validate|inspect|explain`,
+default action), `list`, `agents validate`, `models`, `doctor`, `onboard`, `auth status|repair`,
+`jobs list|status|watch|wait|extend|cancel|steer|resume|revalidate`, `worktree gc`,
+`manifest FILE`, `mission start|status|watch|steer|reply|cancel|list`,
+`memory search QUERY`, `council`, `chat`, `swarm`,
+`deliberate QUESTION`, `deliberate status|replay|recover|cancel|open|resume RUN_ID`,
+`agent new|set NAME`, `role propose|approve|list|resolve`, `telemetry enable|disable|status|clear`,
+`usage status|import|refresh|export|example`, `stats`, `result project|validate|consume`,
+`fleet propose|validate|inspect|explain`,
 `fleet approval status|approve|list|inspect|revoke`, `bug-report`, `version` — e.g. `run_subagent.py
 council --question "…" --cwd DIR`. The
 **legacy flat form still works unchanged** (`run_subagent.py --agent … --prompt …`,
@@ -449,13 +452,17 @@ Use this mode map (council and deliberate are a handoff, not one mixed run):
 
 | Request | Mode |
 |---|---|
-| One agent should do the work | ordinary dispatch |
-| Several independent jobs | manifest/fan-out |
-| Diverse positions, cross-examination, and a chairman | council |
-| Fixed-option, quorum-controlled, replayable decision | deliberate |
-| Read or repair an existing deliberate run | deliberate status/replay/recover |
-| Continue after a crash | deliberate resume, with explicit spend consent |
-| Open the local ledger | deliberate open |
+| One agent should do the work synchronously | ordinary `dispatch` |
+| One long-running task that needs live progress monitoring (`jobs watch`), mid-turn steering (`jobs steer` with `--in-flight-hooks`), or governed session resume (`jobs resume`) | `dispatch --background` + `jobs` |
+| Several independent or multi-wave jobs (`depends_on`, `worktree`, `files_scope`, `forward_handoff`) | `manifest` / DAG fan-out |
+| High-level objective requiring coordinator decomposition (`--coordinator`, `--team`, `--max-permission`), wave execution across isolated worktrees, and fast-forward merge | `mission start\|status\|watch\|steer\|reply\|cancel\|list` |
+| Diverse positions, cross-examination, and a chairman | `council` |
+| Fixed-option, quorum-controlled, replayable decision | `deliberate` |
+| Read or repair an existing deliberate run | `deliberate status/replay/recover` |
+| Continue after a crash | `deliberate resume`, with explicit spend consent |
+| Open the local ledger | `deliberate open` |
+| Multi-turn human + multi-agent discussion room | `chat open\|post\|turn\|show\|list` |
+| Provider-neutral task lease & claim ledger for external workers | `swarm create\|register\|claim\|renew\|status` |
 
 The conversation room is not a new authority mode. Use it when the human wants
 to brainstorm with several agents, continue a shared session, or participate in
@@ -606,7 +613,7 @@ not bypass or rewrite the authenticated store.
 | `--job-dir DIR` | No | Where `--background` writes job records and results (default `{tempdir}/subagents_jobs`; env `SUMMON_JOBS_DIR`). Point it at a durable, private path. Single-user model: summon does not defend the registry against other local users on a shared host |
 | `jobs list` / `jobs status ID` / `jobs watch` / `jobs wait ID` | - | Read-only registry commands (flat: `--jobs-list` / `--jobs-status ID` / `--jobs-watch` / `--jobs-wait ID`; add `--job-dir` and `--json` for `list`/`status`/`watch`, `--once` / `--jobs-watch-once` and `--interval SEC` / `--jobs-watch-interval SEC` for `watch`, or `--job-dir` and `--timeout` for `wait`). `watch` projects HMAC-authenticated `summon.job-heartbeat/v2` and terminal telemetry (`STATE`, `PHASE`, `ELAPSED`, `BREAKER`, `CTX%`, `PROGRESS`, `WORK_TOK`, `SPEND`) with terminal-result precedence over retained heartbeats and fail-closed `unknown_spend` reporting. `list` shows `prepared`, liveness-verified `running`, `stale` (pid gone with no result), `identity_mismatch` (the authenticated terminal scripts or prompt identity differs from the frozen launch record), `unverified` (probe unavailable), or a terminal status. `status` is a typed redacted projection: it omits prompts, report text, local paths, provider handles, profile/account data, non-schema heartbeat fields, and other execution capabilities; read roots appear as counts only. An available continuation is shown only after its private authenticated sidecar verifies. Use `jobs wait` (or the owner-readable result file named by the background launch response) when you need the complete private terminal envelope. `status` includes `liveness:alive|dead|unknown`; `wait` returns early on stale or identity mismatch instead of burning its timeout. When the wait's own `--timeout` elapses first, it exits 124 with `terminal: false` and a `status` that says what is known: `running` (pid observed alive), `prepared` (no pid published yet), or `unverified` (liveness unknown). None of these means failed, so check `jobs status` rather than relaunching; a job id missing from `--job-dir` is an error. Liveness proves that a pid exists, not that an old pid was never reused. |
 | `--adaptive-timeout` / `--hard-timeout` / `--max-runtime DURATION` | hard timeout | Adaptive mode treats `--timeout` as an activity checkpoint: meaningful progress can auto-extend the turn up to the current `--max-runtime` budget. An explicit authenticated `jobs extend` can raise an active background job's hard deadline within the seven-day cap. `--hard-timeout` preserves a fixed wall-clock deadline. Durations require explicit units such as `10m`, `900s`, or `4h` |
-| `jobs extend ID --duration DURATION` / `jobs cancel ID` / `jobs steer ID --message TEXT` | - | Durable background controls (flat aliases: `--jobs-extend ID --job-duration DURATION`, `--jobs-cancel ID`, and `--jobs-steer ID --job-message TEXT`). An authenticated extend advances an active adaptive attempt's soft and hard deadlines, bounded to seven days from job start; its applied generation appears in the heartbeat. Cancel affects the active job. Steering is currently authenticated and queued for a later resume/follow-up; it is not claimed as live mid-turn prompt injection |
+| `jobs extend ID --duration DURATION` / `jobs cancel ID` / `jobs steer ID --message TEXT` | - | Durable background controls (flat aliases: `--jobs-extend ID --job-duration DURATION`, `--jobs-cancel ID`, and `--jobs-steer ID --job-message TEXT`). An authenticated extend advances an active adaptive attempt's soft and hard deadlines, bounded to seven days from job start; its applied generation appears in the heartbeat. Cancel affects the active job. On Claude Code background jobs launched with `--in-flight-hooks`, queued steering is delivered live mid-turn via `PreToolUse` / `PostToolUse` `additionalContext` on the next tool boundary; on jobs without `--in-flight-hooks`, steering remains authenticated and queued for `jobs resume` |
 | `jobs resume ID [--message TEXT \| --message-file FILE] [--request-id ID]` | - | Creates one authenticated background successor for an eligible terminal named-profile Claude subprocess job, consuming queued steering exactly once. Flat aliases are `--jobs-resume`, `--job-message-file`, and `--job-request-id`. The same request ID is idempotent; conflicting inputs fail closed. Permission can only stay equal or decrease, any prior gate is preserved, retries/fallback/repair are disabled, and credit/PAYG consent must be freshly supplied. Other backends remain unsupported until they expose provider-specific continuity evidence |
 | `--jobs-revalidate ID --job-revalidation-file FILE` | - | Seal provider-free launch observation/qualification evidence for a legacy background source before a governed continuation. The packet is private, bounded, and never treated as a provider verdict. |
 | `--dry-run` | No | Print the fully resolved dispatch (command, model, permission flags) WITHOUT executing — catches wrong models/permissions/dead backends in zero paid runs |
@@ -638,12 +645,12 @@ not bypass or rewrite the authenticated store.
 | `--bug-report --bug-description TEXT` | No | Add a short, manually supplied description to the generated report. It is not automatic telemetry; review it for private content before sharing |
 | `--bug-report --submit-github` | No | Submit an existing reviewed Markdown report from `--from REVIEWED_REPORT.md` through `gh issue create`; no report regeneration, direct HTTP, or token access. Optional `--github-repo OWNER/REPO` and `--bug-title` |
 | `--manifest FILE` | - | Batch and DAG fan-out: run all jobs in a JSON manifest (`depends_on`, `worktree`, `link_deps`, `link_deps_allow_mutation`, `forward_handoff`, `files_scope`; see [references/fan-out.md](fan-out.md)). Combine with `--concurrency` and `--results-dir` |
-| `--concurrency` | No | With `--manifest` or `mission start`: `auto` (hardware-aware dynamic governor bounded by available RAM, CPU/load, and disk floors) or per-backend caps, e.g. `agy=2,codex=3,default=3` |
+| `--concurrency` | No | With `--manifest` or `mission start`: `auto` (hardware-aware dynamic governor bounded by available RAM, CPU/load, and disk floors) or per-backend caps (`default=N` or `BACKEND=N,…`, e.g. `agy=2,codex=3,default=3`) |
 | `--results-dir` | No | With `--manifest`: where job envelopes land (default `{cwd}/.agents/results`) |
-| `--mission-id ID` / `--mission-max-work-tokens N` / `--mission-max-cost-usd USD` | No | Shared attempt-scoped mission budget ceiling (`summon.mission-budget/v1`) across background jobs, manifests, and missions; reserves per-worker token allowances before launch (`error_kind: mission_budget_exhausted` on denial) and triggers a soft stop on mid-turn exhaustion |
-| `--in-flight-hooks` | No | With `--background` on Claude Code: generate an isolated `--settings` hook bridge (`summon.hook-bridge/v1`) while preserving `--setting-sources ""`, enforcing synchronous `PreToolUse` write/shell/MCP denial in `constrained` breaker mode and delivering queued `jobs steer` messages via `additionalContext` |
-| `mission start\|status\|watch\|steer\|reply\|cancel\|list` | - | Coordinator-led long-horizon task execution (`summon.mission/v1`, `summon.mission-plan/v1`): decompose an `--objective` via `--coordinator` (clamped to `--team` and `--max-permission`), execute wave DAGs across isolated git worktrees with `files_scope` verification before fast-forward merge, and monitor with `mission status ID --digest` or `mission watch ID` |
-| `memory search QUERY` (`--memory-search QUERY`) | - | Stdlib SQLite FTS5 / BM25 search (`summon.memory-search/v1`) over `.agents/memory.md`, completed `handoff_note` artifacts, council syntheses, and mission projections (`--memory-source`, `--memory-limit`, `--memory-rebuild`), re-verifying source digests and byte offsets before serving hits |
+| `--mission-id ID` / `--mission-max-work-tokens N` / `--mission-max-cost-usd USD` | No | Shared attempt-scoped mission budget ceiling (`summon.mission-budget/v1`) across background jobs, manifests, and missions; reserves per-worker token allowances before launch (`error_kind: mission_budget_exhausted` on denial) and triggers a soft stop on mid-turn exhaustion (when a backend reports token usage only at terminal turn completion rather than streaming deltas, a single worker turn can overshoot its allowance before the post-turn accounting pass blocks subsequent wave launches) |
+| `--in-flight-hooks` | No | With `--background` on Claude Code: generate an isolated `--settings` hook bridge (`summon.hook-bridge/v1`) while preserving `--setting-sources ""`, enforcing synchronous `PreToolUse` write/shell/MCP denial in `constrained` breaker mode and delivering queued `jobs steer` messages live mid-turn via `PreToolUse` / `PostToolUse` `additionalContext` |
+| `mission start\|status\|watch\|steer\|reply\|cancel\|list` | - | Coordinator-led long-horizon task execution (`summon.mission/v1`, `summon.mission-plan/v1`): decompose an `--objective` (or `--goal`) or load `--plan-file` via `--coordinator` (clamped to `--team` and `--max-permission`), execute wave DAGs across isolated git worktrees with `files_scope` verification before fast-forward merge, and monitor with `mission status ID --digest` or `mission watch ID` |
+| `memory search <query> [--query <q>] [--limit N]` | - | Stdlib SQLite FTS5 / BM25 search (`summon.memory-search/v1`; flat form: `--memory-action search --memory-query <q> [--memory-limit N]`) over `{cwd}/.agents/memory.md`, `{cwd}/.agents/handoffs/*.json`, `{cwd}/.agents/results/**/*.json`, `{cwd}/.agents/runs/**/result.json`, and `{cwd}/.agents/missions/**/mission_status.json`, re-verifying source digests and byte offsets before serving hits |
 | `--council` | - | Consensus deliberation: dispatch `--question` to diverse members, chairman synthesizes. See "Council mode" |
 | `--council-context-submit RUN_ID` / `--council-context-file FILE` | With a paused council | Admit one bounded, provider-inert context packet at the paused checkpoint. Pair with `--council-operation-key KEY` for idempotency and `--council-expect-generation N` for stale-check protection. |
 | `--council-continue RUN_ID` | With a paused council | Continue the next council round after its checkpoint and any explicitly admitted context. It does not silently retry a completed member. |
@@ -822,11 +829,13 @@ Agent definitions are trusted execution configuration, not passive prose: a proj
 `--agents-dir`, inspect `agent_def.source`, and apply `--max-permission` only on a backend
 that actually enforces the chosen tier.
 
-## Large document audit quick path
+## Ready-to-copy templates (`examples/`) & Large document audit quick path
 
-The installed skill includes a ready schema, manifest, council question, and four
+The installed skill includes ready-to-copy `v3.8.0` orchestration templates (`v380-manifest-dag.json` for 2-wave DAG manifests with `depends_on`/`worktree`/`files_scope`/`max_permission`, and `v380-mission-plan.json` for `summon.mission-plan/v1` mission plans) plus a schema, manifest, council question, and four
 role-specialized agents under `examples/`:
 
+- `v380-manifest-dag.json` is a 2-wave DAG manifest template with `depends_on`, `worktree: true`, `link_deps`, `files_scope`, `max_permission`, and `forward_handoff: true`.
+- `v380-mission-plan.json` is a validated `summon.mission-plan/v1` template ready for `summon mission start --plan-file`.
 - `document-audit.schema.json` is a claim ledger contract with exact artifact locator,
   source evidence, severity, confidence, disposition, and correction.
 - `document-audit.manifest.json` fans correspondence/coverage, mechanics/metadata, and
@@ -1131,7 +1140,7 @@ permissions.
 
 | Field | Values | Description |
 |-------|--------|-------------|
-| `run-agent` | `codex`, `claude`, `cursor-agent`, `gemini`, `kimi`, `agy`, `opencode`, `openai-compat` | Which backend executes this agent (`opencode` = OpenCode's toolful CLI gateway; `openai-compat` = a configured endpoint implementing Summon's supported OpenAI-compatible API subset — see "Custom & API backends") |
+| `run-agent` | `codex`, `claude`, `cursor-agent`, `gemini`, `kimi`, `agy`, `arkcli`, `opencode`, `zcode`, `openai-compat` | Which backend executes this agent (`opencode` = OpenCode's toolful CLI gateway; `zcode` = ZCode gateway or native adapter; `arkcli` = BytePlus ArkCLI Coding Plan chat seat; `openai-compat` = a configured endpoint implementing Summon's supported OpenAI-compatible API subset — see "Custom & API backends") |
 | `permission` | `read-only`, `safe-edit` (default), `yolo` | Approval/sandbox level the sub-agent runs with |
 | `model` | CLI-specific string (optional) | Pin this agent to a model; `--model` at dispatch overrides it. Verify with the envelope's `model.served` |
 | `model-policy` | `exact` (optional) | Require provider-authored terminal evidence for the pinned model. A mismatch or missing served-model receipt blocks the result without fallback, resume, or contract repair. Built-in governance seats use this policy automatically. |
