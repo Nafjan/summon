@@ -205,7 +205,7 @@ def blocked_envelope(*, agent: str, cli: str, text_seat: dict) -> dict:
     return {
         "result": "",
         "status": "blocked",
-        "exit_code": 0,
+        "exit_code": 1,
         "attempts": 0,
         "attempt_status": "not_run",
         "execution_status": "not_run",

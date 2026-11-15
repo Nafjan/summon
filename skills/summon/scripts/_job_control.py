@@ -151,7 +151,7 @@ def public_heartbeat(value: dict, integrity: str) -> dict | None:
         trusted_kind = live.get("last_trusted_kind")
         if trusted_kind is None or (isinstance(trusted_kind, str) and trusted_kind in {
                 "transport_started", "stream_event", "output_text", "tool_activity",
-                "reconnect", "finalizing", "terminal", "cancelled"}):
+                "reconnect", "step_start", "finalizing", "terminal", "cancelled"}):
             safe_live["last_trusted_kind"] = trusted_kind
         activity_kind = live.get("last_activity_kind")
         if activity_kind is None or (isinstance(activity_kind, str) and activity_kind in {"tool", "generation"}):

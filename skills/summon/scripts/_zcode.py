@@ -12,6 +12,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,6 +59,12 @@ def _target(path: str, source: str, *, which=shutil.which) -> ZCodeTarget | None
     # off argv, but a direct executable/bundle is still required for a truthful
     # headless integration; discovery continues to the bundled CLI instead.
     if suffix in {".cmd", ".bat", ".ps1"}:
+        if Path(path).stem.casefold().startswith("zcode"):
+            sibling_js = Path(path).parent / "node_modules" / "zcode-app-cli" / "bin" / "zcode.js"
+            if _is_file(sibling_js):
+                node = which("node")
+                if node:
+                    return ZCodeTarget(command=node, prefix_args=(str(sibling_js),), source=source)
         return None
     return ZCodeTarget(command=str(path), prefix_args=(), source=source)
 
@@ -134,6 +141,10 @@ def _well_known_bundle_candidates() -> list[tuple[str, str]]:
     """Return trusted app-bundle locations, with no private-config lookup."""
     candidates: list[tuple[str, str]] = []
     if os.name == "nt":
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            candidates.append((str(Path(appdata, "npm", "node_modules", "zcode-app-cli", "bin", "zcode.js")),
+                               "npm_zcode_cli"))
         local = os.environ.get("LOCALAPPDATA")
         if local:
             candidates.append((str(Path(local, "Programs", "ZCode").joinpath(*_BUNDLE_RELATIVE)),
@@ -144,7 +155,10 @@ def _well_known_bundle_candidates() -> list[tuple[str, str]]:
                 candidates.append((str(Path(root, "ZCode").joinpath(*_BUNDLE_RELATIVE)),
                                    "windows_bundle"))
     elif os.name == "posix":
-        if os.sys.platform == "darwin":
+        for prefix in ("/usr/local/lib", "/opt/homebrew/lib", str(Path.home() / ".npm-global" / "lib")):
+            candidates.append((str(Path(prefix, "node_modules", "zcode-app-cli", "bin", "zcode.js")),
+                               "npm_zcode_cli"))
+        if sys.platform == "darwin":
             candidates.extend([
                 ("/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs", "macos_bundle"),
                 (str(Path.home() / "Applications" / "ZCode.app" / "Contents" / "Resources" /
@@ -256,6 +270,28 @@ def _usage(value: object) -> dict | None:
     return normalized or None
 
 
+def zcode_config_status() -> dict:
+    """Inspect non-secret local ZCode config paths without reading secrets."""
+    from pathlib import Path
+    zcode_root = Path.home() / ".zcode"
+    v2_provider = zcode_root / "v2" / "provider_config.json"
+    cli_config = zcode_root / "cli" / "config.json"
+    v2_exists = v2_provider.is_file()
+    cli_exists = cli_config.is_file()
+    out = {
+        "v2_provider_config_present": v2_exists,
+        "v2_provider_config_path": "~/.zcode/v2/provider_config.json",
+        "cli_config_present": cli_exists,
+        "cli_config_path": "~/.zcode/cli/config.json",
+        "configured": bool(v2_exists or cli_exists),
+    }
+    if not v2_exists and not cli_exists:
+        out["hint"] = "Run `zcode doctor` or `zcode login` to initialize ~/.zcode/v2/provider_config.json"
+    elif not v2_exists and cli_exists:
+        out["hint"] = "~/.zcode/v2/provider_config.json is absent; if `zcode` reports missing provider_config, run `zcode doctor` or `zcode login`"
+    return out
+
+
 def zcode_result_fields(value: dict | None) -> dict:
     """Extract a verified minimal terminal ZCode result shape.
 
@@ -266,25 +302,34 @@ def zcode_result_fields(value: dict | None) -> dict:
     """
     if not isinstance(value, dict):
         return {"response": "", "session_id": None, "usage": None,
-                "context_window": None, "parse_ok": False}
+                "context_window": None, "model": None, "parse_ok": False}
     response = value.get("response")
     if (not isinstance(response, str) or not response.strip()
             or len(response.encode("utf-8", errors="replace")) > _MAX_JSON_OUTPUT):
         return {"response": "", "session_id": None, "usage": None,
-                "context_window": None, "parse_ok": False}
+                "context_window": None, "model": None, "parse_ok": False}
     session = _bounded_text(value.get("sessionId"), 256)
     if session is None or not _SESSION_RE.fullmatch(session):
         return {"response": "", "session_id": None, "usage": None,
-                "context_window": None, "parse_ok": False}
+                "context_window": None, "model": None, "parse_ok": False}
     usage = _usage(value.get("usage"))
     projection = value.get("projection") if isinstance(value.get("projection"), dict) else {}
     context_window = projection.get("contextWindow")
     if isinstance(context_window, bool) or not isinstance(context_window, int) or context_window < 0:
         context_window = None
+    raw_model = (
+        value.get("model")
+        or value.get("modelId")
+        or value.get("model_id")
+        or projection.get("model")
+        or projection.get("modelId")
+    )
+    model = _bounded_text(raw_model, 160) if isinstance(raw_model, str) else None
     return {
         "response": response,
         "session_id": session,
         "usage": usage,
         "context_window": context_window,
+        "model": model,
         "parse_ok": True,
     }

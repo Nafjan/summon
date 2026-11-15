@@ -26,6 +26,7 @@ _CLI_CATALOG = (
             "default": "npm install -g @anthropic-ai/claude-code",
         },
         "auth": "claude auth login",
+        "upgrade": "claude update  (or `npm update -g @anthropic-ai/claude-code`)",
     },
     {
         "id": "codex",
@@ -35,6 +36,7 @@ _CLI_CATALOG = (
             "default": "npm install -g @openai/codex",
         },
         "auth": "codex login",
+        "upgrade": "npm update -g @openai/codex",
     },
     {
         "id": "cursor-agent",
@@ -46,6 +48,7 @@ _CLI_CATALOG = (
             "default": "https://cursor.com/cli  (install Cursor CLI / cursor-agent)",
         },
         "auth": "cursor-agent login  (or set CLI_API_KEY)",
+        "upgrade": "cursor-agent update  (or reinstall from https://cursor.com/cli)",
     },
     {
         "id": "gemini",
@@ -55,6 +58,7 @@ _CLI_CATALOG = (
             "default": "npm install -g @google/gemini-cli",
         },
         "auth": "gemini  (first interactive run) or GEMINI_API_KEY",
+        "upgrade": "Frozen in Summon; prefer the `agy` (Antigravity) backend",
     },
     {
         "id": "agy",
@@ -65,6 +69,7 @@ _CLI_CATALOG = (
             "Windows": "Antigravity CLI — https://antigravity.google  (Windows ConPTY)",
         },
         "auth": "agy login",
+        "upgrade": "Update via Antigravity IDE / installer (https://antigravity.google)",
     },
     {
         "id": "kimi",
@@ -74,6 +79,7 @@ _CLI_CATALOG = (
             "default": "Kimi Code CLI — https://moonshotai.github.io/kimi-code/",
         },
         "auth": "kimi login",
+        "upgrade": "kimi upgrade  (or `kimi update`, then `kimi login` to refresh models)",
     },
     {
         "id": "arkcli",
@@ -83,6 +89,7 @@ _CLI_CATALOG = (
             "default": "npm install -g @byteplus/ark-cli",
         },
         "auth": "arkcli auth login",
+        "upgrade": "npm update -g @byteplus/ark-cli",
     },
 )
 
@@ -165,6 +172,7 @@ def detect_clis() -> list[dict[str, Any]]:
             "path": found_bin if found_path else None,
             "install": _install_hint(entry),
             "auth": entry["auth"],
+            "upgrade": entry.get("upgrade"),
             "auth_state": "unverified",
             "auth_plan": auth_repair_plan(entry["id"]),
         })
@@ -206,10 +214,14 @@ def render_detection(clis: list[dict[str, Any]], creds: dict[str, Any]) -> str:
             if plan.get("command"):
                 lines.append(f"       repair:  `{plan['command']}`; authorized flow: "
                              f"`{plan.get('authorized_command', '')}`")
+            if row.get("upgrade"):
+                lines.append(f"       upgrade: {row['upgrade']}")
         else:
             lines.append(f"  [--] {row['id']:14} not found")
             lines.append(f"       install: {row['install']}")
             lines.append(f"       auth:    {row['auth']}")
+            if row.get("upgrade"):
+                lines.append(f"       upgrade: {row['upgrade']}")
     lines.append("")
     lines.append("credential presence (values never shown):")
     for k in ("BYTEPLUS_CODING_API_KEY", "byteplus_coding_resolvable",

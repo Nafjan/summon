@@ -186,6 +186,43 @@ def test_git_integration_merges_in_scope_and_blocks_scope_violation(tmp_path: Pa
     assert "secrets/config.json" in res2["out_of_scope_files"]
     assert not (Path(integration["worktree_path"]) / "secrets" / "config.json").exists()
 
+    # 3. Task 3 has verified unmutated linked_deps (.venv) alongside src/with_venv.py -> merged cleanly without staging .venv
+    wt3 = tmp_path / "wt3"
+    _git(str(repo), "worktree", "add", "-b", "agents/task-3", str(wt3), base_head)
+    (wt3 / "src" / "with_venv.py").write_text("def v(): return 3\n", encoding="utf-8")
+    (wt3 / ".venv").mkdir()
+    (wt3 / ".venv" / "pyvenv.cfg").write_text("home = C:/Python\n", encoding="utf-8")
+
+    task3 = {
+        "id": "task-3",
+        "agent": "implementer",
+        "files_scope": ["src/"],
+    }
+    env3 = {
+        "status": "success",
+        "exit_code": 0,
+        "result": "Added src/with_venv.py with linked .venv",
+        "worktree": {
+            "path": str(wt3),
+            "base_head": base_head,
+            "linked_deps": {
+                "deps_mutated": False,
+                "links_intact": True,
+                "paths": [".venv"],
+            },
+        },
+    }
+    res3 = _mission.verify_and_integrate_task(
+        task=task3,
+        envelope=env3,
+        integration=integration,
+    )
+    assert res3["status"] == "merged"
+    assert res3["merged"] is True
+    assert "src/with_venv.py" in res3["touched_files"]
+    assert not any(p.startswith(".venv") for p in res3["touched_files"])
+    assert not (Path(integration["worktree_path"]) / ".venv").exists()
+
 
 def test_mission_cli_needs_human_reply_steer_digest_and_cancel(tmp_path: Path):
     ws = tmp_path / "ws"

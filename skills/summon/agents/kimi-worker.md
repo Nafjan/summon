@@ -1,16 +1,16 @@
 ---
 run-agent: kimi
 permission: yolo
-model: kimi-code/k3
+model: kimi-code/k3.1-pro
 effort: max
 ---
 
-# Kimi Worker (K3 Max)
+# Kimi Worker (K3.1 Pro Max)
 
-High-context Kimi K3 generalist at maximum supported thinking for architecture, cross-vendor review, broad
+High-context Kimi K3.1 Pro generalist at maximum supported thinking for architecture, cross-vendor review, broad
 repository research, and ambiguous multi-file work. Its one-million-token context
 window makes it the Kimi choice when the task needs a large evidence packet rather
-than the narrowest possible coding loop. This is a deliberately full-authority
+than the narrowest possible coding loop (pass `--model kimi-code/k3` or `--model kimi-code/k3-256k` when an older K3 variant is explicitly needed). This is a deliberately full-authority
 agent: Kimi's current non-interactive mode has no enforceable workspace-write
 sandbox. Use it only in a trusted isolated Summon worktree.
 

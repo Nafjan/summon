@@ -40,7 +40,7 @@ EVENT_SCHEMA_VERSION = 2
 # Keep the telemetry contract tied to the dispatcher release without importing
 # ``run_subagent`` (which would introduce a module cycle).  Release bumps must
 # update this alongside the dispatcher ``__version__``.
-SUMMON_VERSION = "3.8.0"
+SUMMON_VERSION = "3.8.1"
 # Backward-compatible name for callers that used the old event constant.  It
 # refers to event records, never the persisted opt-in configuration.
 SCHEMA_VERSION = EVENT_SCHEMA_VERSION
@@ -638,7 +638,17 @@ _FAILURE_CLASS_BY_KIND = {
     "agy_capability_probe_stalled": "dispatch",
     "agy_capability_probe_failed": "dispatch",
     "prompt_too_long_for_argv": "invalid_input",
+    "prompt_transport_unsafe": "invalid_input",
     "invalid_input": "invalid_input",
+    "opencode_yolo_isolation_error": "worktree",
+    "zcode_isolation_required": "worktree",
+    "zcode_tool_credentials_consent_required": "permission",
+    "zcode_safe_edit_unsupported": "permission",
+    "link_deps_requires_worktree": "worktree",
+    "link_deps_target_exists": "worktree",
+    "link_deps_mutated": "worktree",
+    "linked_deps_mutated": "worktree",
+    "link_deps_broken": "worktree",
 }
 # "timeout" as a word, not inside a flag name such as "--print-timeout".
 _TIMEOUT_TEXT_RE = re.compile(r"(?<!-)timeout")
@@ -647,7 +657,8 @@ _TIMEOUT_TEXT_RE = re.compile(r"(?<!-)timeout")
 def _failure_class(envelope: dict) -> str:
     status = str(envelope.get("status") or "").lower()
     kind = str(envelope.get("error_kind") or "").lower()
-    stage = str((envelope.get("timeout") or {}).get("stage") or "").lower()
+    _timeout_raw = envelope.get("timeout")
+    stage = str((_timeout_raw if isinstance(_timeout_raw, dict) else {}).get("stage") or "").lower()
     text = " ".join((kind, stage, str(envelope.get("error") or "").lower()))
     if status == "success":
         return "success"
@@ -661,10 +672,12 @@ def _failure_class(envelope: dict) -> str:
         return _FAILURE_CLASS_BY_KIND[kind]
     if _TIMEOUT_TEXT_RE.search(text) or stage:
         return "timeout"
+    if "--worktree" in text or "--isolated-lane" in text:
+        return "worktree"
+    if "--allow-tool-credentials" in text or "permission_unsupported" in text or "cannot enforce" in text:
+        return "permission"
     if any(word in text for word in ("auth", "login", "unauthorized", "forbidden")):
         return "authentication"
-    if "permission_unsupported" in text or "cannot enforce" in text:
-        return "permission"
     if any(word in text for word in ("quota", "rate limit", "429", "credit")):
         return "quota"
     if any(word in text for word in ("transport", "connection", "network", "acp")):
@@ -673,7 +686,11 @@ def _failure_class(envelope: dict) -> str:
         return "missing_cli"
     if any(word in text for word in ("prompt", "argument", "invalid", "required", "incompatible")):
         return "invalid_input"
-    if any(word in text for word in ("report", "contract", "parse")):
+    if any(word in text for word in (
+        "report contract", "report_contract", "report block",
+        "missing report", "incomplete report", "bookend",
+        "contract", "parse",
+    )):
         return "report_contract"
     if "worktree" in text:
         return "worktree"
@@ -752,6 +769,17 @@ def _workspace_summary(value: object) -> dict | None:
                         "renamed_count": len(snap.get("renamed") or []) if isinstance(snap.get("renamed"), list) else None,
                         "untracked_count": len(snap.get("untracked") or []) if isinstance(snap.get("untracked"), list) else None}
     return out
+
+
+def _system_name() -> str | None:
+    """Return the OS family label without triggering Windows WMI/cmd.exe probes."""
+    if os.name == "nt" or sys.platform == "win32":
+        return "Windows"
+    if sys.platform == "darwin":
+        return "Darwin"
+    if sys.platform.startswith("linux"):
+        return "Linux"
+    return platform.system() or None
 
 
 def event_from_envelope(envelope: dict, *, source: str = "dispatch",
@@ -973,7 +1001,7 @@ def event_from_envelope(envelope: dict, *, source: str = "dispatch",
         "prompt_sha256": _hash(envelope.get("prompt_sha256")),
         "workspace": _workspace_summary(envelope.get("workspace_evidence")),
         "platform": {"os": os.name, "python": f"{sys.version_info.major}.{sys.version_info.minor}",
-                      "system": platform.system() or None},
+                      "system": _system_name()},
     }
     warnings = envelope.get("warnings")
     if isinstance(warnings, list):

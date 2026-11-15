@@ -404,7 +404,8 @@ class EvidenceGuardTests(unittest.TestCase):
             "usage": {"output_tokens": 12},
         })
         self.assertEqual(result["served_model_evidence"], "inferred")
-        self.assertEqual(result["model"]["served"], "kimi-code/k3")
+        self.assertIsNone(result["model"]["served"])
+        self.assertEqual(result["model"]["targeted"], "kimi-code/k3")
         self.assertNotIn("suspect", result)
 
     def test_invalid_target_cannot_be_used_for_inferred_provenance(self):

@@ -284,6 +284,17 @@ jobs:
       - name: Unit tests (backend/model routing preflight)
         run: python -m unittest skills.summon.scripts.test_model_routing
 
+      - name: Unit tests (v3.8.0 orchestration and v3.8.1 hindrance regressions)
+        run: >-
+          python -m pytest -q
+          skills/summon/scripts/test_v381_hindrance_fixes.py
+          skills/summon/scripts/test_manifest_dag.py
+          skills/summon/scripts/test_mission.py
+          skills/summon/scripts/test_mission_budget.py
+          skills/summon/scripts/test_hook_bridge.py
+          skills/summon/scripts/test_memory_index.py
+          skills/summon/scripts/test_resource_governor.py
+
       - name: Doctor runs clean on a bare machine (exit 1 = no backends, still valid JSON)
         shell: bash
         run: |

@@ -31,6 +31,12 @@ PROFILE_ENV_VARS = {
     "codex": "CODEX_HOME",
 }
 
+CODEX_LOGIN_CONFIG_TOML = (
+    'cli_auth_credentials_store = "file"\n'
+    'forced_login_method = "chatgpt"\n'
+    'model_provider = "openai"\n'
+)
+
 
 def validate_profile_name(name: str) -> str:
     """Validate a registry key, refusing paths and shell metacharacters."""
@@ -86,6 +92,9 @@ def _inside_dispatch_tree(path: str, cwd: str | None) -> bool:
     try:
         candidate = os.path.normcase(os.path.realpath(os.path.abspath(path)))
         root = os.path.normcase(os.path.realpath(os.path.abspath(cwd)))
+        home = os.path.normcase(os.path.realpath(os.path.abspath(os.path.expanduser("~"))))
+        if root == home:
+            return False
         return os.path.commonpath((candidate, root)) == root
     except ValueError:
         # Different Windows drives have no common path and therefore cannot be
@@ -188,7 +197,16 @@ def resolve_profile(name: str | None, cli: str, cwd: str | None = None) -> dict 
         raise ValueError(
             f"profile {profile_name!r} targets {entry_cli!r}, not the resolved backend {cli!r}")
     path, path_sha = _profile_dir(entry.get("config_dir"), cwd)
-    auth_mode = entry.get("auth_mode", "profile")
+    raw_auth_mode = entry.get("auth_mode")
+    if raw_auth_mode is None:
+        if cli == "codex" and os.path.isfile(os.path.join(path, "auth.json")):
+            auth_mode = "login"
+        elif cli == "claude" and os.path.isfile(os.path.join(path, ".credentials.json")):
+            auth_mode = "login"
+        else:
+            auth_mode = "profile"
+    else:
+        auth_mode = raw_auth_mode
     if auth_mode not in ("profile", "login"):
         raise ValueError("profile auth_mode must be 'profile' or 'login'")
     command, command_sha = _profile_command(entry.get("command"), cli, cwd)
@@ -209,6 +227,125 @@ def resolve_profile(name: str | None, cli: str, cwd: str | None = None) -> dict 
         "state_sha256": _profile_state(path, cli),
         "models": tuple(models or ()),
     }
+
+
+def init_profile(name: str | None, cli: str | None) -> dict:
+    """Create an isolated private account home and register a login-mode profile.
+
+    Never overwrites an existing registry entry or echoes filesystem paths in the
+    returned receipt.
+    """
+    if cli not in ("claude", "codex"):
+        raise ValueError("auth init supports only 'claude' and 'codex' login profiles")
+    if not name or not str(name).strip():
+        raise ValueError("auth init requires --profile NAME")
+    profile_name = validate_profile_name(name)
+    reg_file = Path(registry_path())
+    reg_parent = reg_file.parent
+    reg_parent.mkdir(parents=True, exist_ok=True)
+    if reg_file.exists():
+        document, _ = _read_registry(str(reg_file))
+    else:
+        document = {"profiles": {}}
+    profiles = document.setdefault("profiles", {})
+    if profile_name in profiles:
+        resolved = resolve_profile(profile_name, cli, None)
+        return {
+            "status": "success",
+            "backend": cli,
+            "profile": profile_name,
+            "created": False,
+            "auth_mode": resolved["auth_mode"],
+            "path_sha256": resolved["path_sha256"],
+            "registry_sha256": resolved["registry_sha256"],
+            "repair_command": f"summon auth repair {cli} --profile {profile_name} --allow-auth-repair",
+            "status_command": f"summon auth status {cli} --profile {profile_name} --probe",
+            "message": (
+                f"Profile {profile_name!r} ({cli}) is already registered. "
+                f"Run `summon auth repair {cli} --profile {profile_name} --allow-auth-repair` to sign in, "
+                f"or `summon auth status {cli} --profile {profile_name} --probe` to check status."
+            ),
+        }
+    home_dir = reg_parent / "summon-account-homes" / profile_name
+    home_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if cli == "codex":
+        cfg_path = home_dir / "config.toml"
+        if not cfg_path.exists():
+            cfg_path.write_text(CODEX_LOGIN_CONFIG_TOML, encoding="utf-8")
+    profiles[profile_name] = {
+        "cli": cli,
+        "config_dir": str(home_dir.resolve()),
+        "auth_mode": "login",
+    }
+    tmp_file = reg_file.with_suffix(reg_file.suffix + ".tmp")
+    tmp_file.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp_file, reg_file)
+    resolved = resolve_profile(profile_name, cli, None)
+    return {
+        "status": "success",
+        "backend": cli,
+        "profile": profile_name,
+        "created": True,
+        "auth_mode": resolved["auth_mode"],
+        "path_sha256": resolved["path_sha256"],
+        "registry_sha256": resolved["registry_sha256"],
+        "repair_command": f"summon auth repair {cli} --profile {profile_name} --allow-auth-repair",
+        "status_command": f"summon auth status {cli} --profile {profile_name} --probe",
+        "message": (
+            f"Initialized private {cli} login profile {profile_name!r}. "
+            f"Next, sign in with `summon auth repair {cli} --profile {profile_name} --allow-auth-repair` "
+            f"and verify with `summon auth status {cli} --profile {profile_name} --probe`."
+        ),
+    }
+
+
+def list_profiles(cli: str | None = None, cwd: str | None = None) -> list[dict]:
+    """Enumerate configured profiles from the private registry without exposing paths."""
+    path = registry_path()
+    if not os.path.isfile(path):
+        return []
+    try:
+        document, _registry_sha = _read_registry(path)
+    except ValueError:
+        return []
+    profiles = document.get("profiles") or {}
+    rows: list[dict] = []
+    for raw_name in sorted(profiles):
+        entry = profiles.get(raw_name)
+        if not isinstance(entry, dict):
+            continue
+        entry_cli = entry.get("cli", entry.get("backend"))
+        if not isinstance(entry_cli, str) or not entry_cli.strip():
+            continue
+        entry_cli = entry_cli.strip()
+        if cli and entry_cli != cli:
+            continue
+        try:
+            resolved = resolve_profile(str(raw_name), entry_cli, cwd)
+            rows.append({
+                "name": resolved["name"],
+                "cli": resolved["cli"],
+                "auth_mode": resolved["auth_mode"],
+                "models": list(resolved["models"]),
+                "path_sha256": resolved["path_sha256"],
+                "valid": True,
+                "status_command": f"summon auth status {resolved['cli']} --profile {resolved['name']} --probe",
+                "repair_command": f"summon auth repair {resolved['cli']} --profile {resolved['name']} --allow-auth-repair",
+            })
+        except ValueError as exc:
+            safe_name = str(raw_name).strip()
+            rows.append({
+                "name": safe_name,
+                "cli": entry_cli,
+                "auth_mode": str(entry.get("auth_mode") or "profile"),
+                "models": [m for m in (entry.get("models") or ()) if isinstance(m, str)],
+                "valid": False,
+                "error": str(exc),
+                "status_command": f"summon auth status {entry_cli} --profile {safe_name} --probe",
+                "repair_command": f"summon auth repair {entry_cli} --profile {safe_name} --allow-auth-repair",
+            })
+    return rows
+
 
 
 def validate_model(profile: dict | None, model: str | None) -> None:
@@ -274,8 +411,7 @@ def account_launch_policy(inv) -> tuple[list, dict]:
         # unambiguously local to CODEX_HOME rather than an OS-wide keyring.
         flags = ["-c", 'cli_auth_credentials_store="file"',
                  "-c", 'forced_login_method="chatgpt"',
-                 "-c", 'model_provider="openai"',
-                 "-c", 'openai_base_url="https://api.openai.com/v1"']
+                 "-c", 'model_provider="openai"']
     else:
         # Read this account's user settings, not project/local auth overrides.
         # Managed organization policy remains in force.

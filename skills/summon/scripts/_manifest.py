@@ -1220,6 +1220,16 @@ def run_manifest(args) -> int:
                                                 touched.add(new_p.strip().strip('"'))
                                         elif rel.strip('"'):
                                             touched.add(rel.strip('"'))
+                            ld_info = wt_obj.get("linked_deps") if isinstance(wt_obj.get("linked_deps"), dict) else {}
+                            if ld_info.get("deps_mutated") is False and ld_info.get("links_intact") is True:
+                                ld_exact = {str(lp).replace("\\", "/").strip("/") for lp in (ld_info.get("paths") or ()) if lp}
+                                ld_prefixes = [f"{lp}/" for lp in ld_exact if lp]
+                                filtered_touched: set[str] = set()
+                                for p in touched:
+                                    norm_p = p.replace("\\", "/").strip("/")
+                                    if norm_p not in ld_exact and not any(norm_p.startswith(pref) for pref in ld_prefixes):
+                                        filtered_touched.add(p)
+                                touched = filtered_touched
                             violations = [p for p in sorted(touched) if not path_matches_scope(p, job["files_scope"])]
                             if violations:
                                 envelope["status"] = "blocked"

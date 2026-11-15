@@ -926,7 +926,7 @@ def test_schema_validator_subset():
 def test_manifest_normalize_and_concurrency():
     import _manifest as m
     caps = m._parse_concurrency("agy=2, codex=3")
-    assert caps == {"default": 3, "agy": 2, "codex": 3}
+    assert caps == {"default": 3, "agy": 2, "codex": 3, "_auto": False}
     jobs, err = m._normalize_jobs(
         {"defaults": {"retries": 1},
          "jobs": [{"agent": "reviewer", "prompt": "p1"},
@@ -1137,7 +1137,7 @@ def test_v1_normalized_success_exit_fields():
     resp = _executor.build_final_response(
         "codex", 1, {"is_error": False, "result": "done"}, ["done\n"], "")
     assert resp["status"] == "success"
-    assert resp["exit_code"] == 1 and resp["backend_exit_code"] == 1
+    assert resp["exit_code"] == 0 and resp["backend_exit_code"] == 1
     assert resp["raw_backend_exit_code"] == 1 and resp["normalized_exit_code"] == 0
     assert resp["dispatcher_status"] == "success"
     assert "normalized to success" in resp["normalization_reason"]
@@ -1725,11 +1725,15 @@ def test_doctor_version_probe_allows_slow_cli_startup():
 def test_background_and_out_rejected():
     import json as _json, subprocess as sp
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_subagent.py")
-    r = sp.run([sys.executable, script, "--agent", "a", "--prompt", "p",
-                "--cwd", os.getcwd(), "--background", "--out", "x.json"],
-               capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
-    env = _json.loads(r.stdout)
-    assert env["status"] == "error" and "incompatible" in env["error"] and r.returncode == 1
+    with tempfile.TemporaryDirectory(prefix="summon-bg-out-") as td:
+        out_path = os.path.join(td, "x.json")
+        r = sp.run([sys.executable, script, "--agent", "a", "--prompt", "p",
+                    "--cwd", os.getcwd(), "--background", "--out", out_path],
+                   capture_output=True, text=True, encoding="utf-8", **_spawn.run_flags())
+        env = _json.loads(r.stdout)
+        assert env["status"] == "error" and r.returncode == 1
+        assert "incompatible" not in (env.get("error") or "").lower()
+        assert env.get("provider_contacted") is False
 
 
 def test_roster_new_agent_scaffolds_house_format():
@@ -19159,7 +19163,7 @@ def test_text_seat_env_opt_in_and_require_tools():
         out2 = _json.loads(r2.stdout)
         assert out2["status"] == "blocked", out2
         assert out2["blocked_reason"] == "text_seat_no_tools"
-        assert r2.returncode == 0  # structural block matches gate exit contract
+        assert r2.returncode == 1  # structural block exits non-zero consistently with status != "success"
     finally:
         srv.shutdown()
         import shutil

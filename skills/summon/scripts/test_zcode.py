@@ -207,8 +207,65 @@ class ZCodeBuilderTests(unittest.TestCase):
         with mock.patch.object(_zcode.os, "name", "nt"), \
              mock.patch("_zcode._bundle_candidates", return_value=[]), \
              mock.patch("_zcode._target", side_effect=resolve_target):
-            resolved = _zcode.resolve_zcode_cli(which=which)
+            resolved = _zcode.resolve_zcode_cli(environ={}, which=which)
         self.assertEqual(resolved, target)
+
+    def test_npm_zcode_cmd_shim_resolves_sibling_zcode_app_cli_js(self):
+        with tempfile.TemporaryDirectory() as directory:
+            npm_dir = Path(directory)
+            shim = npm_dir / "zcode.cmd"
+            shim.write_text("@echo off\n", encoding="utf-8")
+            cli_js = npm_dir / "node_modules" / "zcode-app-cli" / "bin" / "zcode.js"
+            cli_js.parent.mkdir(parents=True, exist_ok=True)
+            cli_js.write_text("// zcode-app-cli entry\n", encoding="utf-8")
+            other_shim = npm_dir / "other.cmd"
+            other_shim.write_text("@echo off\n", encoding="utf-8")
+            target = _zcode._target(str(shim), "path", which=lambda _name: "node-bin")
+            rejected = _zcode._target(str(other_shim), "path", which=lambda _name: "node-bin")
+        self.assertIsNotNone(target)
+        self.assertEqual(target.command, "node-bin")
+        self.assertEqual(target.prefix_args, (str(cli_js),))
+        self.assertEqual(target.source, "path")
+        self.assertIsNone(rejected)
+
+    def test_zcode_provider_model_selector_and_effort_forwarding(self):
+        self.assertEqual(
+            _builder.normalize_zcode_model_selector("zai-coding-plan/glm-5.3-flash"),
+            "zai-coding-plan/GLM-5.3-Flash",
+        )
+        self.assertEqual(
+            _builder.normalize_zcode_model_selector("openrouter/glm-4.6"),
+            "openrouter/glm-4.6",
+        )
+        self.assertEqual(
+            _builder.normalize_zcode_model_selector("openrouter/z-ai/glm-4.6"),
+            "openrouter/z-ai/glm-4.6",
+        )
+        self.assertEqual(
+            _builder.normalize_zcode_model_selector("custom-provider/my-model-1"),
+            "custom-provider/my-model-1",
+        )
+        self.assertIsNone(_builder.normalize_zcode_model_selector("glm-5.3-flash"))
+        self.assertIsNone(_builder.normalize_zcode_model_selector("a//b"))
+        self.assertIsNone(_builder.normalize_zcode_model_selector("a/b/c/d"))
+        self.assertIsNone(model_backend_compatibility("zcode", "zai-coding-plan/glm-5.3-flash"))
+        invocation = self._inv(
+            permission="read-only",
+            model="zai-coding-plan/glm-5.3-flash",
+            effort="high",
+            extra_args=("--effort", "low", "--mode", "yolo"),
+        )
+        with mock.patch.dict(os.environ, {"SUMMON_ALLOW_UNENFORCED_READONLY": "1"}, clear=False), \
+             mock.patch("_zcode.resolve_zcode_cli", return_value=self._target()), \
+             mock.patch("_builder._lock_zcode_attachment"):
+            _command, args, _env = build_invocation_args(invocation)
+        _builder.cleanup_zcode_attachment(args)
+        self.assertEqual(args.count("--mode"), 1)
+        self.assertEqual(args[args.index("--mode") + 1], "guarded")
+        self.assertIn("--model", args)
+        self.assertEqual(args[args.index("--model") + 1], "zai-coding-plan/GLM-5.3-Flash")
+        self.assertEqual(args.count("--effort"), 1)
+        self.assertEqual(args[args.index("--effort") + 1], "high")
 
     def test_preflight_names_rejected_path_shim_without_treating_it_as_available(self):
         with mock.patch("_zcode.resolve_zcode_cli", return_value=None), \

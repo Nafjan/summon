@@ -198,6 +198,13 @@ class StreamProcessor:
         self.is_codex = False
         self.is_kimi = False
         self.is_agy = cli == "agy"
+        self.agy_parts: list[str] = []
+        self._agy_buffered_bytes: int = 0
+        self._claude_text_blocks: list[str] = []
+        self._opencode_step_parts: list[str] = []
+        self._opencode_text_blocks: list[str] = []
+        self.progress_notes: list[str] = []
+        self.final_message: str | None = None
         self.kimi_parts = []
         # Kimi has no terminal-success record: a clean EOF is the only
         # completion boundary. Keep the normal accumulator unchanged for
@@ -262,6 +269,50 @@ class StreamProcessor:
         self._live_claude_usage: dict[str, dict] = {}
         self._live_claude_evicted_work_tokens: int = 0
         self._live_claude_anon_seq: int = 0
+
+    _AGY_BUFFER_MAX_BYTES = 512 * 1024
+
+    def _append_agy_step_text(self, step: dict) -> None:
+        """Buffer bounded AGY step_update assistant output across long runs."""
+        text_delta = step.get("text_delta")
+        if isinstance(text_delta, str) and text_delta:
+            remaining = self._AGY_BUFFER_MAX_BYTES - self._agy_buffered_bytes
+            if remaining <= 0:
+                return
+            chunk = text_delta.encode("utf-8", errors="ignore")[:remaining].decode(
+                "utf-8", errors="ignore")
+            if chunk:
+                self.agy_parts.append(chunk)
+                self._agy_buffered_bytes += len(chunk.encode("utf-8", errors="ignore"))
+            return
+        snapshot = step.get("response") or step.get("content")
+        if not isinstance(snapshot, str) or not snapshot:
+            return
+        current = "".join(self.agy_parts)
+        if self.agy_parts and snapshot.startswith(current):
+            bounded = snapshot.encode("utf-8", errors="ignore")[
+                :self._AGY_BUFFER_MAX_BYTES].decode("utf-8", errors="ignore")
+            self.agy_parts = [bounded] if bounded else []
+            self._agy_buffered_bytes = len(bounded.encode("utf-8", errors="ignore"))
+            return
+        if not self.agy_parts or snapshot != self.agy_parts[-1]:
+            remaining = self._AGY_BUFFER_MAX_BYTES - self._agy_buffered_bytes
+            if remaining <= 0:
+                return
+            chunk = snapshot.encode("utf-8", errors="ignore")[:remaining].decode(
+                "utf-8", errors="ignore")
+            if chunk:
+                self.agy_parts.append(chunk)
+                self._agy_buffered_bytes += len(chunk.encode("utf-8", errors="ignore"))
+
+    def _flush_opencode_step(self) -> None:
+        """Record accumulated OpenCode text from one step into text blocks."""
+        if not self._opencode_step_parts:
+            return
+        joined = "".join(self._opencode_step_parts)
+        self._opencode_step_parts.clear()
+        if joined.strip():
+            self._opencode_text_blocks.append(joined)
 
     def live_work_tokens(self, cli: str | None = None) -> dict | None:
         """Return deduplicated live or terminal work-token accounting, if available."""
@@ -567,6 +618,7 @@ class StreamProcessor:
                 # explicitly inferred service evidence; a progress packet must
                 # never activate even that weaker path.
                 self.progress_usage = step["usage"]
+            self._append_agy_step_text(step)
             content = (step.get("text_delta") or step.get("response")
                        or step.get("content"))
             if isinstance(content, str) and content:
@@ -652,10 +704,13 @@ class StreamProcessor:
                 )
             self._capture_claude_root(data, message, content)
             if isinstance(content, list):
+                _root_texts: list[str] = []
                 for index, block in enumerate(content):
                     if not isinstance(block, dict):
                         continue
                     if block.get("type") == "text" and isinstance(block.get("text"), str):
+                        if data.get("parent_tool_use_id") is None and block["text"]:
+                            _root_texts.append(block["text"])
                         self._liveness("output_text", data,
                                        output_chars=self._meaningful_chars(block["text"]),
                                        semantic_identity=("claude_text", message.get("id"),
@@ -668,6 +723,8 @@ class StreamProcessor:
                                        progress=self._tool_progress,
                                        semantic_identity=("claude_tool", message.get("id"),
                                                           index, block))
+                if _root_texts:
+                    self._claude_text_blocks.append("\n".join(_root_texts))
             return False
 
         if (data.get("type") == "user"
@@ -848,11 +905,13 @@ class StreamProcessor:
                 text = part.get("text") if isinstance(part, dict) else data.get("text")
                 if isinstance(text, str):
                     self.opencode_parts.append(text)
+                    self._opencode_step_parts.append(text)
                     self._liveness("output_text", data,
                                    output_chars=self._meaningful_chars(text),
                                    semantic_identity=("opencode_text", part.get("id"),
                                                       text))
             elif data.get("type") in {"tool_use", "tool_result"}:
+                self._flush_opencode_step()
                 self._tool_progress += 1
                 part = data.get("part") if isinstance(data.get("part"), dict) else {}
                 tool_id = part.get("callID") or part.get("id") or data.get("id") or "tool"
@@ -860,7 +919,16 @@ class StreamProcessor:
                                progress=self._tool_progress,
                                semantic_identity=("opencode_tool", part))
             elif data.get("type") == "step_finish":
-                self._liveness("finalizing", data)
+                self._flush_opencode_step()
+                _oc_part = data.get("part") if isinstance(data.get("part"), dict) else {}
+                _oc_reason = _oc_part.get("reason") or data.get("reason")
+                if str(_oc_reason or "").strip().lower() in {"tool-calls", "tool_calls", "tool_use", "continue"}:
+                    self._liveness("stream_event", data)
+                else:
+                    self._liveness("finalizing", data)
+            elif data.get("type") == "step_start":
+                self._flush_opencode_step()
+                self._liveness("step_start", data)
             else:
                 self._liveness("stream_event", data)
             return False
@@ -903,18 +971,28 @@ class StreamProcessor:
             self._capture_opencode_metadata(data)
             if part.get("type") == "text" and isinstance(part.get("text"), str):
                 self.opencode_parts.append(part["text"])
+                self._opencode_step_parts.append(part["text"])
                 self._liveness("output_text", data,
                                output_chars=self._meaningful_chars(part["text"]),
                                semantic_identity=("opencode_part_text", part.get("id"),
                                                   part["text"]))
             elif part.get("type") in {"tool", "patch", "file", "subtask", "agent"}:
+                self._flush_opencode_step()
                 self._tool_progress += 1
                 tool_id = part.get("callID") or part.get("id") or part.get("type")
                 self._liveness("tool_activity", data, tool_id=str(tool_id)[:128],
                                progress=self._tool_progress,
                                semantic_identity=("opencode_part", part))
             elif part.get("type") == "step-finish":
-                self._liveness("finalizing", data)
+                self._flush_opencode_step()
+                _oc_reason = part.get("reason") or data.get("reason")
+                if str(_oc_reason or "").strip().lower() in {"tool-calls", "tool_calls", "tool_use", "continue"}:
+                    self._liveness("stream_event", data)
+                else:
+                    self._liveness("finalizing", data)
+            elif part.get("type") == "step-start":
+                self._flush_opencode_step()
+                self._liveness("step_start", data)
             else:
                 self._liveness("stream_event", data)
             return False
@@ -981,6 +1059,12 @@ class StreamProcessor:
                         break
                 if self.model:
                     break
+            if self.codex_messages:
+                self.final_message = self.codex_messages[-1]
+                self.progress_notes = [
+                    m for m in self.codex_messages[:-1]
+                    if isinstance(m, str) and m.strip()
+                ]
             self.result_json = {
                 "type": "result",
                 "result": "\n".join(self.codex_messages),
@@ -1020,15 +1104,35 @@ class StreamProcessor:
                     terminal_state, status, response = "UNKNOWN", "error", ""
                     error = payload.get("error") if isinstance(payload, dict) else None
                 self.is_error = status == "error"
+                _buffered_agy = "".join(self.agy_parts)
+                _final_agy = (
+                    response if (isinstance(response, str) and response.strip())
+                    else _buffered_agy
+                )
+                if isinstance(response, str) and response.strip():
+                    self.final_message = response
+                    if _buffered_agy.strip():
+                        if _buffered_agy.endswith(response):
+                            _prefix = _buffered_agy[:len(_buffered_agy) - len(response)].strip()
+                        elif response.strip() not in _buffered_agy:
+                            _prefix = _buffered_agy.strip()
+                        else:
+                            _prefix = ""
+                        if _prefix:
+                            self.progress_notes = [_prefix]
+                elif _buffered_agy.strip():
+                    self.final_message = _buffered_agy
                 self.result_json = {
                     "type": "result",
-                    "result": response if isinstance(response, str) else "",
+                    "result": _final_agy,
                     "status": status,
                     # These keys exist only on this parser-authored object; raw
                     # provider data never reaches this mapping unchanged.
                     "_summon_provider_terminal_state": terminal_state,
                     "_summon_terminal_outcome": status,
                 }
+                if status == "error" and _buffered_agy.strip():
+                    self.result_json["partial_result"] = _buffered_agy
                 if error:
                     self.result_json["error"] = error
                 self._liveness("terminal", data)
@@ -1049,6 +1153,13 @@ class StreamProcessor:
                 if data.get("error"):  # keep the terminal error for a precise message
                     self.result_json["error"] = data["error"]
             else:
+                if len(self._claude_text_blocks) > 1:
+                    self.progress_notes = [
+                        m for m in self._claude_text_blocks[:-1] if m.strip()
+                    ]
+                    self.final_message = self._claude_text_blocks[-1]
+                elif len(self._claude_text_blocks) == 1:
+                    self.final_message = self._claude_text_blocks[0]
                 self.result_json = data
             self._liveness("terminal", data)
             return True
@@ -1456,10 +1567,14 @@ class StreamProcessor:
         """Finish protocols whose success is defined by clean EOF, not an event."""
         if self.result_json is None and self.is_agy:
             self.is_error = True
+            _buffered_agy = "".join(self.agy_parts)
+            if _buffered_agy.strip():
+                self.final_message = _buffered_agy
             self.result_json = {
-                "type": "result", "result": "", "status": "error",
+                "type": "result", "result": _buffered_agy, "status": "error",
                 "_summon_provider_terminal_state": "UNKNOWN",
                 "_summon_terminal_outcome": "error",
+                **({"partial_result": _buffered_agy} if _buffered_agy.strip() else {}),
             }
         if self.result_json is None and self.is_kimi:
             self.result_json = {
@@ -1468,6 +1583,14 @@ class StreamProcessor:
                 "status": "success",
             }
         if self.result_json is None and self.is_opencode:
+            self._flush_opencode_step()
+            if len(self._opencode_text_blocks) > 1:
+                self.progress_notes = [
+                    m for m in self._opencode_text_blocks[:-1] if m.strip()
+                ]
+                self.final_message = self._opencode_text_blocks[-1]
+            elif len(self._opencode_text_blocks) == 1:
+                self.final_message = self._opencode_text_blocks[0]
             self.result_json = {
                 "type": "result",
                 "result": "".join(self.opencode_parts),
@@ -1492,6 +1615,10 @@ class StreamProcessor:
             self._bind_session(fields.get("session_id"), {})
             if isinstance(fields.get("usage"), dict):
                 self.usage = fields["usage"]
+            zcode_model = fields.get("model")
+            if isinstance(zcode_model, str) and zcode_model.strip():
+                self.model = zcode_model.strip()
+                self.model_evidence_source = "zcode_terminal_json"
             self.result_json = {
                 "type": "result",
                 # Never surface a retained prefix of oversized stdout. It can
@@ -1499,6 +1626,7 @@ class StreamProcessor:
                 "result": (fields.get("response") or raw)
                           if not self.zcode_output_truncated else "",
                 "status": "success" if fields.get("parse_ok") else "error",
+                **({"model": self.model} if self.model else {}),
                 **({"error": ("ZCode terminal JSON exceeded the bounded output limit"
                                 if self.zcode_output_truncated else
                                 "ZCode did not emit a parseable terminal JSON result")}

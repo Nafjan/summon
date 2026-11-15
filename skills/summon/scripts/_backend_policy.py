@@ -51,6 +51,15 @@ def permission_enforcement(cli: str, permission: str) -> str:
     return "enforced"
 
 
+def is_sandbox_enforced(cli: str, permission: str) -> bool:
+    """True when the backend actually enforces a filesystem/tool sandbox tier."""
+    if cli in TEXT_ONLY_BACKENDS:
+        return True
+    if permission not in ("read-only", "safe-edit"):
+        return False
+    return permission_enforcement(cli, permission) == "enforced"
+
+
 def effective_permission(cli: str, permission: str) -> str:
     """Return the authority a backend actually receives for a declared tier."""
     if cli == "agy":

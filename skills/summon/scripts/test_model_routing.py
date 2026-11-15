@@ -25,7 +25,7 @@ class ModelRoutingTests(unittest.TestCase):
         self.assertIn("kimi-code/k3", refusal)
 
     def test_explicit_effort_refuses_backends_without_reviewed_transport(self):
-        for backend in ("gemini", "zcode", "openai-compat"):
+        for backend in ("gemini", "openai-compat"):
             with self.subTest(backend=backend):
                 refusal = run_subagent._unsupported_explicit_effort(
                     backend, "some-model", "high")
@@ -33,6 +33,12 @@ class ModelRoutingTests(unittest.TestCase):
                     "unsupported" in refusal or "no reviewed transport" in refusal,
                     refusal,
                 )
+        self.assertIsNone(run_subagent._unsupported_explicit_effort(
+            "zcode", "zai-coding-plan/glm-5.3-flash", "high"))
+        bad_zcode = run_subagent._unsupported_explicit_effort(
+            "zcode", "zai-coding-plan/glm-5.3-flash", "bogus")
+        self.assertIsNotNone(bad_zcode)
+        self.assertIn("unsupported", bad_zcode)
 
     def test_ambient_effort_remains_best_effort_for_unpinned_route(self):
         self.assertIsNone(run_subagent._unsupported_explicit_effort(
@@ -652,6 +658,81 @@ class ModelRoutingTests(unittest.TestCase):
             self.assertEqual(enriched["model_resolved"], "gpt-6.1-sol")
             self.assertEqual(enriched["models_used"], ["gpt-6.1-sol"])
             self.assertEqual(enriched["model_evidence_source"], "codex_rollout_token_usage_record")
+
+    def test_kimi_k31_pro_effort_and_canonical_matching(self):
+        import _builder
+        import _executor
+        import _resolver
+        self.assertTrue(_builder.kimi_model_supports_effort("kimi-code/k3.1-pro"))
+        self.assertTrue(_builder.kimi_model_supports_effort("k3.1-pro"))
+        self.assertTrue(_builder.kimi_model_supports_effort("kimi-code/k3"))
+        self.assertFalse(_builder.kimi_model_supports_effort("kimi-code/kimi-for-coding"))
+        self.assertIsNone(
+            run_subagent._unsupported_explicit_effort("kimi", "kimi-code/k3.1-pro", "max")
+        )
+        self.assertEqual(
+            _executor._canonical_model_key("kimi-code/k3.1-pro"),
+            "kimi-k3.1-pro",
+        )
+        self.assertFalse(_executor._model_mismatch("kimi-code/k3.1-pro", "kimi-code/k3.1-pro"))
+        self.assertTrue(_executor._model_mismatch("kimi-code/k3.1-pro", "kimi-code/k3"))
+
+        # Unknown model in config.toml -> terminal non-retryable model_not_found
+        err_env = {
+            "status": "error",
+            "cli": "kimi",
+            "error": 'error: failed to run prompt: Model "kimi-code/k3.1-pro" is not configured in config.toml.',
+            "output_tail": "",
+        }
+        _executor._attach_eligibility(err_env)
+        self.assertEqual(err_env["error_kind"], "model_not_found")
+        self.assertFalse(err_env["retryable"])
+        self.assertFalse(err_env["provider_contacted"])
+        self.assertTrue(_executor.is_terminal_nonretryable(err_env))
+
+        # Successful response echoing the phrase in result must NOT be misclassified
+        echo_env = {
+            "status": "error",
+            "cli": "kimi",
+            "error": "other failure",
+            "output_tail": "",
+            "result": 'Model "kimi-code/k3.1-pro" is not configured in config.toml.',
+        }
+        _executor._attach_eligibility(echo_env)
+        self.assertNotEqual(echo_env.get("error_kind"), "model_not_found")
+
+        # discover_models("kimi") reads synthetic KIMI_CODE_HOME/config.toml
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = os.path.join(tmp, "config.toml")
+            with open(cfg, "w", encoding="utf-8") as fh:
+                fh.write(
+                    'default_model = "kimi-code/k3.1-pro"\n\n'
+                    '[models."kimi-code/k3.1-pro"]\n'
+                    'model = "k3.1-pro"\n'
+                    'display_name = "K3.1 Pro"\n'
+                    'max_context_size = 262144\n'
+                    'support_efforts = ["low", "medium", "high", "max"]\n'
+                    'default_effort = "max"\n\n'
+                    '[models."kimi-code/k3"]\n'
+                    'model = "k3"\n'
+                    'display_name = "K3"\n'
+                    'max_context_size = 262144\n'
+                    'support_efforts = ["low", "medium", "high", "max"]\n\n'
+                    '[models."unsafe;id"]\n'
+                    'model = "bad"\n'
+                )
+            with mock.patch.dict(os.environ, {"KIMI_CODE_HOME": tmp}, clear=False):
+                discovered = _resolver.discover_models("kimi")
+            kimi_info = discovered["kimi"]
+            self.assertEqual(kimi_info["source"], "config")
+            self.assertEqual(kimi_info["default"], "kimi-code/k3.1-pro")
+            self.assertIn("kimi-code/k3.1-pro", kimi_info["models"])
+            self.assertIn("kimi-code/k3", kimi_info["models"])
+            self.assertNotIn("unsafe;id", kimi_info["models"])
+            self.assertEqual(
+                kimi_info["model_details"]["kimi-code/k3.1-pro"]["display_name"],
+                "K3.1 Pro",
+            )
 
 
 if __name__ == "__main__":

@@ -20,7 +20,7 @@ class ModelCatalogTests(unittest.TestCase):
         self.assertEqual([item["name"] for item in entries[:5]],
                          ["Astra", "Fable", "Sol", "Opus", "Kimi"])
         self.assertEqual([item["version"] for item in entries[:5]],
-                         ["6", "5.1", "6.1", "5.5", "K3"])
+                         ["6", "5.1", "6.1", "5.5", "K3.1 Pro"])
         self.assertEqual([item["label"] for item in entries[:5]], ["frontier"] * 5)
         near = [item for item in entries if item["label"] == "near-frontier"]
         self.assertEqual([item["name"] for item in near],
@@ -74,6 +74,10 @@ class ModelCatalogTests(unittest.TestCase):
         sol_prev = catalog.display_for("codex", "gpt-5.6-sol")
         self.assertEqual(sol_cur["version"], "6.1")
         self.assertEqual(sol_prev["version"], "5.6")
+        kimi_cur = catalog.display_for("kimi", "kimi-code/k3.1-pro")
+        kimi_prev = catalog.display_for("kimi", "kimi-code/k3")
+        self.assertEqual(kimi_cur["version"], "K3.1 Pro")
+        self.assertEqual(kimi_prev["version"], "K3")
 
     def test_display_can_be_derived_from_redacted_model_hash(self):
         model_hash = __import__("hashlib").sha256(

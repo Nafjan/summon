@@ -76,7 +76,10 @@ def scripts_sha256(scripts_dir, max_bytes=None) -> str:
     detection still matches the receipt for any genuine copy."""
     here = Path(scripts_dir)
     h = hashlib.sha256()
-    names = {p.name for p in here.glob("*.py") if p.name != "test_discovery.py"}
+    names = {
+        p.name for p in here.glob("*.py")
+        if not p.name.startswith("test_") and p.name != "conftest.py"
+    }
     # Always frame the launcher name, including on an older copy where it is
     # absent, so missing-versus-present is provenance-visible.
     names.add("summon.cmd")
@@ -121,10 +124,16 @@ def receipt_base(entry_path: str, version: str) -> dict:
                        "scripts_sha256": scripts_sha256(here)}}
 
 
-def receipt_agent(args: argparse.Namespace, agent_file: str) -> dict:
+def receipt_agent(args: argparse.Namespace, agent_file: str | None) -> dict:
     """Agent-definition provenance. ``agents_dir`` records the ABSOLUTE roster
     directory the definition was ACTUALLY loaded from (a bundled-fallback hit
     must not record the project dir that failed the lookup)."""
+    if not agent_file:
+        return {
+            "agent": getattr(args, "agent", None),
+            "ad_hoc": True,
+            "agent_def": None,
+        }
     try:
         fsha = hashlib.sha256(Path(agent_file).read_bytes()).hexdigest()
     except OSError:
@@ -581,9 +590,29 @@ def partial_worktree_summary(before: dict | None, after: dict | None,
     }
 
 
+def _normalize_repo_rel_list(paths: list[str] | tuple[str, ...] | None) -> list[str]:
+    """Normalize repo-relative file paths for comparison against ``files_touched``."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in paths or ():
+        if not isinstance(raw, str):
+            continue
+        p = raw.strip().strip("`'\"").replace("\\", "/")
+        while p.startswith("./"):
+            p = p[2:]
+        p = p.rstrip("/")
+        if p and p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
 def workspace_evidence(before: dict | None, after: dict | None,
                        permission: str | None = None,
-                       cli: str | None = None) -> dict:
+                       cli: str | None = None,
+                       *,
+                       reported_files: list[str] | tuple[str, ...] | None = None,
+                       concurrent_shared_tree: bool = False) -> dict:
     """Compare two snapshots without attributing a dirty baseline to the child."""
     before = before if isinstance(before, dict) else _workspace_empty()
     after = after if isinstance(after, dict) else _workspace_empty()
@@ -601,6 +630,9 @@ def workspace_evidence(before: dict | None, after: dict | None,
     attribution = "unavailable"
     files_touched: list[str] = []
     files_touched_digests: list[dict] = []
+    norm_reported = _normalize_repo_rel_list(reported_files)
+    unreported_tree_changes: list[str] = []
+    writer_reported_only: list[str] = []
     if proven:
         child_commit = before.get("head") != after.get("head")
         before_state = tuple(b_view[k] for k in ("branch", "staged", "unstaged", "renamed", "untracked"))
@@ -618,7 +650,10 @@ def workspace_evidence(before: dict | None, after: dict | None,
         # arbitrarily large dirty baseline. Only a new observable state, digest change,
         # or child commit proves mutation; otherwise a dirty baseline remains unknown.
         mutation = (True if state_changed else None) if baseline_dirty else state_changed
-        attribution = "ambiguous" if baseline_dirty else "exact"
+        attribution = (
+            "ambiguous" if baseline_dirty
+            else ("shared_tree" if concurrent_shared_tree else "exact")
+        )
         if cli in ("openai-compat", "arkcli"):
             # Text-only seats have no filesystem or tool execution surface; any
             # concurrent working-tree change came from outside this child.
@@ -681,7 +716,22 @@ def workspace_evidence(before: dict | None, after: dict | None,
                         pass
             files_touched = sorted(touched_set)
             files_touched_digests = _compute_files_touched_digests(root, files_touched)
-    return {
+            if norm_reported:
+                def _matches_reported(tree_path: str) -> bool:
+                    return any(
+                        tree_path == rep or tree_path.endswith("/" + rep)
+                        for rep in norm_reported
+                    )
+                unreported_tree_changes = [
+                    p for p in files_touched if not _matches_reported(p)
+                ]
+                writer_reported_only = [
+                    rep for rep in norm_reported
+                    if not any(p == rep or p.endswith("/" + rep) for p in files_touched)
+                ]
+                if unreported_tree_changes and attribution == "exact":
+                    attribution = "shared_tree"
+    result = {
         "before": b_view,
         "after": a_view,
         "coverage": coverage,
@@ -692,3 +742,11 @@ def workspace_evidence(before: dict | None, after: dict | None,
         "files_touched": files_touched,
         "files_touched_digests": files_touched_digests,
     }
+    if concurrent_shared_tree:
+        result["concurrent_shared_tree"] = True
+    if norm_reported:
+        result["reported_files"] = norm_reported
+        result["unreported_tree_changes"] = unreported_tree_changes
+        if writer_reported_only:
+            result["writer_reported_only"] = writer_reported_only
+    return result

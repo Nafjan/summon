@@ -266,35 +266,40 @@ class OpenCodeBuilderTests(unittest.TestCase):
         self.assertEqual(out["opencode_stream"]["completion_evidence"],
                          "step_finish")
         self.assertEqual(out["served_model_evidence"], "inferred")
-        self.assertEqual(out["model"]["served"],
+        self.assertIsNone(out["model"]["served"])
+        self.assertEqual(out["model"]["targeted"],
                          "openrouter/stealth/ox-alpha")
 
-    def test_restricted_windows_external_cwd_refuses_before_dispatch(self):
+    def test_restricted_windows_external_cwd_allows_local_drives_and_refuses_unc(self):
         with mock.patch.object(_builder.os, "name", "nt"), \
              mock.patch.object(_builder.tempfile, "gettempdir", return_value=r"C:\\Temp"):
-            denied = read_allowlist("opencode", "safe-edit", r"I:\\review", ())
-            denied_with_root = read_allowlist(
-                "opencode", "read-only", r"I:\\review", (r"C:\\review-packet",))
-            allowed = read_allowlist("opencode", "safe-edit", r"C:\\review", ())
-        self.assertTrue(denied["would_refuse"])
-        self.assertFalse(denied["enforced"])
-        self.assertEqual(denied["error_kind"], "opencode_external_cwd_denied")
-        self.assertEqual(denied["allowed_root"], r"C:\Temp\opencode")
-        self.assertTrue(denied["requires_packet_refreeze"])
-        self.assertEqual(denied["reroute"]["action"], "copy_sanitized_packet_and_refreeze")
-        self.assertEqual(denied_with_root["error_kind"], "opencode_external_cwd_denied")
-        self.assertFalse(denied_with_root["enforced"])
-        self.assertFalse(allowed["would_refuse"])
-        self.assertTrue(allowed["enforced"])
+            denied_unc = read_allowlist("opencode", "safe-edit", r"\\server\share\review", ())
+            denied_unc_with_root = read_allowlist(
+                "opencode", "read-only", r"\\server\share\review", (r"C:\\review-packet",))
+            allowed_other_drive = read_allowlist("opencode", "read-only", r"I:\\review", ())
+            allowed_same_drive = read_allowlist("opencode", "safe-edit", r"C:\\review", ())
+        self.assertTrue(denied_unc["would_refuse"])
+        self.assertFalse(denied_unc["enforced"])
+        self.assertEqual(denied_unc["error_kind"], "opencode_external_cwd_denied")
+        self.assertEqual(denied_unc["allowed_root"], r"C:\Temp\opencode")
+        self.assertTrue(denied_unc["requires_packet_refreeze"])
+        self.assertEqual(denied_unc["reroute"]["action"], "copy_sanitized_packet_and_refreeze")
+        self.assertEqual(denied_unc_with_root["error_kind"], "opencode_external_cwd_denied")
+        self.assertFalse(allowed_other_drive["would_refuse"])
+        self.assertFalse(allowed_same_drive["would_refuse"])
+        self.assertFalse(allowed_same_drive["enforced"])
 
     def test_doctor_surfaces_restricted_windows_cwd_before_a_turn(self):
         with mock.patch.object(_builder.os, "name", "nt"), \
              mock.patch.object(_builder.tempfile, "gettempdir", return_value=r"C:\\Temp"):
-            policy = _doctor._opencode_cwd_policy(r"I:\\review")
-        self.assertTrue(policy["checked"])
-        self.assertFalse(policy["allowed"])
-        self.assertEqual(policy["error_kind"], "opencode_external_cwd_denied")
-        self.assertEqual(policy["reroute"]["action"], "copy_sanitized_packet_and_refreeze")
+            local_policy = _doctor._opencode_cwd_policy(r"I:\\review")
+            unc_policy = _doctor._opencode_cwd_policy(r"\\server\share\review")
+        self.assertTrue(local_policy["checked"])
+        self.assertTrue(local_policy["allowed"])
+        self.assertTrue(unc_policy["checked"])
+        self.assertFalse(unc_policy["allowed"])
+        self.assertEqual(unc_policy["error_kind"], "opencode_external_cwd_denied")
+        self.assertEqual(unc_policy["reroute"]["action"], "copy_sanitized_packet_and_refreeze")
 
     def test_openrouter_credential_bridge_is_child_only(self):
         with mock.patch.dict(os.environ, {}, clear=False), \

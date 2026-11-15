@@ -145,7 +145,7 @@ not installed or required.
 - **Route named local logins:** keep multiple Claude config directories behind private
   profile names, so a public agent definition never carries a machine path or credential.
 
-The workspace and roster changes above ship in **Summon 3.8.0**, whose workspace
+The workspace and roster changes above ship in **Summon 3.8.1**, whose workspace
 features are a preview: provider-free acceptance covers them, but live adapters are
 not stable-certified. See the
 [release gates](docs/planning/EXPECTED_NEXT_RELEASE.md) for what each profile
@@ -293,15 +293,17 @@ python summon.py doctor      # which backends are ready? what's missing?
 python install.py            # install the skill into every detected AI CLI
 ```
 
-### Expired login recovery
+### Expired login recovery & multi-account profiles
 
 Provider logins expire independently. If a dispatch fails with an authentication error,
 Summon returns a safe, vendor-specific repair plan instead of silently retrying or switching
-models. Check a backend without launching a task:
+models. Check a backend (and any configured private account profiles) without launching a task:
 
 ```bash
-python summon.py auth status --cli kimi
-python summon.py auth status --cli arkcli --probe
+python summon.py auth status kimi
+python summon.py auth status arkcli --probe
+python summon.py auth status claude --probe
+python summon.py auth status codex --probe
 ```
 
 If the caller explicitly authorizes a login flow, Summon can start the vendor command (which
@@ -312,7 +314,25 @@ python summon.py auth repair kimi --allow-auth-repair
 # finish browser approval, then retry the original command explicitly
 ```
 
-Without that authorization, run the vendor command yourself (`kimi login`, `arkcli auth
+To use multiple `claude` or `codex` accounts on the same machine (for example, personal and
+work subscriptions) without exposing paths or emails in project files, initialize a named
+login profile in `~/.agents/summon-profiles.json`, sign in once, and pass `--profile <name>`:
+
+```bash
+python summon.py auth init claude --profile claude-work
+python summon.py auth repair claude --profile claude-work --allow-auth-repair
+python summon.py auth status claude --probe
+
+python summon.py auth init codex --profile codex-work
+python summon.py auth repair codex --profile codex-work --allow-auth-repair
+python summon.py auth status codex --probe
+```
+
+See [`skills/summon/references/customizing.md`](skills/summon/references/customizing.md#multiple-claude-and-codex-accounts)
+for full details on `auth_mode: login`, file-backed Codex credential isolation, and optional
+shell wrappers for running secondary accounts directly outside Summon.
+
+Without `--allow-auth-repair`, run the vendor command yourself (`kimi login`, `arkcli auth
 login`, or the command shown in the error). A successful login command is not proof that a
 model was served; inspect the next dispatch envelope's `model.served` and
 `served_model_evidence` fields, and require `named_model_verified: true` for an exact pin.
@@ -364,7 +384,7 @@ python tools/release_gates.py --require-clean --output "${RUNNER_TEMP:-${TMPDIR:
 python tools/release_manifest.py \
   --evidence-file "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/summon-release-evidence.json" \
   --output "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/summon-release-manifest.json" \
-  --expected-version 3.8.0 --check
+  --expected-version 3.8.1 --check
 ```
 
 The runner executes the fixed suites, records output digests, strips backend credentials and
@@ -433,7 +453,9 @@ You can also skip the skill install entirely and run the script directly:
 `python summon.py dispatch --agent reviewer --prompt "…" --cwd "$PWD"`.
 
 For a second local Claude login, define it in the private
-`~/.agents/summon-profiles.json` registry and select it with
+`~/.agents/summon-profiles.json` registry, check all configured profiles with
+`python summon.py auth status claude --probe`, sign in via
+`python summon.py auth repair claude --profile <name> --allow-auth-repair`, and select it with
 `--profile <name>` (or `profile: <name>` in a local agent definition). Summon records the
 profile name and integrity digests, not the config path. See
 [private backend profiles](skills/summon/SKILL.md#private-backend-profiles).
@@ -481,7 +503,7 @@ Git-style subcommands. The old flat `--flag` form still works too:
 | `summon list` | list available agents |
 | `summon agents validate [--cwd D] [--agents-dir D]` | validate provider-inert custom-agent manifests and print redacted identity/digest evidence |
 | `summon models [--cli B] [--refresh]` | invocable models per backend, with a `source` per entry; refresh live provider rosters explicitly |
-| `summon auth status [--cli BACKEND]` · `auth repair BACKEND` | inspect auth state or run one explicitly authorized vendor login flow; never silently retries |
+| `summon auth status [BACKEND] [--profile NAME] [--probe]` · `auth repair BACKEND [--profile NAME]` | inspect auth state and configured account profiles or run one explicitly authorized vendor login flow; never silently retries |
 | `summon doctor [--json]` | backend / setup health check (run this first) |
 | `summon manifest FILE` | run a batch fan-out, resumable. Jobs that declare `depends_on` run as a multi-wave DAG; each job can take its own `worktree` and a `files_scope` allowlist that is verified against the worktree diff after a success (a violation sets `status: blocked` and `error_kind: scope_violation`). Upstream handoffs are forwarded into downstream prompts as fenced, untrusted `<context_handoff>` blocks, and `--concurrency auto` sizes per-backend caps for you instead of requiring `agy=2,codex=3,default=3` |
 | `summon swarm create|status|claim|renew|cancel|close …` | use the durable local swarm coordinator; provider/IDE adapters remain explicit |
@@ -690,7 +712,7 @@ dispatch it with the **summon** skill instead of doing everything yourself:
 - **Independent work → `--manifest`.** Fan several jobs out with per-backend
   concurrency; each writes its own result envelope you can inspect.
 - **Use the curated model bands deliberately.** The catalog places
-  Astra, Fable, Sol, Opus, Kimi, DeepSeek V4 Pro GA, and Gemini Flash 3.8 in the
+  Astra, Fable, Sol, Opus, Kimi (K3.1 Pro and K3), DeepSeek V4 Pro GA, and Gemini Flash 3.8 in the
   editorial frontier lane for
   maximum-thinking coding work. It places Grok 4.6, Gemini Flash 3.7, GLM 5.2, and
   DeepSeek V4 Flash in a near-frontier/value lane. These are editorial labels, not benchmark
@@ -808,7 +830,7 @@ vendors.
   "raw_backend_exit_code": null,
   "normalized_exit_code": null,
   "exit_code": null,
-  "summon":  { "version": "3.8.0", "scripts_sha256": "<sha256>" },
+  "summon":  { "version": "3.8.1", "scripts_sha256": "<sha256>" },
   "permission": "safe-edit", "permission_flags": ["--permission-mode", "acceptEdits"],
   "usage": { "input_tokens": 12038, "output_tokens": 981 }, "cost_usd": 0.084,
   "billing": { "source": "subscription", "note": "Claude login" },
@@ -1072,8 +1094,8 @@ You bring model access. Summon orchestrates the CLIs and APIs you already use.
   radius.
 - **Kimi Code uses full-authority prompt mode.** Its non-interactive runner auto-handles
   tools and rejects `read-only` and `safe-edit`; Summon refuses those labels rather than
-  misrepresenting the boundary. `kimi-worker` and `kimi-coder` pin K3 at maximum thinking,
-  while `kimi-k27-coder` is the explicit lower-context K2.7 seat. Use them in isolated
+  misrepresenting the boundary. `kimi-worker` and `kimi-coder` pin K3.1 Pro (`kimi-code/k3.1-pro`) at maximum thinking,
+  while `kimi-k27-coder` is the explicit lower-context K2.7/K2.8 Coding seat. If a newly released Kimi model is missing from `~/.kimi-code/config.toml`, run `kimi upgrade` (or `kimi update`) followed by `kimi login`. Use them in isolated
   worktrees, monitor their mutations, and keep or discard the result after verification.
   For a review-only Kimi job,
   use `--worktree`, instruct it not to change product files, and inspect the worktree
@@ -1190,6 +1212,27 @@ the dispatch receipt must carry `reported` evidence and `named_model_verified: t
 before an exact served-model claim is accepted. `--list --json` shows each
 seat's declared model and effort. Luna is deliberately separate from Sol and Terra, so a
 cost-efficient Luna turn cannot be mistaken for a Sol review.
+
+Landed in **3.8.1**:
+- **Trustworthy exit codes, cutoffs & background signals**: exits `0` on `status == "success"`,
+  rescues completed `STATUS: DONE` runs hit by trailing output-token limits or stream stalls,
+  rejects empty results from non-writable seats, validates `--background` arguments before
+  issuing a `job_id`, holds `<out>.active.lock` across the full `--out` lifecycle, and reports
+  exact elapsed ms in timeout headlines.
+- **Honest evidence & attribution**: keeps `model.served` `null` when evidence is `inferred`,
+  reports `agy` `sandbox_enforced: false` and `read_allowlist.enforced: false`, flags
+  `shared_tree` attribution alongside `unreported_tree_changes`, emits `effort_downgraded`
+  warnings when clamping `max`/`xhigh`, and keeps pre-contact failures honest.
+- **Adapter, profile & worktree parity**: auto-injects Codex login profile config and `CODEX_HOME`,
+  wires ZCode `~/.zcode/cli/config.json` discovery plus `--model`/`--effort`/checkpointing, permits
+  local Windows drives on OpenCode while blocking UNC shares, pre-approves `python`/`pytest` and
+  read-only `git` in Claude `safe-edit`, and excludes intact `linked_deps` bridges from
+  `files_scope` checks.
+- **Zero-ceremony ergonomics & Kimi K3.1 Pro**: adds ad-hoc `--cli` dispatch without `--agent`,
+  `--permission` on ad-hoc runs, default/relative `--cwd`, stdin `--prompt -`/`--prompt-file -`,
+  direct `summon.ps1` multiline prompts, a compact 14-key `overview` summary first in envelopes,
+  separated `final_result` and `progress_notes`, updated Kimi K3.1 Pro seats/catalog, and
+  `summon onboard` upgrade hints.
 
 Landed in **3.8.0**:
 - **Mission-scoped spend governance**: `--mission-max-work-tokens` and

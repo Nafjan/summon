@@ -252,6 +252,76 @@ def test_auth_cli_accepts_profile_without_dispatch_flags():
     args = _cli.build_parser("test", 1).parse_args(argv)
     assert args.profile == "work"
     assert "profile" in _cli.MODE_FLAGS["auth"]
+    argv_pos, _ = _cli.rewrite_subcommand(["auth", "status", "claude", "--profile", "claude-work", "--json"])
+    args_pos = _cli.build_parser("test", 1).parse_args(argv_pos)
+    assert args_pos.auth_backend == "claude"
+    assert args_pos.profile == "claude-work"
+
+
+def test_list_profiles_and_auth_status_enumerate_configured_accounts_without_paths(account, monkeypatch):
+    home, cwd, _registry = account
+    rows = _profiles.list_profiles(cwd=str(cwd))
+    assert [r["name"] for r in rows] == ["claude-work", "work"]
+    assert all(r["valid"] for r in rows)
+    assert str(home) not in json.dumps(rows)
+
+    monkeypatch.setattr(_auth, "_command_for", lambda cli, plan: plan["argv"])
+    monkeypatch.setattr(_auth, "_default_vendor_auth_probe", lambda backend: True)
+
+    def run(command, **kwargs):
+        return SimpleNamespace(returncode=0, stdout='{"loggedIn":false,"email":"private@example.invalid"}', stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    status = _auth.run_auth_action("status", backend="claude", probe=True)
+    assert status["status"] == "success"
+    assert len(status["profiles"]) == 1
+    assert status["profiles"][0]["name"] == "claude-work"
+    assert status["profiles"][0]["auth_status"] == "not_authenticated"
+    assert "private" not in json.dumps(status)
+    assert str(home) not in json.dumps(status)
+
+    # Running `summon auth` from a parent directory of the account home (e.g. $HOME)
+    # must still resolve the profile instead of rejecting it as in-tree.
+    monkeypatch.chdir(home.parent)
+    from_parent = _auth.run_auth_action("status", backend="claude", profile="claude-work")
+    assert from_parent["status"] == "success"
+    assert from_parent["profile"] == "claude-work"
+
+
+def test_auth_init_scaffolds_claude_and_codex_profiles_without_path_leaks(tmp_path, monkeypatch):
+    reg_file = tmp_path / "agents" / "summon-profiles.json"
+    monkeypatch.setenv("SUMMON_PROFILES_FILE", str(reg_file))
+
+    argv, mode = _cli.rewrite_subcommand(["auth", "init", "codex", "--profile", "codex-work", "--json"])
+    assert mode is None
+    args = _cli.build_parser("test", 1).parse_args(argv)
+    assert args.auth_action == "init"
+    assert args.auth_backend == "codex"
+    assert args.profile == "codex-work"
+
+    res_codex = _auth.run_auth_action("init", backend="codex", profile="codex-work")
+    assert res_codex["status"] == "success"
+    assert res_codex["created"] is True
+    assert res_codex["profile"] == "codex-work"
+    assert str(tmp_path) not in json.dumps(res_codex)
+
+    codex_home = reg_file.parent / "summon-account-homes" / "codex-work"
+    assert (codex_home / "config.toml").is_file()
+    assert 'cli_auth_credentials_store = "file"' in (codex_home / "config.toml").read_text(encoding="utf-8")
+
+    # Idempotent re-run does not clobber
+    res_codex_again = _auth.run_auth_action("init", backend="codex", profile="codex-work")
+    assert res_codex_again["status"] == "success"
+    assert res_codex_again["created"] is False
+    assert str(tmp_path) not in json.dumps(res_codex_again)
+
+    res_claude = _auth.run_auth_action("init", backend="claude", profile="claude-work")
+    assert res_claude["status"] == "success"
+    assert res_claude["created"] is True
+    assert str(tmp_path) not in json.dumps(res_claude)
+    assert (reg_file.parent / "summon-account-homes" / "claude-work").is_dir()
+
+
 
 
 def test_fleet_accounts_remain_distinct_and_usage_not_assumed(account, monkeypatch):

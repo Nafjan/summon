@@ -430,3 +430,127 @@ def test_extract_handoff_payload_agent_fallback():
     )
     assert payload is not None
     assert payload["agent"] == "scout"
+
+
+def test_manifest_files_scope_ignores_verified_linked_deps_junction(tmp_path: Path, monkeypatch):
+    import subprocess
+    from _spawn import run_flags
+
+    repo = tmp_path / "repo_ld"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True, **run_flags())
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@t.com"], check=True, **run_flags())
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "T"], check=True, **run_flags())
+    (repo / "src").mkdir()
+    (repo / "src" / "app.py").write_text("x = 1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True, **run_flags())
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True, **run_flags())
+    base_head = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True, **run_flags(),
+    ).stdout.strip()
+
+    # Simulate an untracked linked dependency directory (.venv) alongside an in-scope edit
+    (repo / ".venv").mkdir()
+    (repo / ".venv" / "marker.txt").write_text("linked", encoding="utf-8")
+    (repo / "src" / "app.py").write_text("x = 2\n", encoding="utf-8")
+
+    agents_dir = tmp_path / "agents_ld"
+    agents_dir.mkdir()
+    (agents_dir / "worker.md").write_text(
+        "---\nname: worker\nrun-agent: claude\nmodel: claude-sonnet-4-6\npermission: safe-edit\n---\nBody\n",
+        encoding="utf-8",
+    )
+
+    # 1. Verified unmutated linked_deps -> succeeds (ignores .venv/)
+    results_ok = tmp_path / "results_ld_ok"
+    mf_ok = tmp_path / "mf_ld_ok.json"
+    mf_ok.write_text(
+        json.dumps({"jobs": [{"id": "j_ok", "agent": "worker", "prompt": "p", "cwd": str(repo), "files_scope": ["src/"]}]}),
+        encoding="utf-8",
+    )
+
+    def fake_dispatch_ok(cmd, timeout_sec, on_spawn=None, on_reap=None, env_extra=None):
+        out_path = cmd[cmd.index("--out") + 1]
+        prompt_val = cmd[cmd.index("--prompt") + 1]
+        ident = _executor.build_request_identity(
+            agent="worker", prompt=prompt_val, cwd=str(repo), agents_dir=str(agents_dir), require_tools=True
+        )
+        fp = _executor.request_fingerprint(**ident)
+        Path(out_path).write_text(
+            json.dumps({
+                "status": "success",
+                "agent": "worker",
+                "request_sha256": fp,
+                "git_head_before": base_head,
+                "worktree": {
+                    "path": str(repo),
+                    "linked_deps": {
+                        "deps_mutated": False,
+                        "links_intact": True,
+                        "paths": [".venv"],
+                    },
+                },
+            }),
+            encoding="utf-8",
+        )
+        return _manifest._ChildResult(0, "", "", False), None
+
+    monkeypatch.setattr(_manifest, "_dispatch_child", fake_dispatch_ok)
+    rc_ok = _manifest.run_manifest(
+        argparse.Namespace(
+            manifest=str(mf_ok), concurrency="default=1", results_dir=str(results_ok),
+            cwd=str(repo), agents_dir=str(agents_dir), retries=0,
+            retry_nonretryable=False, strict_agents_dir=False, enable_roles=False,
+        )
+    )
+    assert rc_ok == 0
+    env_ok = json.loads((results_ok / "j_ok.json").read_text(encoding="utf-8"))
+    assert env_ok["status"] == "success"
+
+    # 2. Missing deps_mutated key -> fails closed as scope_violation
+    results_bad = tmp_path / "results_ld_bad"
+    mf_bad = tmp_path / "mf_ld_bad.json"
+    mf_bad.write_text(
+        json.dumps({"jobs": [{"id": "j_bad", "agent": "worker", "prompt": "p", "cwd": str(repo), "files_scope": ["src/"]}]}),
+        encoding="utf-8",
+    )
+
+    def fake_dispatch_bad(cmd, timeout_sec, on_spawn=None, on_reap=None, env_extra=None):
+        out_path = cmd[cmd.index("--out") + 1]
+        prompt_val = cmd[cmd.index("--prompt") + 1]
+        ident = _executor.build_request_identity(
+            agent="worker", prompt=prompt_val, cwd=str(repo), agents_dir=str(agents_dir), require_tools=True
+        )
+        fp = _executor.request_fingerprint(**ident)
+        Path(out_path).write_text(
+            json.dumps({
+                "status": "success",
+                "agent": "worker",
+                "request_sha256": fp,
+                "git_head_before": base_head,
+                "worktree": {
+                    "path": str(repo),
+                    "linked_deps": {
+                        "links_intact": True,
+                        "paths": [".venv"],
+                    },
+                },
+            }),
+            encoding="utf-8",
+        )
+        return _manifest._ChildResult(0, "", "", False), None
+
+    monkeypatch.setattr(_manifest, "_dispatch_child", fake_dispatch_bad)
+    rc_bad = _manifest.run_manifest(
+        argparse.Namespace(
+            manifest=str(mf_bad), concurrency="default=1", results_dir=str(results_bad),
+            cwd=str(repo), agents_dir=str(agents_dir), retries=0,
+            retry_nonretryable=False, strict_agents_dir=False, enable_roles=False,
+        )
+    )
+    assert rc_bad == 1
+    env_bad = json.loads((results_bad / "j_bad.json").read_text(encoding="utf-8"))
+    assert env_bad["status"] == "blocked"
+    assert env_bad["error_kind"] == "scope_violation"
+

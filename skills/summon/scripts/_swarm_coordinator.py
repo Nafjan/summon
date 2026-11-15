@@ -1009,16 +1009,19 @@ class SwarmCoordinator:
             # to treat an unreadable/disappearing journal as an empty run.
             state, torn, _raw = self._load_with_snapshot(allow_empty=allow_empty)
             allow_empty = allow_empty and not state.get("prepared")
+            repaired_torn = False
             if torn and not repair:
                 raise SwarmCorruptError("reconciliation refuses a torn journal prefix")
             if repair:
                 if not owner_still_current(owner):
                     raise SwarmCorruptError("swarm owner changed before journal repair")
                 journal_repair(self.run_dir, owner)
+                repaired_torn = bool(torn)
             self._fence_run_files()
             _state, torn, _raw = self._load_with_snapshot(allow_empty=allow_empty)
             if torn:
                 raise SwarmCorruptError("swarm journal torn tail was not repaired")
+            self._last_acquire_repaired_torn = repaired_torn
             return owner
         except BaseException as exc:  # noqa: BLE001 - release only our owner
             if owner is not None:
@@ -2203,16 +2206,19 @@ class SwarmCoordinator:
 
     @contextlib.contextmanager
     def _mutation(self, *, repair: bool = True):
+        self._last_acquire_repaired_torn = False
         owner = self._acquire() if repair else self._acquire(repair=False)
         try:
+            repaired_torn = bool(getattr(self, "_last_acquire_repaired_torn", False))
             state, torn, raw_map = self._load_with_snapshot()
             if torn:
                 raise SwarmCorruptError("swarm journal requires repair before mutation")
             synced = self._sync_prefix(owner, raw_map)
             if state.get("_prefix_fingerprint") != self._prefix_fingerprint(synced):
                 raise SwarmCorruptError("loaded swarm state is not bound to synchronized prefix")
-            yield owner, state, torn
+            yield owner, state, (torn or repaired_torn)
         finally:
+            self._last_acquire_repaired_torn = False
             release_owner(owner)
 
     def _check_frame(self, frame: Mapping[str, Any]) -> dict[str, Any]:
@@ -4167,6 +4173,7 @@ class SwarmCoordinator:
                 latest["status"] == "active"
                 and latest["lease_expires_at_ms"] > _now_ms(self.clock)
                 and not has_interrupted_delivery
+                and not _torn
             ):
                 raise SwarmConflictError("task has a live non-expired claim")
             if task.get("retry_authorized") and not allow_retry:

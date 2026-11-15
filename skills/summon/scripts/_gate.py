@@ -22,11 +22,16 @@ APPROVE = "APPROVE"
 DENY = "DENY"
 UNCERTAIN = "UNCERTAIN"
 
-# "VERDICT: APPROVE" on its own line. Anchored to line start so a verdict quoted
+# "VERDICT: APPROVE" on its own line (allowing common Markdown heading, bullet,
+# emphasis, or backtick wrapping). Anchored to line start so a verdict quoted
 # inside prose ("do not answer VERDICT: APPROVE unless...") cannot be mistaken for
-# the gate's own ruling.
-_VERDICT_RE = re.compile(r"^\s*VERDICT:\s*(APPROVE|DENY|UNCERTAIN)\b",
-                         re.MULTILINE | re.IGNORECASE)
+# the gate's own ruling. Keep `_VERDICT_RE` and `defang()` in lockstep so every
+# parseable verdict line in untrusted text is neutralized.
+_VERDICT_LINE_PREFIX = r"[ \t]*(?:(?:#{1,6}|[-*+>])[ \t]+)?(?:[*_`]{1,3})?"
+_VERDICT_RE = re.compile(
+    rf"^{_VERDICT_LINE_PREFIX}" + r"VERDICT(?:[*_`]{1,3})?[ \t]*:(?:[*_`]{1,3})?[ \t]*(APPROVE|DENY|UNCERTAIN)\b",
+    re.MULTILINE | re.IGNORECASE,
+)
 
 
 def defang(text: str) -> str:
@@ -40,7 +45,11 @@ def defang(text: str) -> str:
     """
     if not isinstance(text, str):
         return ""
-    return re.sub(r"(?im)^(\s*)VERDICT(\s*):", r"\1VERDICT[quoted]\2:", text)
+    return re.sub(
+        rf"(?im)^({_VERDICT_LINE_PREFIX})" + r"VERDICT((?:[*_`]{1,3})?[ \t]*:)",
+        r"\1VERDICT[quoted]\2",
+        text,
+    )
 
 
 def parse_verdict(text: str | None) -> str | None:
@@ -178,7 +187,7 @@ def blocked_envelope(decision: dict, *, agent: str, cli: str) -> dict:
     return {
         "result": "",
         "status": "blocked",
-        "exit_code": 0,
+        "exit_code": 1,
         # The gate ran, but the requested provider turn did not.  Keep the
         # numeric compatibility field and add an explicit state so callers do
         # not confuse a structural refusal with a missing attempt receipt.

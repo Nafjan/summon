@@ -534,6 +534,18 @@ def verify_and_integrate_task(
                             dirty_paths.append(entries[idx])
                 idx += 1
 
+        ld_info = wt_info.get("linked_deps") if isinstance(wt_info.get("linked_deps"), dict) else {}
+        ld_exact: set[str] = set()
+        if ld_info.get("deps_mutated") is False and ld_info.get("links_intact") is True:
+            ld_exact = {str(lp).replace("\\", "/").strip("/") for lp in (ld_info.get("paths") or ()) if lp}
+            ld_prefixes = [f"{lp}/" for lp in ld_exact if lp]
+            filtered_dirty: list[str] = []
+            for p in dirty_paths:
+                norm_p = p.replace("\\", "/").strip("/")
+                if norm_p not in ld_exact and not any(norm_p.startswith(pref) for pref in ld_prefixes):
+                    filtered_dirty.append(p)
+            dirty_paths = filtered_dirty
+
         files_scope = task.get("files_scope") or []
         # Check dirty paths against files_scope BEFORE staging/committing!
         out_of_scope: list[str] = [
@@ -541,7 +553,8 @@ def verify_and_integrate_task(
         ]
 
         if dirty_paths and not out_of_scope:
-            add_proc = subprocess.run([*git_wt, "add", "-A"], capture_output=True, timeout=20, **run_flags())
+            add_cmd = [*git_wt, "add", "--", *dirty_paths] if ld_exact else [*git_wt, "add", "-A"]
+            add_proc = subprocess.run(add_cmd, capture_output=True, timeout=20, **run_flags())
             if add_proc.returncode != 0:
                 return {
                     "task_id": tid,

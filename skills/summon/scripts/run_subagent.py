@@ -33,6 +33,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -102,7 +103,7 @@ from _resolver import discover_models, resolve_cli  # noqa: E402
 # Keep a literal assignment: the release-contract parser uses the dispatcher
 # source as a machine-checkable companion.  `_telemetry.SUMMON_VERSION` must be
 # updated in the same release; the release contract checks both literals.
-__version__ = "3.8.0"  # summon dispatcher version (see CHANGELOG.md)
+__version__ = "3.8.1"  # summon dispatcher version (see CHANGELOG.md)
 
 # When set (a --background child), the final JSON goes to this file (atomically,
 # via .tmp + rename) instead of stdout, so the parent can poll for completion.
@@ -223,139 +224,199 @@ def _write_error_out(out_path: str, env: dict) -> None:
 
 _ACTIVE_OUT_LOCKS: set[str] = set()
 _CURRENT_OUT_LOCK: tuple[str, str] | None = None
+_OUT_LOCK_LOCAL_MUTEX = threading.Lock()
+
+
+def _handoff_current_out_lock() -> tuple[str, str] | None:
+    """Return the active (lock_path, token) for passing ownership to a child."""
+    return _CURRENT_OUT_LOCK
+
+
+def _clear_handed_off_out_lock(lock_path: str | None) -> None:
+    """Drop parent tracking after a detached child inherits lock ownership."""
+    global _CURRENT_OUT_LOCK
+    _CURRENT_OUT_LOCK = None
+    if lock_path:
+        _ACTIVE_OUT_LOCKS.discard(lock_path)
 
 
 def _acquire_out_lock(out_path: str) -> int | None:
     """Acquire an exclusive active-writer lock for ``out_path``.
 
     Returns ``None`` when acquired, or the live owner's integer PID when a
-    concurrent Summon process already holds the lock. Stale locks from dead
-    processes are reclaimed under an atomic companion mutex so two waiters
-    cannot race to unlink a newly acquired replacement lock.
+    concurrent Summon process already holds the lock (failing closed on
+    unrecoverable OS errors). Stale locks from dead processes are reclaimed under
+    an atomic companion mutex so two waiters cannot race to unlink a newly
+    acquired replacement lock.
     """
     global _CURRENT_OUT_LOCK
     lock_path = os.path.abspath(out_path) + ".active.lock"
     reap_dir = lock_path + ".reap"
     token = uuid.uuid4().hex
-    try:
-        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
-    except OSError:
-        return None
-    for _ in range(8):
+    with _OUT_LOCK_LOCAL_MUTEX:
+        handoff_path = os.environ.pop("SUMMON_OUT_LOCK_PATH", None)
+        handoff_token = os.environ.pop("SUMMON_OUT_LOCK_TOKEN", None)
+        if (handoff_path and handoff_token
+                and os.path.normcase(os.path.abspath(handoff_path))
+                == os.path.normcase(lock_path)
+                and os.path.isfile(lock_path)):
+            try:
+                with open(lock_path, encoding="utf-8") as fh:
+                    cur = json.load(fh)
+                if isinstance(cur, dict) and cur.get("token") == handoff_token:
+                    payload = {
+                        "pid": os.getpid(),
+                        "token": handoff_token,
+                        "acquired_at": cur.get("acquired_at", time.time()),
+                    }
+                    fd, tmp_path = tempfile.mkstemp(
+                        prefix=".out-lock-", suffix=".tmp",
+                        dir=os.path.dirname(lock_path))
+                    try:
+                        with os.fdopen(fd, "w", encoding="utf-8") as wfh:
+                            json.dump(payload, wfh)
+                            wfh.flush()
+                        _jobs._replace_with_retry(tmp_path, lock_path)
+                    except BaseException:
+                        try:
+                            os.unlink(tmp_path)
+                        except OSError:
+                            pass
+                        raise
+                    _ACTIVE_OUT_LOCKS.add(lock_path)
+                    _CURRENT_OUT_LOCK = (lock_path, handoff_token)
+                    return None
+            except (OSError, ValueError, UnicodeDecodeError):
+                return os.getpid()
         try:
-            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump({"pid": os.getpid(), "token": token,
-                           "acquired_at": time.time()}, fh)
-                fh.flush()
-            _ACTIVE_OUT_LOCKS.add(lock_path)
-            _CURRENT_OUT_LOCK = (lock_path, token)
-            return None
-        except FileExistsError:
-            owner = None
-            for _ in range(5):
-                try:
-                    with open(lock_path, encoding="utf-8") as fh:
-                        owner = json.load(fh)
-                    break
-                except (OSError, ValueError, UnicodeDecodeError):
-                    time.sleep(0.01)
-            if owner is None:
-                try:
-                    if (time.time() - os.path.getmtime(lock_path)) < 2.0:
-                        time.sleep(0.05)
-                        continue
-                except OSError:
-                    continue
-            owner_pid = owner.get("pid") if isinstance(owner, dict) else None
-            owner_tok = owner.get("token") if isinstance(owner, dict) else None
-            acquired_at = owner.get("acquired_at") if isinstance(owner, dict) else None
-            is_expired = (
-                isinstance(acquired_at, (int, float))
-                and not isinstance(acquired_at, bool)
-                and (time.time() - float(acquired_at)) > 86400
-            )
-            if isinstance(owner_pid, int) and not isinstance(owner_pid, bool) and not is_expired:
-                if owner_pid == os.getpid() and lock_path in _ACTIVE_OUT_LOCKS:
-                    return owner_pid
-                if owner_pid != os.getpid() and _jobs._pid_liveness(owner_pid) in ("alive", "unknown"):
-                    return owner_pid
-            # Stale or unreadable lock: serialize reaping via atomic mkdir(reap_dir)
-            # and verify the lock token has not changed before unlinking.
-            reap_acquired = False
+            os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+        except OSError:
+            return os.getpid()
+        for _ in range(8):
             try:
-                os.mkdir(reap_dir)
-                reap_acquired = True
+                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump({"pid": os.getpid(), "token": token,
+                               "acquired_at": time.time()}, fh)
+                    fh.flush()
+                _ACTIVE_OUT_LOCKS.add(lock_path)
+                _CURRENT_OUT_LOCK = (lock_path, token)
+                return None
             except FileExistsError:
-                try:
-                    if (time.time() - os.path.getmtime(reap_dir)) > 5.0:
-                        os.rmdir(reap_dir)
-                        os.mkdir(reap_dir)
-                        reap_acquired = True
-                except OSError:
-                    pass
-                if not reap_acquired:
-                    time.sleep(0.015)
-                    continue
-            except OSError:
-                return owner_pid if isinstance(owner_pid, int) else os.getpid()
-            try:
-                current = None
-                try:
-                    with open(lock_path, encoding="utf-8") as fh:
-                        current = json.load(fh)
-                except FileNotFoundError:
-                    continue
-                except (OSError, ValueError, UnicodeDecodeError):
-                    current = None
-                if current is None:
+                owner = None
+                for _ in range(5):
+                    try:
+                        with open(lock_path, encoding="utf-8") as fh:
+                            owner = json.load(fh)
+                        break
+                    except (OSError, ValueError, UnicodeDecodeError):
+                        time.sleep(0.01)
+                if owner is None:
                     try:
                         if (time.time() - os.path.getmtime(lock_path)) < 2.0:
+                            time.sleep(0.05)
                             continue
                     except OSError:
+                        time.sleep(0.02)
                         continue
-                cur_tok = current.get("token") if isinstance(current, dict) else None
-                cur_pid = current.get("pid") if isinstance(current, dict) else None
-                if cur_tok != owner_tok:
-                    # Another waiter already replaced the stale lock.
-                    continue
-                if (isinstance(cur_pid, int) and not isinstance(cur_pid, bool)
-                        and not is_expired
-                        and cur_pid != os.getpid()
-                        and _jobs._pid_liveness(cur_pid) in ("alive", "unknown")):
-                    return cur_pid
+                owner_pid = owner.get("pid") if isinstance(owner, dict) else None
+                owner_tok = owner.get("token") if isinstance(owner, dict) else None
+                acquired_at = owner.get("acquired_at") if isinstance(owner, dict) else None
+                is_expired = (
+                    isinstance(acquired_at, (int, float))
+                    and not isinstance(acquired_at, bool)
+                    and (time.time() - float(acquired_at)) > 86400
+                )
+                if isinstance(owner_pid, int) and not isinstance(owner_pid, bool) and not is_expired:
+                    if owner_pid == os.getpid() and lock_path in _ACTIVE_OUT_LOCKS:
+                        return owner_pid
+                    if owner_pid != os.getpid() and _jobs._pid_liveness(owner_pid) in ("alive", "unknown"):
+                        return owner_pid
+                # Stale or unreadable lock: serialize reaping via atomic mkdir(reap_dir)
+                # and verify the lock token has not changed before unlinking.
+                reap_acquired = False
                 try:
-                    os.unlink(lock_path)
-                except FileNotFoundError:
-                    pass
-                except OSError:
-                    return owner_pid if isinstance(owner_pid, int) else os.getpid()
-            finally:
-                if reap_acquired:
+                    os.mkdir(reap_dir)
+                    reap_acquired = True
+                except FileExistsError:
                     try:
-                        os.rmdir(reap_dir)
+                        if (time.time() - os.path.getmtime(reap_dir)) > 5.0:
+                            os.rmdir(reap_dir)
+                            os.mkdir(reap_dir)
+                            reap_acquired = True
                     except OSError:
                         pass
-        except OSError:
-            return None
-    # Contended after retries: read current live holder PID if present.
-    try:
-        with open(lock_path, encoding="utf-8") as fh:
-            final_owner = json.load(fh)
-        if isinstance(final_owner, dict) and isinstance(final_owner.get("pid"), int):
-            return final_owner["pid"]
-    except (OSError, ValueError, UnicodeDecodeError):
-        pass
-    return os.getpid()
+                    if not reap_acquired:
+                        time.sleep(0.015)
+                        continue
+                except OSError:
+                    return owner_pid if isinstance(owner_pid, int) else os.getpid()
+                try:
+                    current = None
+                    try:
+                        with open(lock_path, encoding="utf-8") as fh:
+                            current = json.load(fh)
+                    except FileNotFoundError:
+                        continue
+                    except (OSError, ValueError, UnicodeDecodeError):
+                        current = None
+                    if current is None:
+                        try:
+                            if (time.time() - os.path.getmtime(lock_path)) < 2.0:
+                                continue
+                        except OSError:
+                            continue
+                    cur_tok = current.get("token") if isinstance(current, dict) else None
+                    cur_pid = current.get("pid") if isinstance(current, dict) else None
+                    if cur_tok != owner_tok:
+                        # Another waiter already replaced the stale lock.
+                        continue
+                    if (isinstance(cur_pid, int) and not isinstance(cur_pid, bool)
+                            and not is_expired
+                            and ((cur_pid == os.getpid() and lock_path in _ACTIVE_OUT_LOCKS)
+                                 or (cur_pid != os.getpid()
+                                     and _jobs._pid_liveness(cur_pid) in ("alive", "unknown")))):
+                        return cur_pid
+                    try:
+                        os.unlink(lock_path)
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        return owner_pid if isinstance(owner_pid, int) else os.getpid()
+                finally:
+                    if reap_acquired:
+                        try:
+                            os.rmdir(reap_dir)
+                        except OSError:
+                            pass
+            except OSError:
+                # Transient Windows PermissionError (STATUS_DELETE_PENDING / sharing violation):
+                # retry instead of mistaking failure to open for lock acquisition.
+                time.sleep(0.02)
+                continue
+        # Contended after retries: read current live holder PID if present.
+        try:
+            with open(lock_path, encoding="utf-8") as fh:
+                final_owner = json.load(fh)
+            if isinstance(final_owner, dict) and isinstance(final_owner.get("pid"), int):
+                return final_owner["pid"]
+        except (OSError, ValueError, UnicodeDecodeError):
+            pass
+        return os.getpid()
 
 
 def _release_current_out_lock() -> None:
     """Release the active-writer lock owned by this invocation, if any."""
     global _CURRENT_OUT_LOCK
-    if _CURRENT_OUT_LOCK is None:
-        return
-    lock_path, token = _CURRENT_OUT_LOCK
+    lock_info = _CURRENT_OUT_LOCK
     _CURRENT_OUT_LOCK = None
+    if lock_info is None:
+        handoff_path = os.environ.pop("SUMMON_OUT_LOCK_PATH", None)
+        handoff_token = os.environ.pop("SUMMON_OUT_LOCK_TOKEN", None)
+        if not (handoff_path and handoff_token):
+            return
+        lock_info = (handoff_path, handoff_token)
+    lock_path, token = lock_info
     _ACTIVE_OUT_LOCKS.discard(lock_path)
     try:
         with open(lock_path, encoding="utf-8") as fh:
@@ -395,7 +456,8 @@ def _request_identity(args) -> dict:
         role_provenance=getattr(args, "_role_provenance", None),
         require_exact_model=bool(getattr(args, "require_exact_model", False)),
         link_deps=getattr(args, "link_deps", None),
-        link_deps_allow_mutation=bool(getattr(args, "link_deps_allow_mutation", False)))
+        link_deps_allow_mutation=bool(getattr(args, "link_deps_allow_mutation", False)),
+        ad_hoc_permission=getattr(args, "permission", None))
 
 
 def _context_bindings(values) -> dict[str, str]:
@@ -693,6 +755,34 @@ def _public_submission_projection(envelope: dict) -> dict:
                     item.pop("submission_accounting", None)
     projected.pop("submission_accounting", None)
     projected.pop("_private_launch_observation", None)
+    if ("status" in projected and "exit_code" in projected
+            and ("summon" in projected or "sandbox_enforced" in projected
+                 or projected.get("cli") is not None
+                 or projected.get("agent") is not None)):
+        _model_info = (projected.get("model")
+                       if isinstance(projected.get("model"), dict) else {})
+        _files_touched = projected.get("files_touched")
+        _ws_ev = (projected.get("workspace_evidence")
+                  if isinstance(projected.get("workspace_evidence"), dict) else {})
+        _warnings = projected.get("warnings")
+        overview = {
+            "status": projected.get("status"),
+            "exit_code": projected.get("exit_code"),
+            "result_usable": projected.get("result_usable"),
+            "agent": projected.get("agent"),
+            "cli": projected.get("cli"),
+            "model_requested": _model_info.get("requested"),
+            "model_served": _model_info.get("served"),
+            "served_model_evidence": projected.get("served_model_evidence"),
+            "sandbox_enforced": projected.get("sandbox_enforced"),
+            "elapsed_ms": projected.get("elapsed_ms"),
+            "files_touched_count": len(_files_touched) if isinstance(_files_touched, list) else 0,
+            "files_attribution": _ws_ev.get("attribution"),
+            "error_kind": projected.get("error_kind"),
+            "warning_count": len(_warnings) if isinstance(_warnings, list) else 0,
+        }
+        projected = {"overview": overview,
+                     **{k: v for k, v in projected.items() if k != "overview"}}
     return projected
 
 
@@ -1081,11 +1171,12 @@ def _unsupported_explicit_effort(cli: str | None, model: str | None,
     backend = (cli or "").strip().lower()
     selected = (model or "").strip().lower()
     if backend == "kimi":
-        if re.fullmatch(r"(?:kimi-code/)?k3(?:-256k)?", selected):
+        from _builder import kimi_model_supports_effort
+        if kimi_model_supports_effort(selected):
             return None
         return (f"explicit effort {effort!r} is unsupported for Kimi model "
-                f"{model!r}; use kimi-code/k3 or kimi-code/k3-256k, or remove "
-                "the effort pin")
+                f"{model!r}; use kimi-code/k3.1-pro, kimi-code/k3, or "
+                "kimi-code/k3-256k, or remove the effort pin")
     if backend == "agy":
         if (selected.startswith("gemini")
                 or re.fullmatch(r"claude-(?:opus|sonnet)-5-5(?:-(?:low|medium|high))?", selected)):
@@ -1095,7 +1186,13 @@ def _unsupported_explicit_effort(cli: str | None, model: str | None,
     if backend == "gemini":
         return (f"explicit effort {effort!r} is unsupported for the frozen "
                 "gemini CLI; use the agy Gemini route or remove the effort pin")
-    if backend not in {"claude", "codex", "opencode"}:
+    if backend == "zcode":
+        from _builder import _ZCODE_EFFORT_LEVELS
+        if str(effort).strip().lower() in _ZCODE_EFFORT_LEVELS:
+            return None
+        return (f"explicit effort {effort!r} is unsupported for ZCode; "
+                f"supported levels: {', '.join(sorted(_ZCODE_EFFORT_LEVELS))}")
+    if backend not in {"claude", "codex", "opencode", "zcode"}:
         return (f"explicit effort {effort!r} has no reviewed transport for "
                 f"backend {cli!r}; remove the effort pin or select a supported "
                 "backend")
@@ -1354,7 +1451,8 @@ def _setup_worktree(cwd: str, name_arg: str, agent: str, *,
 
 
 def _preflight_then_setup_worktree(invocation, cwd: str, name_arg: str | None,
-                                   agent: str, *, dry_run: bool = False):
+                                   agent: str, *, dry_run: bool = False,
+                                   preflight_only: bool = False):
     """Run pure authority checks before creating any persistent Git state."""
     from _builder import zcode_invocation_preflight
     refusal = zcode_invocation_preflight(invocation)
@@ -1373,6 +1471,43 @@ def _preflight_then_setup_worktree(invocation, cwd: str, name_arg: str | None,
             return None, {"error_kind": exc.kind, "message": str(exc)}
     if name_arg is None or dry_run:
         return None, None
+    if preflight_only:
+        from _spawn import run_flags
+        git_cmd = _git_win_prefix()
+        r = subprocess.run([*git_cmd, "-C", cwd, "rev-parse", "--show-toplevel"],
+                           capture_output=True, text=True, **run_flags())
+        if r.returncode != 0:
+            raise ValueError(f"--worktree requires a git repo; {cwd} is not inside one")
+        repo = r.stdout.strip()
+        if name_arg:
+            if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", name_arg) or ".." in name_arg:
+                raise ValueError(
+                    f"invalid worktree name: {name_arg!r} (letters/digits/._- , no '..', no leading dot)")
+            branch = f"agents/{name_arg}"
+            default_wt = os.path.join(repo, ".claude", "worktrees", name_arg)
+            max_rel_len = (
+                _max_tracked_relpath_len(repo)
+                if (os.name == "nt" or os.environ.get("SUMMON_WORKTREE_ROOT"))
+                else 80
+            )
+            if _should_relocate_worktree(repo, default_wt, max_rel_len):
+                short_root = _per_user_worktree_root()
+                short_hash = hashlib.sha256(f"{repo}:{name_arg}".encode("utf-8")).hexdigest()[:10]
+                short_prefix = re.sub(r"[^A-Za-z0-9_-]", "", agent)[:10] or "wt"
+                wt = os.path.join(short_root, f"{short_prefix}-{short_hash}")
+            else:
+                wt = default_wt
+            if os.path.exists(wt):
+                raise ValueError(f"worktree path already exists: {wt}")
+            if subprocess.run(
+                [*git_cmd, "-C", repo, "rev-parse", "--verify", "--quiet",
+                 f"refs/heads/{branch}"],
+                capture_output=True, text=True, **run_flags(),
+            ).returncode == 0:
+                raise ValueError(
+                    f"branch {branch} already exists; pick a different --worktree name "
+                    "(its commits would otherwise be at risk)")
+        return None, None
     return _setup_worktree(
         cwd, name_arg, agent,
         link_deps=tuple(link_deps),
@@ -1389,11 +1524,13 @@ def _preflight_then_setup_worktree(invocation, cwd: str, name_arg: str | None,
 _child_argv = _background.child_argv
 
 
-def _spawn_background(args: argparse.Namespace) -> dict:
+def _spawn_background(args: argparse.Namespace, *,
+                      out_lock_handoff: tuple[str, str] | None = None) -> dict:
     """Dispatch detached. See _background.spawn_background; the entry-script path
     and summon receipt are injected here."""
     return _background.spawn_background(
-        args, os.path.abspath(__file__), _receipt_base()["summon"])
+        args, os.path.abspath(__file__), _receipt_base()["summon"],
+        out_lock_handoff=out_lock_handoff)
 
 
 # --- Provenance receipt --------------------------------------------------------
@@ -2394,14 +2531,10 @@ def main() -> None:
                     env[key] = value
         env.update(receipt)
         # --out is the AUTHORITATIVE result path, so a pre-dispatch failure has to land
-        # there too. Emitting only to stdout left that path EMPTY after a refused stale
-        # success was archived -- the old answer correctly gone, but the new failure
-        # recorded nowhere a consumer of the file would look.
-        # Not under --background (which never owns --out; writing there while REJECTING the
-        # combination would be self-contradictory, and it littered a file into the caller's
-        # cwd) and not under --dry-run (which promises to touch nothing).
+        # there too whenever this invocation holds the --out lock (including a
+        # --background --out invocation that failed preflight before spawning).
+        # Not under --dry-run (which promises to touch nothing).
         if (getattr(args, "out", None) and not getattr(args, "dry_run", False)
-                and not getattr(args, "background", False)
                 and error_kind != "out_path_collision"
                 and _CURRENT_OUT_LOCK is not None):
             try:
@@ -2439,18 +2572,6 @@ def main() -> None:
              "--council (it previews one resolved dispatch and never executes)",
              error_kind="invalid_input")
 
-    # --background and --out are two DIFFERENT completion contracts: background
-    # signals done via its own result_file (job handle), while --out means
-    # "write the envelope here, skip if it already exists". Mixing them is
-    # ambiguous (skip returns a cached envelope with no job handle; a pre-dispatch
-    # error never creates --out). For fan-out with per-job result files, use
-    # --manifest. Reject the combination rather than pick a surprising winner.
-    if args.background and args.out:
-        _die("--background and --out are incompatible: background reports "
-             "completion via its own result_file; --out is the (manifest) "
-             "result-file mechanism. Use --manifest for fan-out with result files.",
-             error_kind="invalid_input")
-
     # --manifest: batch fan-out. Delegates to _manifest and exits.
     if args.manifest:
         from _manifest import run_manifest
@@ -2469,13 +2590,7 @@ def main() -> None:
         from _council import run_council_status
         sys.exit(run_council_status(args))
 
-    # --council: consensus deliberation (fresh run or --resume-run). Delegates
-    # to _council and exits.
-    if args.council:
-        from _council import run_council
-        sys.exit(run_council(args))
-
-    if args.out and not args.dry_run and not args.background:
+    if args.out and not args.dry_run:
         _lock_holder = _acquire_out_lock(args.out)
         if _lock_holder is not None:
             _die(
@@ -2485,6 +2600,15 @@ def main() -> None:
                        "result_usable": False,
                        "out_lock": {"lock_holder_pid": _lock_holder}},
             )
+
+    # --council: consensus deliberation (fresh run or --resume-run). Delegates
+    # to _council and exits while holding the --out lock if --out was supplied.
+    if args.council:
+        from _council import run_council
+        try:
+            sys.exit(run_council(args))
+        finally:
+            _release_current_out_lock()
 
     if args.resume and args.worktree is not None:
         _die("--resume and --worktree are incompatible: a session lives in the "
@@ -2506,24 +2630,45 @@ def main() -> None:
     # inputs (and an empty filename then fails the open loudly, never silently).
     if args.prompt is not None and args.prompt_file is not None:
         _die("give --prompt or --prompt-file, not both")
+    _stdin_prompt_used = False
     if args.prompt_file is not None:
+        if args.prompt_file == "-":
+            _stdin_prompt_used = True
+            try:
+                args.prompt = sys.stdin.read()
+            except (OSError, UnicodeDecodeError, ValueError) as e:
+                _die(f"cannot read --prompt-file - (stdin): {e}")
+            if not args.prompt.strip():
+                _die("--prompt-file - (stdin) is empty")
+        else:
+            try:
+                if getattr(args, "prompt_file_internal_exact", False):
+                    with open(args.prompt_file, encoding="utf-8", newline="") as fh:
+                        args.prompt = fh.read()
+                else:
+                    with open(args.prompt_file, encoding="utf-8-sig") as fh:
+                        args.prompt = fh.read()
+            except (OSError, UnicodeDecodeError, ValueError) as e:
+                _die(f"cannot read --prompt-file {args.prompt_file}: {e}")
+            if not args.prompt.strip():
+                _die(f"--prompt-file {args.prompt_file} is empty")
+    elif args.prompt == "-":
+        _stdin_prompt_used = True
         try:
-            if getattr(args, "prompt_file_internal_exact", False):
-                with open(args.prompt_file, encoding="utf-8", newline="") as fh:
-                    args.prompt = fh.read()
-            else:
-                with open(args.prompt_file, encoding="utf-8-sig") as fh:
-                    args.prompt = fh.read()
+            args.prompt = sys.stdin.read()
         except (OSError, UnicodeDecodeError, ValueError) as e:
-            _die(f"cannot read --prompt-file {args.prompt_file}: {e}")
+            _die(f"cannot read --prompt - (stdin): {e}")
         if not args.prompt.strip():
-            _die(f"--prompt-file {args.prompt_file} is empty")
+            _die("--prompt - (stdin) is empty")
 
     # The batch launcher cannot safely preserve raw CR/LF or cmd metacharacters
     # inside ``%*``.  Refuse before roster/backend work so the malformed legacy
     # invocation has an explicit zero-attempt receipt and cannot launch a child;
-    # ``--prompt-file`` is the safe transport for those prompts.
-    _cmd_transport_error = _cmd_prompt_transport_error(args.prompt, args.prompt_file)
+    # ``--prompt-file`` or stdin (``-``) is the safe transport for those prompts.
+    _cmd_transport_error = (
+        None if _stdin_prompt_used
+        else _cmd_prompt_transport_error(args.prompt, args.prompt_file)
+    )
     if _cmd_transport_error:
         _die(_cmd_transport_error, error_kind="prompt_transport_unsafe",
              extra={"provider_contacted": False, "retryable": False,
@@ -2627,6 +2772,16 @@ def main() -> None:
     elif _fleet_live_option_used:
         _die("--fleet-file, --fleet-approval-id, and --fleet-data-proof require --lane "
              "for a dispatch", error_kind="fleet_activation_usage_invalid")
+
+    if getattr(args, "permission", None) is not None and args.agent:
+        _die("--permission is only valid with ad-hoc --cli dispatches (without --agent); "
+             "use --max-permission to clamp a roster agent",
+             error_kind="invalid_input")
+    if not getattr(args, "list", False):
+        if not args.cwd:
+            args.cwd = os.getcwd()
+        elif not os.path.isabs(args.cwd):
+            args.cwd = os.path.abspath(args.cwd)
 
     # Role aliases are an explicit, opt-in operator feature.  Keep the requested
     # spelling on ``args`` for receipts and child argv, while every loader/identity
@@ -2800,75 +2955,6 @@ def main() -> None:
                      f"dispatch ({_sch_expected} -> {_sch_actual}); re-run rather than "
                      "validate against a contract the envelope does not name")
 
-    # --background: hand off to a detached copy of ourselves and return at once.
-    # Text-seat honesty: refuse HERE when possible so the parent does not return a
-    # background handle for a child that will only emit blocked (Sonnet review).
-    # Fail CLOSED on text seats: evaluation/emit errors must not fall through to spawn
-    # (GLM adversarial C1). Agent-load failures stay soft so the child can report them.
-    if args.background and not args.list:
-        if not (args.agent and args.prompt and args.cwd):
-            _die("--background requires --agent, --prompt, and --cwd")
-        from _text_seat import (evaluate_text_seat, blocked_envelope as _ts_blocked,
-                                is_text_seat as _is_text_seat, text_seat_info as _ts_info)
-        import _loader as _ts_loader
-        from _resolver import resolve_cli as _ts_resolve_cli
-        _bg_cli = _identity.get("resolved_cli") or args.cli
-        _bg_file = None
-        try:
-            _bg_dir = _ts_loader.get_agents_dir(args.agents_dir, args.cwd)
-            _bg_tup = _ts_loader.load_agent(
-                _bg_dir, getattr(args, "_resolved_agent", args.agent),
-                strict_agents_dir=bool(getattr(args, "strict_agents_dir", False)))
-            _bg_file = _bg_tup[3]
-            if not _bg_cli:
-                # Identity may omit resolved_cli in edge cases; fall back to
-                # frontmatter run-agent so we do not return a background handle
-                # for a child that will only emit blocked.
-                _bg_cli = _ts_resolve_cli(_bg_tup[0])
-        except Exception:  # noqa: BLE001 — child will surface load errors
-            _bg_file = None
-        if (_bg_cli and getattr(args, "context_references", None)
-                and _is_text_seat(_bg_cli)):
-            _die("externalized context references require a tool-capable backend",
-                 error_kind="context_reference_backend_unsupported",
-                 extra={"provider_contacted": False, "result_usable": False,
-                        "retryable": False})
-        if _bg_cli and _is_text_seat(_bg_cli):
-            try:
-                _bg_ts = evaluate_text_seat(
-                    cli=_bg_cli,
-                    allow_text_only=bool(getattr(args, "allow_text_only", False)),
-                    require_tools_flag=bool(getattr(args, "require_tools", False)),
-                    agent_file=_bg_file,
-                )
-            except Exception:  # noqa: BLE001 — fail closed rather than spawn
-                _bg_ts = {
-                    "would_block": True,
-                    "text_seat": _ts_info(
-                        cli=_bg_cli, allowed=False, would_block=True, capability=False),
-                }
-            if _bg_ts is not None and _bg_ts.get("would_block"):
-                _env = _ts_blocked(
-                    agent=args.agent, cli=_bg_cli,
-                    text_seat=_bg_ts["text_seat"])
-                _env.update(receipt)
-                try:
-                    _env.update(_receipt.receipt_agent(args, _bg_file))
-                except Exception:  # noqa: BLE001
-                    pass
-                if args.cwd:
-                    _env["cwd"] = args.cwd
-                _mark_not_run(_env)
-                finalize_exit_fields(_env)
-                _emit(_env, operation=_EMIT_OPERATION, trusted_executor_result=True)
-                sys.exit(0)
-        try:
-            _bg_resp = _spawn_background(args)
-        except (OSError, ValueError) as e:
-            _die(str(e), error_kind=getattr(e, "kind", None) or "background_launch_failed")
-        print(json.dumps(_bg_resp, ensure_ascii=False))
-        sys.exit(0)
-
     if args.list:
         agents_dir = get_agents_dir(args.agents_dir, args.cwd)
         agents = list_agents(agents_dir)
@@ -2923,7 +3009,7 @@ def main() -> None:
         sys.exit(0)
 
     # Validate required args for execution
-    if not args.agent:
+    if not args.agent and not args.cli:
         try:
             _agents_dir = get_agents_dir(args.agents_dir, args.cwd)
             _rows = list_agents(_agents_dir)
@@ -2946,96 +3032,119 @@ def main() -> None:
 
     agents_dir = get_agents_dir(args.agents_dir, args.cwd)
 
-    try:
-        # Keep the frontmatter snapshot that supplied the tuple.  The profile selector is
-        # metadata, not backend prompt text, and re-reading the file later would open the
-        # same A->B->A window the definition hash attestation exists to close.
-        if getattr(args, "strict_agents_dir", False):
-            _loaded, _agent_fm, _agent_sha = _dispatch_agent_snapshot(
-                agents_dir, getattr(args, "_resolved_agent", args.agent),
-                strict_agents_dir=True)
-        else:
-            _loaded, _agent_fm, _agent_sha = _dispatch_agent_snapshot(
-                agents_dir, getattr(args, "_resolved_agent", args.agent))
-        if _loaded is None:
-            raise FileNotFoundError(
-                f"Agent definition not found: {getattr(args, '_resolved_agent', args.agent)}")
-        run_agent_cli, system_context, _, agent_file, permission, model, extra_args, effort_fm = _loaded
-        _agent_fm = _agent_fm or {}
-        # Safe declarative provider metadata for decision evidence. The backend
-        # remains transport; route_provider validates multi-provider bindings.
-        args._declared_provider = _agent_fm.get("provider")
-        args._provider_endpoint_mode = (
-            "inline_endpoint" if _agent_fm.get("base_url")
-            else "named_provider" if _agent_fm.get("provider") else "none")
-        if _fleet_live_context is not None and extra_args:
-            _die(
-                "approved lane dispatch does not permit agent frontmatter args in "
-                "this first executable slice",
-                error_kind="fleet_activation_agent_args_unsupported")
+    if args.agent:
         try:
-            _agent_lifecycle = require_dispatchable_lifecycle(
-                _agent_fm, getattr(args, "_resolved_agent", args.agent))
-        except AgentLifecycleError as exc:
-            _die(
-                str(exc),
-                error_kind="agent_retired",
-                details={"agent": exc.agent, "lifecycle": exc.lifecycle,
-                         "successor": exc.successor},
-            )
-        if _agent_lifecycle == "deprecated":
-            print("warning: selected agent seat is deprecated"
-                  + (f"; prefer {_agent_fm.get('successor')!r}"
-                     if _agent_fm.get("successor") else ""), file=sys.stderr)
+            # Keep the frontmatter snapshot that supplied the tuple.  The profile selector is
+            # metadata, not backend prompt text, and re-reading the file later would open the
+            # same A->B->A window the definition hash attestation exists to close.
+            if getattr(args, "strict_agents_dir", False):
+                _loaded, _agent_fm, _agent_sha = _dispatch_agent_snapshot(
+                    agents_dir, getattr(args, "_resolved_agent", args.agent),
+                    strict_agents_dir=True)
+            else:
+                _loaded, _agent_fm, _agent_sha = _dispatch_agent_snapshot(
+                    agents_dir, getattr(args, "_resolved_agent", args.agent))
+            if _loaded is None:
+                raise FileNotFoundError(
+                    f"Agent definition not found: {getattr(args, '_resolved_agent', args.agent)}")
+            run_agent_cli, system_context, _, agent_file, permission, model, extra_args, effort_fm = _loaded
+            _agent_fm = _agent_fm or {}
+            # Safe declarative provider metadata for decision evidence. The backend
+            # remains transport; route_provider validates multi-provider bindings.
+            args._declared_provider = _agent_fm.get("provider")
+            args._provider_endpoint_mode = (
+                "inline_endpoint" if _agent_fm.get("base_url")
+                else "named_provider" if _agent_fm.get("provider") else "none")
+            if _fleet_live_context is not None and extra_args:
+                _die(
+                    "approved lane dispatch does not permit agent frontmatter args in "
+                    "this first executable slice",
+                    error_kind="fleet_activation_agent_args_unsupported")
+            try:
+                _agent_lifecycle = require_dispatchable_lifecycle(
+                    _agent_fm, getattr(args, "_resolved_agent", args.agent))
+            except AgentLifecycleError as exc:
+                _die(
+                    str(exc),
+                    error_kind="agent_retired",
+                    details={"agent": exc.agent, "lifecycle": exc.lifecycle,
+                             "successor": exc.successor},
+                )
+            if _agent_lifecycle == "deprecated":
+                print("warning: selected agent seat is deprecated"
+                      + (f"; prefer {_agent_fm.get('successor')!r}"
+                         if _agent_fm.get("successor") else ""), file=sys.stderr)
+            try:
+                _fm_read_roots = parse_read_roots(_agent_fm.get("read-roots"))
+                _read_roots = normalize_read_roots(
+                    tuple(getattr(args, "_read_roots_cli", ())) + tuple(_fm_read_roots))
+            except ValueError as exc:
+                _die(str(exc), error_kind="read_allowlist")
+        except ValueError as e:
+            _die(str(e), error_kind=getattr(e, "kind", None))
+        except FileNotFoundError as e:
+            if getattr(e, "kind", None) == "strict_agents_dir_miss":
+                _die(str(e), error_kind=e.kind, details={
+                    "agent": getattr(e, "agent_name",
+                                      getattr(args, "_resolved_agent", args.agent)),
+                    "strict_agents_dir": True,
+                    "fallback_source": getattr(e, "fallback_source", "unknown"),
+                })
+            _die(str(e))
+
+        # The identity hashed this definition BEFORE dispatch; this is the copy that will
+        # actually be executed. If it changed in between, the run would use one definition's
+        # model, permission and system context while being stamped with another's request hash
+        # -- and restoring the first would then let the second's answer resume as its own. Same
+        # attestation shape as the agy account profile and the openai-compat endpoint snapshot.
+        # UNCONDITIONAL (not only when a hash was recorded): a definition that did NOT resolve
+        # when the identity was built but DOES by dispatch would otherwise run under an identity
+        # naming none of it. agent_file is set (load_agent succeeded), so the actual hash is
+        # real; the expected side is None exactly when the identity found no definition, and
+        # None != a real hash is the mismatch we want. Only a pre-0.10.2 caller (no agent field
+        # in its identity at all) is exempt.
+        from _loader import last_parsed_sha
+        _def_actual = None
+        _def_expected = _identity.get("agent_def_sha256")
+        if _identity.get("agent") is not None:
+            # The bytes load_agent PARSED, not a fresh read of the path: re-reading made this
+            # ABA-vulnerable, since a file changed to B and restored to A around the parse
+            # matched on the re-read while B was what got loaded.
+            _def_actual = last_parsed_sha(agent_file) or _executor.content_sha(agent_file)
+            if _def_actual != _def_expected:
+                _die(f"agent definition {getattr(args, '_resolved_agent', args.agent)!r} "
+                     "changed between fingerprinting and "
+                     f"dispatch ({_def_expected} -> {_def_actual}); re-run rather than record "
+                     "a result under a definition that was not used")
+            _role_info = (getattr(args, "_role_provenance", {}) or {}).get("role")
+            _role_target_sha = (_role_info or {}).get("target_sha256") if isinstance(
+                _role_info, dict) else None
+            if _role_target_sha and _def_actual != _role_target_sha:
+                _die("role target changed between resolution and dispatch; re-propose and "
+                     "approve the alias before retrying", error_kind="role_resolution")
+
+        receipt.update(_receipt.receipt_agent(args, agent_file))
+    else:
         try:
-            _fm_read_roots = parse_read_roots(_agent_fm.get("read-roots"))
-            _read_roots = normalize_read_roots(
-                tuple(getattr(args, "_read_roots_cli", ())) + tuple(_fm_read_roots))
-        except ValueError as exc:
-            _die(str(exc), error_kind="read_allowlist")
-    except ValueError as e:
-        _die(str(e), error_kind=getattr(e, "kind", None))
-    except FileNotFoundError as e:
-        if getattr(e, "kind", None) == "strict_agents_dir_miss":
-            _die(str(e), error_kind=e.kind, details={
-                "agent": getattr(e, "agent_name",
-                                  getattr(args, "_resolved_agent", args.agent)),
-                "strict_agents_dir": True,
-                "fallback_source": getattr(e, "fallback_source", "unknown"),
-            })
-        _die(str(e))
-
-    # The identity hashed this definition BEFORE dispatch; this is the copy that will
-    # actually be executed. If it changed in between, the run would use one definition's
-    # model, permission and system context while being stamped with another's request hash
-    # -- and restoring the first would then let the second's answer resume as its own. Same
-    # attestation shape as the agy account profile and the openai-compat endpoint snapshot.
-    # UNCONDITIONAL (not only when a hash was recorded): a definition that did NOT resolve
-    # when the identity was built but DOES by dispatch would otherwise run under an identity
-    # naming none of it. agent_file is set (load_agent succeeded), so the actual hash is
-    # real; the expected side is None exactly when the identity found no definition, and
-    # None != a real hash is the mismatch we want. Only a pre-0.10.2 caller (no agent field
-    # in its identity at all) is exempt.
-    from _loader import last_parsed_sha
-    _def_expected = _identity.get("agent_def_sha256")
-    if _identity.get("agent") is not None:
-        # The bytes load_agent PARSED, not a fresh read of the path: re-reading made this
-        # ABA-vulnerable, since a file changed to B and restored to A around the parse
-        # matched on the re-read while B was what got loaded.
-        _def_actual = last_parsed_sha(agent_file) or _executor.content_sha(agent_file)
-        if _def_actual != _def_expected:
-            _die(f"agent definition {getattr(args, '_resolved_agent', args.agent)!r} "
-                 "changed between fingerprinting and "
-                 f"dispatch ({_def_expected} -> {_def_actual}); re-run rather than record "
-                 "a result under a definition that was not used")
-        _role_info = (getattr(args, "_role_provenance", {}) or {}).get("role")
-        _role_target_sha = (_role_info or {}).get("target_sha256") if isinstance(
-            _role_info, dict) else None
-        if _role_target_sha and _def_actual != _role_target_sha:
-            _die("role target changed between resolution and dispatch; re-propose and "
-                 "approve the alias before retrying", error_kind="role_resolution")
-
-    receipt.update(_receipt.receipt_agent(args, agent_file))
+            run_agent_cli = resolve_cli(args.cli)
+        except ValueError as e:
+            _die(str(e), error_kind="invalid_input")
+        if run_agent_cli == "openai-compat":
+            _die("openai-compat requires an --agent definition declaring provider: or base_url:",
+                 error_kind="invalid_input")
+        agent_file = None
+        system_context = ""
+        permission = getattr(args, "permission", None) or "read-only"
+        model = None
+        extra_args = ()
+        effort_fm = None
+        _agent_fm = {}
+        args._declared_provider = None
+        args._provider_endpoint_mode = "none"
+        _read_roots = normalize_read_roots(tuple(getattr(args, "_read_roots_cli", ())))
+        _def_actual = None
+        receipt["ad_hoc"] = True
+        receipt.update(_receipt.receipt_agent(args, None))
 
     # Shared project memory: inject {cwd}/.agents/memory.md (standing conventions,
     # constraints, durable decisions) so callers don't re-explain project context
@@ -3123,11 +3232,12 @@ def main() -> None:
             # a preflight failure after a refused stale success was archived left that path
             # absent entirely -- the old answer correctly gone, the new failure nowhere a
             # reader of the file would find it.
-            if args.out and not args.background:
+            if args.out and _CURRENT_OUT_LOCK is not None:
                 try:
                     _write_out(args.out, setup_error)
                 except Exception:  # noqa: BLE001 — reporting the error matters more
                     pass
+            _release_current_out_lock()
             _emit(setup_error, operation=_EMIT_OPERATION, trusted_executor_result=True)
             sys.exit(setup_error.get("exit_code", 1))
 
@@ -3194,15 +3304,15 @@ def main() -> None:
         # Kimi's K3 family advertises low/high/max in config.toml.  The
         # K2.7 Coding seat does not, so do not expose the generic built-in
         # `high` as if it were applied there.
+        from _builder import kimi_model_supports_effort
         _kimi_model = (final_model or "").strip().lower()
-        _kimi_supports_effort = bool(re.fullmatch(
-            r"(?:kimi-code/)?k3(?:-256k)?", _kimi_model))
+        _kimi_supports_effort = kimi_model_supports_effort(_kimi_model)
         if effort and not _kimi_supports_effort:
             if _explicit_effort:
-                print("note: effort is only applied to Kimi K3/K3-256k; "
+                print("note: effort is only applied to Kimi K3.1 Pro/K3/K3-256k; "
                       "ignored for the selected Kimi model", file=sys.stderr)
             effort = None
-    elif effort and cli not in ("claude", "codex", "opencode"):
+    elif effort and cli not in ("claude", "codex", "opencode", "zcode"):
         if _explicit_effort:
             print(f"note: effort is only honored by claude/codex/kimi/opencode/agy; ignored for {cli}",
                   file=sys.stderr)
@@ -3445,8 +3555,10 @@ def main() -> None:
     # leave a branch or checkout behind.
     try:
         worktree_info, _zcode_refusal = _preflight_then_setup_worktree(
-            invocation, args.cwd, args.worktree, args.agent,
-            dry_run=bool(args.dry_run))
+            invocation, args.cwd, args.worktree,
+            args.agent or f"adhoc-{invocation.cli}",
+            dry_run=bool(args.dry_run),
+            preflight_only=bool(args.background))
     except ValueError as e:
         _die(str(e), error_kind=getattr(e, "kind", None))
     if _zcode_refusal:
@@ -3495,7 +3607,18 @@ def main() -> None:
         finalize_exit_fields(_env)
         if args.out:
             _write_out(args.out, _env)
+        _release_current_out_lock()
         _emit(_env, operation=_EMIT_OPERATION, trusted_executor_result=True)
+        sys.exit(1)
+
+    if args.background:
+        _handoff = _handoff_current_out_lock()
+        try:
+            _bg_resp = _spawn_background(args, out_lock_handoff=_handoff)
+        except (OSError, ValueError) as e:
+            _die(str(e), error_kind=getattr(e, "kind", None) or "background_launch_failed")
+        _clear_handed_off_out_lock(_handoff[0] if _handoff is not None else None)
+        print(json.dumps(_bg_resp, ensure_ascii=False))
         sys.exit(0)
 
     _mission_id = getattr(args, "mission_id", None) or os.environ.get("SUMMON_MISSION_ID") or None
@@ -3659,7 +3782,7 @@ def main() -> None:
             if args.out:
                 _write_out(args.out, _env)
             _emit(_env, operation=_EMIT_OPERATION, trusted_executor_result=True)
-            sys.exit(0)
+            sys.exit(1)
 
     # Effective-tree provenance: recompute HEAD after any worktree rewrite,
     # BEFORE the agent can commit anything.
@@ -3986,14 +4109,15 @@ def _effective_decision_view(invocation, args) -> dict:
         _declared_provider if isinstance(_declared_provider, str)
         and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+@-]{0,127}", _declared_provider)
         else None)
+    _adhoc_slug = f"adhoc-{invocation.cli}"
     from _decision import decide
     view = decide(
-        request={"agent": args.agent, "lane": None, "model": invocation.model,
+        request={"agent": args.agent or _adhoc_slug, "lane": None, "model": invocation.model,
                  "provider": _decision_provider,
-                 "resolved_agent": getattr(args, "_resolved_agent", args.agent),
+                 "resolved_agent": getattr(args, "_resolved_agent", None) or args.agent or _adhoc_slug,
                  "source": source},
         candidates=[{
-            "seat": getattr(args, "_resolved_agent", args.agent),
+            "seat": getattr(args, "_resolved_agent", None) or args.agent or _adhoc_slug,
             "backend": invocation.cli,
             "provider": _decision_provider,
             "model": invocation.model,
@@ -4157,7 +4281,8 @@ def _dry_run_view(invocation, args, agents_dir: str,
                           advisory_warnings, apply_credit_guard, infer_dispatch_billing,
                           credit_spend_allowed, selects_credit_only,
                           model_backend_compatibility, codex_model_selection,
-                          read_allowlist, opencode_yolo_isolation_error)
+                          read_allowlist, opencode_yolo_isolation_error,
+                          effective_effort)
     _guarded, _, _guard_warnings = apply_credit_guard(invocation)
     _codex_selection = (codex_model_selection(
                             invocation.model, invocation.extra_args,
@@ -4182,6 +4307,10 @@ def _dry_run_view(invocation, args, agents_dir: str,
               and credit_spend_allowed()):
             _bill = {"source": "api" if os.environ.get("ANTHROPIC_API_KEY") else "credit",
                      "note": "credit-only model authorized"}
+    _eff_applied, _eff_downgrade_warn = effective_effort(
+        invocation.cli, _eff_model, invocation.effort
+    )
+    from _backend_policy import is_sandbox_enforced as _is_sandbox_enforced
     view = {
         "dry_run": True,
         # A dry-run is a provider-inert resolution proof. Keep this explicit even
@@ -4193,6 +4322,7 @@ def _dry_run_view(invocation, args, agents_dir: str,
         "execution_status": "not_run",
         "agent": args.agent,
         "agent_resolved": getattr(args, "_resolved_agent", args.agent),
+        **({"ad_hoc": True} if not args.agent else {}),
         "cli": invocation.cli,
         "cwd": invocation.cwd,
         "agents_dir": agents_dir,
@@ -4204,7 +4334,9 @@ def _dry_run_view(invocation, args, agents_dir: str,
                                       or (_codex_selection and
                                           _codex_selection.get("exact_required"))),
         "model_exact_source": getattr(invocation, "model_exact_source", None),
-        "effort": invocation.effort,
+        "effort": _eff_applied,
+        **({"effort_requested": invocation.effort, "effort_downgraded": True}
+           if invocation.effort and _eff_applied != invocation.effort else {}),
         "effort_transport": (
             "kimi-profile-config" if invocation.cli == "kimi" and invocation.effort
             else "opencode-variant" if invocation.cli == "opencode" and invocation.effort
@@ -4212,6 +4344,7 @@ def _dry_run_view(invocation, args, agents_dir: str,
         "profile": invocation.profile,
         "billing_predicted": _bill,     # subscription / credit / api / unknown
         "permission": invocation.permission,
+        "sandbox_enforced": _is_sandbox_enforced(invocation.cli, invocation.permission),
         "read_allowlist": read_allowlist(invocation.cli, invocation.permission,
                                           invocation.cwd, invocation.read_roots),
         # openai-compat (and any future non-sandbox backend) has no permission
@@ -4422,6 +4555,8 @@ def _dry_run_view(invocation, args, agents_dir: str,
     if not _decision_projection_invalid:
         for _w in _guard_warnings:  # credit-only guard actions surfaced in the preview
             view.setdefault("warnings", []).append(_w)
+        if _eff_downgrade_warn:
+            view.setdefault("warnings", []).append(_eff_downgrade_warn)
     # A dispatch that will be REFUSED must say so in preflight. Surfaced as `would_refuse`
     # plus `error` rather than a warning, because it is not advice: the run does not happen.
     from _builder import readonly_unenforceable_error as _refuse
@@ -4711,7 +4846,8 @@ def _run_gate(args, agents_dir, gated_inv, *, launch_control=None) -> dict:
     # adjudicated the ORIGINAL task while a DIFFERENT request was dispatched -- the gate
     # approved something nobody was about to run. args is the first dispatch's shape; the
     # invocation is what is about to happen.
-    prompt = gate_prompt(agent=args.agent, prompt=gated_inv.prompt, cwd=gated_inv.cwd,
+    prompt = gate_prompt(agent=(args.agent or f"adhoc-{gated_inv.cli}"),
+                         prompt=gated_inv.prompt, cwd=gated_inv.cwd,
                          permission=gated_inv.permission, cli=gated_inv.cli,
                          model=gated_inv.model)
     gate_inv = AgentInvocation(

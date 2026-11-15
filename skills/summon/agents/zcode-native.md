@@ -3,14 +3,15 @@ run-agent: zcode
 permission: yolo
 ---
 
-# Native ZCode generic preview seat
+# Native ZCode generic seat
 
-This optional native ZCode seat uses the locally configured ZCode provider.
-ZCode is ambient/multi-provider until its app-server model selection and
-terminal provider provenance are reviewed end-to-end. It intentionally does
-not claim a provider, a model pin, or GLM-5.3 Flash. Use the explicit direct
-or OpenCode Z.AI Coding Plan seats when an exact target-model selector is
-required.
+This optional native ZCode seat runs the locally configured `zcode` CLI. Pass an
+explicit `<provider>/<model>` selector via `--model` (bare model IDs without a
+`<provider>/` prefix are refused) and optional reasoning level via `--effort`.
+If ZCode fails on startup complaining about `provider_config` or missing
+providers, run `zcode doctor` or `zcode login` to initialize
+`~/.zcode/v2/provider_config.json`. Use `z.ai` direct or OpenCode seats when you
+need OpenAI-compatible HTTP transport instead of the native ZCode CLI.
 
 This experimental broad-authority `yolo` mode is only for disposable clones,
 isolated worktrees, or similarly reversible boundaries. Launch with

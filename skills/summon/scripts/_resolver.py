@@ -177,6 +177,92 @@ def _parse_agy_plain_models(stdout: str) -> list[str]:
     return models
 
 
+_KIMI_SAFE_MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
+_KIMI_ALLOWED_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
+_KIMI_MAX_MODELS = 64
+
+
+def _valid_kimi_model_id(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    if not s or ".." in s or not _KIMI_SAFE_MODEL_ID_RE.fullmatch(s):
+        return None
+    low = s.lower()
+    if any(tok in low for tok in ("token", "secret", "password", "api-key",
+                                  "apikey", "bearer", "users/", "appdata")):
+        return None
+    return s
+
+
+def _kimi_configured_models(cfg_path: str) -> tuple[str | None, list[str], dict[str, dict]]:
+    """Read safe model IDs and allowlisted metadata from Kimi's config.toml."""
+    default: str | None = None
+    models: list[str] = []
+    details: dict[str, dict] = {}
+    parsed = None
+    try:
+        import tomllib
+        with open(cfg_path, "rb") as fh:
+            parsed = tomllib.load(fh)
+    except ImportError:
+        try:
+            with open(cfg_path, encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+            m = re.search(r'^\s*default_model\s*=\s*["\']([^"\']+)["\']', text, re.M)
+            if m:
+                default = _valid_kimi_model_id(m.group(1))
+            for hm in re.finditer(r'^\s*\[models\."([^"\']+)"\]\s*$', text, re.M):
+                mid = _valid_kimi_model_id(hm.group(1))
+                if mid and mid not in models and len(models) < _KIMI_MAX_MODELS:
+                    models.append(mid)
+        except OSError:
+            pass
+        if default and default not in models:
+            models.insert(0, default)
+        return default, models, details
+    except (OSError, ValueError):
+        return None, [], {}
+
+    if not isinstance(parsed, dict):
+        return None, [], {}
+    default = _valid_kimi_model_id(parsed.get("default_model"))
+    raw_models = parsed.get("models")
+    if isinstance(raw_models, dict):
+        for raw_key, raw_val in raw_models.items():
+            mid = _valid_kimi_model_id(raw_key)
+            if not mid or not isinstance(raw_val, dict):
+                continue
+            if mid not in models and len(models) < _KIMI_MAX_MODELS:
+                models.append(mid)
+            item_info: dict = {}
+            disp = raw_val.get("display_name")
+            if (isinstance(disp, str) and 0 < len(disp.strip()) <= 80
+                    and not any(ord(c) < 0x20 or ord(c) == 0x7f for c in disp)):
+                item_info["display_name"] = disp.strip()
+            ctx = raw_val.get("max_context_size")
+            if isinstance(ctx, int) and not isinstance(ctx, bool) and 0 < ctx <= 100_000_000:
+                item_info["max_context_size"] = ctx
+            effs = raw_val.get("support_efforts")
+            if isinstance(effs, list):
+                clean_effs = [
+                    e.strip().lower() for e in effs
+                    if isinstance(e, str) and e.strip().lower() in _KIMI_ALLOWED_EFFORTS
+                ]
+                if clean_effs:
+                    item_info["support_efforts"] = clean_effs
+            def_eff = raw_val.get("default_effort")
+            if isinstance(def_eff, str) and def_eff.strip().lower() in _KIMI_ALLOWED_EFFORTS:
+                item_info["default_effort"] = def_eff.strip().lower()
+            if item_info:
+                details[mid] = item_info
+    if default:
+        if default in models:
+            models.remove(default)
+        models.insert(0, default)
+    return default, models, details
+
+
 def _codex_default_model() -> str | None:
     """The model an unpinned codex sub-agent actually runs: the top-level
     ``model`` key in ~/.codex/config.toml.
@@ -417,26 +503,24 @@ def discover_models(cli: str | None = None, *, refresh: bool = False) -> dict:
                     "unpinned uses gemini's own default.",
         }, "gemini")
 
-    # Kimi Code has no model-list command.  The selected default is in its own
-    # TOML profile, but it can be an alias/provider-local identifier, so report
-    # it as configuration rather than a fabricated live catalogue.
+    # Kimi Code stores its configured model table and selected default in its
+    # local TOML profile (~/.kimi-code/config.toml). Extract only safe model IDs
+    # and allowlisted display/effort/context metadata; never touch [providers].
     if want("kimi"):
         home = os.environ.get("KIMI_CODE_HOME") or os.path.join(os.path.expanduser("~"), ".kimi-code")
-        default = None
-        try:
-            import tomllib
-            with open(os.path.join(home, "config.toml"), "rb") as fh:
-                parsed = tomllib.load(fh)
-            value = parsed.get("default_model")
-            default = value if isinstance(value, str) else None
-        except (ImportError, OSError, ValueError):
-            pass
-        info["kimi"] = stamp({
-            "source": "config" if default else "static",
+        default, kimi_models, kimi_details = _kimi_configured_models(
+            os.path.join(home, "config.toml"))
+        kimi_entry: dict = {
+            "source": "config" if (default or kimi_models) else "static",
             "default": default,
-            "note": "Kimi Code accepts --model aliases but exposes no model-list command; "
-                    "the unpinned default comes from ~/.kimi-code/config.toml.",
-        }, "kimi")
+            "models": kimi_models,
+            "note": ("Configured models from ~/.kimi-code/config.toml "
+                     "(or `kimi provider list --json`). If a newly released Kimi "
+                     "model is missing, run `kimi upgrade` and `kimi login`."),
+        }
+        if kimi_details:
+            kimi_entry["model_details"] = kimi_details
+        info["kimi"] = stamp(kimi_entry, "kimi")
 
     if want("opencode"):
         src, models, note = _opencode_live_models()

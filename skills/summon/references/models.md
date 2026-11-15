@@ -14,10 +14,10 @@ The current editorial bands are:
 
 | Band | Order | Models | Typical lane |
 |---|---:|---|---|
-| **Frontier** | 1–12 | Astra, Fable (5.1 and 5), Sol (6.1 and 5.6), Opus (5.5 and 5), Gemini 4 Argon, Kimi, DeepSeek V4 Pro, Gemini Flash 3.8 | escalation, architecture, synthesis, high-context research, deep reasoning, vision and frontend review |
+| **Frontier** | 1–13 | Astra, Fable (5.1 and 5), Sol (6.1 and 5.6), Opus (5.5 and 5), Gemini 4 Argon, Kimi (K3.1 Pro and K3), DeepSeek V4 Pro, Gemini Flash 3.8 | escalation, architecture, synthesis, high-context research, deep reasoning, vision and frontend review |
 | **Near-frontier** | 1–16 | Luna (6 and 5.6), Sonnet (5.5 and 5), Grok (4.7 and 4.6), DeepSeek V4.1 Flash, GLM 5.3 Flash, Gemini Flash 3.7, GLM 5.2, DeepSeek V4 Flash, Terra 5.6, Spark 5.3 | fast evidence, coding second opinions, and cost-efficient secondary work |
 
-The lineup was refreshed on 2026-10-13 to add GPT-6.1 Sol, GPT-6 Luna, Gemini 4 Argon (`gemini-4-argon-high`), Claude Opus/Sonnet 5.5 (`claude` and `agy` routes), Grok 4.7, and un-suffixed ModelArk Coding Plan aliases alongside historical entries so older receipts keep their exact catalog display. These are Summon-curated labels, not benchmark, safety, cost,
+The lineup was refreshed on 2026-11-01 to add Kimi K3.1 Pro (`kimi-code/k3.1-pro`) alongside GPT-6.1 Sol, GPT-6 Luna, Gemini 4 Argon (`gemini-4-argon-high`), Claude Opus/Sonnet 5.5 (`claude` and `agy` routes), Grok 4.7, and un-suffixed ModelArk Coding Plan aliases alongside historical entries so older receipts keep their exact catalog display. These are Summon-curated labels, not benchmark, safety, cost,
 availability, or vendor claims. A tooltip may show the role, model name, version,
 recommendation lane, catalog status, and whether an exact served-model match was
 observed. It must not show profiles, accounts, paths, prompts, credentials, or raw
@@ -62,7 +62,7 @@ tagged with a `source` so you know how much to trust it:
 - `live` — queried just now (`agy --output-format json models`, `opencode models`, or an
   explicit ArkCLI refresh; older AGY versions use one labeled legacy-text fallback)
 - `cache` — read from a provider roster cache; refresh explicitly when it is stale
-- `config` — read from the CLI's own default config (`codex` → config.toml)
+- `config` — read from the CLI's own default config (`codex` and `kimi` → `config.toml`)
 - `static` — documented aliases/defaults to pass via `--model` (CLI has no list)
 - `unavailable` — a live query was attempted and failed (reason in `note`)
 
@@ -141,9 +141,9 @@ emit neither form still truthfully retain `model.served: null` and
 | `terra` / explicit Codex candidate | codex | `gpt-5.6-terra` (declared, unverified) | balanced secondary lane; do not pin until served evidence |
 | `spark` / explicit Codex candidate | codex | `gpt-5.3-spark` (declared, unverified) | fast/quota-isolated candidate; do not pin until served evidence |
 | `coder`, `bug-fixer` | cursor-agent | composer-2.5 | multi-step coding, bug fixing |
-| `kimi-worker` | kimi | `kimi-code/k3` + `effort: max` (pinned target; provider evidence may be absent) | maximum-thinking architecture, independent review, broad repository research, ambiguous multi-file work |
-| `kimi-coder` | kimi | `kimi-code/k3` + `effort: max` (pinned target; provider evidence may be absent) | maximum-thinking scoped implementation, refactoring, debugging, focused verification |
-| `kimi-k27-coder` | kimi | `kimi-code/kimi-for-coding` (explicit lower-context seat; provider evidence may be absent) | deliberate K2.7 implementation/debugging trade-off |
+| `kimi-worker` | kimi | `kimi-code/k3.1-pro` + `effort: max` (pinned target; provider evidence may be absent) | maximum-thinking architecture, independent review, broad repository research, ambiguous multi-file work |
+| `kimi-coder` | kimi | `kimi-code/k3.1-pro` + `effort: max` (pinned target; provider evidence may be absent) | maximum-thinking scoped implementation, refactoring, debugging, focused verification |
+| `kimi-k27-coder` | kimi | `kimi-code/kimi-for-coding` (explicit lower-context seat; provider evidence may be absent) | deliberate K2.7/K2.8 Coding implementation/debugging trade-off |
 | `argon-reviewer` | agy | `gemini-4-argon-high` (advisory target, not certified identity) | deep architecture, multimodal critique, and frontier advisory review |
 | `opus-agy-reviewer`, `opus-agy-coder` | agy | `claude-opus-5-5-high` (advisory target, not certified identity) | Antigravity Claude Opus 5.5 secondary review and scoped implementation |
 | `sonnet-agy-reviewer` | agy | `claude-sonnet-5-5-high` (advisory target, not certified identity) | Antigravity Claude Sonnet 5.5 fast secondary review |
@@ -159,6 +159,14 @@ and (`SUMMARY` or `VERDICT`) while omitting `FOLLOW-UP`, Summon marks
 `report_ok: true` and `report_relaxed_bookends: true` so complete reviews are
 not rejected solely for omitting an empty follow-up line. Summon still does not
 manufacture missing model evidence.
+
+Kimi Code stores its provider-populated model table in `~/.kimi-code/config.toml`
+(or `$KIMI_CODE_HOME/config.toml`), which `summon models --cli kimi` reads and
+exposes as `source: "config"`. If a newly released Kimi model (such as
+`kimi-code/k3.1-pro`) fails with `error_kind: "model_not_found"` or is missing
+from `summon models --cli kimi`, update the Kimi CLI with `kimi upgrade` (or
+`kimi update`) and re-run `kimi login` so Kimi refreshes its `config.toml` model
+entries.
 
 The `astra` seat pins the exact OpenAI model instead of inheriting the Codex default.
 It is the normal OpenAI ceiling for difficult planning and review, while Fable remains

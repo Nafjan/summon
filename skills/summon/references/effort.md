@@ -26,7 +26,7 @@ name** instead.
 2. Agent frontmatter `effort:`
 3. `SUMMON_DEFAULT_EFFORT`
 4. Built-in Summon default: **`high`** for backends with a generic effort flag; bundled
-   Kimi K3 seats explicitly pin **`max`** through their isolated profile config.
+   Kimi K3.1 Pro / K3 seats explicitly pin **`max`** through their isolated profile config.
 
 ## Who honors it
 
@@ -37,7 +37,7 @@ name** instead.
 | **agy** + **Gemini** model | Yes, but only when **explicit** | Rewrites the model display name to `… (Low\|Medium\|High)`; `xhigh`/`max` → `High` | **No rewrite** — keeps whatever is in `model:` (e.g. already `(High)`). `SUMMON_DEFAULT_EFFORT` / built-in `high` do **not** change agy Gemini models |
 | **agy** + non-Gemini (e.g. Claude Thinking) | No via `--effort` | Pin thinking in `model:` itself, e.g. `Claude Opus 4.6 (Thinking)`. Explicit `--effort` prints a note and is ignored | Model string as written |
 | **cursor-agent** | No | Ignored (stderr note if you set it explicitly). Cursor's own `[effort=…]` syntax inside `--model 'id[…]'` is forwarded **verbatim** — that is Cursor's knob, not Summon `--effort` | Cursor / model-string default |
-| **kimi** | Yes for models that advertise effort levels | Writes the selected model's `default_effort` and `[thinking].effort` into the disposable Kimi profile; `medium` → `high`, `xhigh` → `max` | Bundled K3 seats: **`max`**; K2.7 Coding keeps its provider default |
+| **kimi** | Yes for models that advertise effort levels (`k3.1-pro`, `k3`, `k3-256k`) | Writes the selected model's `default_effort` and `[thinking].effort` into the disposable Kimi profile; `medium` → `high`, `xhigh` → `max` | Bundled K3.1 Pro / K3 seats: **`max`**; K2.7/K2.8 Coding keeps its provider default |
 | **opencode** | Yes | Passes the selected level as OpenCode's `--variant` value; the provider/model decides which variants are accepted | OpenCode/provider default unless the seat or caller sets `effort:` |
 | **gemini** CLI | No | Ignored (CLI is frozen; prefer agy) | CLI default |
 | **openai-compat** / **arkcli** | No | Ignored. Provider APIs may support `reasoning_effort` / thinking, but Summon does **not** map `--effort` onto those requests today | Provider / model default |
@@ -67,7 +67,7 @@ Even an unambiguous argument is not evidence of provider-served effort.
 1. **Claude / Codex:** `--effort` is the right lever; default is already `high`.
 2. **Agy Gemini:** either put the thinking tier in `model:` (`Gemini 3.6 Flash (High)`), **or** pass `--effort` / frontmatter `effort:` explicitly. Do not rely on `SUMMON_DEFAULT_EFFORT` alone.
 3. **Cursor:** put effort in the Cursor model string if needed; do not expect Summon `--effort` to change it.
-4. **Kimi:** use K3 seats for maximum thinking; `--effort max` or `effort: max` is written to the isolated profile. K2.7 Coding remains an explicit lower-context option.
+4. **Kimi:** use K3.1 Pro / K3 seats (`kimi-code/k3.1-pro`, `kimi-code/k3`, `kimi-code/k3-256k`) for maximum thinking; `--effort max` or `effort: max` is written to the isolated profile. K2.7/K2.8 Coding (`kimi-code/kimi-for-coding`, `kimi-code/kimi-for-coding-highspeed`) remains an explicit lower-context option.
 5. **OpenCode:** use `effort` only when the selected provider/model documents a matching variant; an unsupported variant fails at the gateway.
 6. **Text seats (openai-compat / arkcli):** no Summon effort mapping — pick a model that thinks by default, or use a toolful CLI.
 7. Not every Gemini variant has every tier (e.g. some Pros have no Medium). An unavailable suffix fails at agy; check `model.requested`.

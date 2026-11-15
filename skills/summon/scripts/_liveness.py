@@ -17,7 +17,7 @@ from typing import Callable
 SCHEMA = "summon.liveness/v1"
 TRUSTED_KINDS = {
     "transport_started", "stream_event", "output_text", "tool_activity",
-    "reconnect", "finalizing", "terminal", "cancelled",
+    "reconnect", "step_start", "finalizing", "terminal", "cancelled",
 }
 FINAL_PHASES = {"terminal", "cancelled", "timed_out"}
 MAX_PROGRESS = (1 << 63) - 1
@@ -229,6 +229,9 @@ class LivenessTracker:
         elif event.kind == "reconnect":
             self.counts["reconnects"] += 1
             self.phase = "reconnect"
+        elif event.kind == "step_start":
+            self.finalization_started = None
+            self.phase = "generation"
         elif event.kind == "finalizing":
             if self.finalization_started is None:
                 self.finalization_started = now

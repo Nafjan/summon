@@ -209,8 +209,8 @@ MODE_FLAGS = {
     "jobs-list": {"jobs_list", "job_dir", "mission_id", "json", "job_file"},
     "jobs-watch": {"jobs_watch", "jobs_watch_once", "jobs_watch_interval",
                    "jobs_active_only", "job_dir", "mission_id", "json", "job_file"},
-    "jobs-status": {"jobs_status", "job_dir", "json", "job_file"},
-    "jobs-wait": {"jobs_wait", "jobs_wait_all", "jobs_wait_ids", "jobs_active_only", "job_dir", "timeout", "json", "job_file"},
+    "jobs-status": {"jobs_status", "jobs_full", "job_dir", "json", "job_file"},
+    "jobs-wait": {"jobs_wait", "jobs_wait_all", "jobs_wait_ids", "jobs_active_only", "jobs_full", "job_dir", "timeout", "json", "job_file"},
     "jobs-extend": {"jobs_extend", "job_duration", "job_dir", "json", "job_file"},
     "jobs-cancel": {"jobs_cancel", "job_dir", "json", "job_file"},
     "jobs-steer": {"jobs_steer", "job_message", "job_dir", "json", "job_file"},
@@ -309,7 +309,7 @@ MODE_HINTS = {
     "jobs-watch": ("jobs watch is read-only: it takes only --job-dir, --active-only, "
                    "--once, --interval, and --json."),
     "jobs-status": ("jobs status is read-only: it takes only the job id, --job-dir, "
-                    "and --json."),
+                    "--full, and --json."),
     "jobs-wait": ("jobs wait is read-only: it takes only the job id, --job-dir, "
                   "and --timeout."),
     "jobs-extend": ("jobs extend queues a bounded deadline extension; it never "
@@ -352,6 +352,7 @@ FLAG_NAMES = {
     "jobs_active_only": "--active-only",
     "jobs_watch_once": "--once",
     "jobs_watch_interval": "--interval",
+    "jobs_full": "--full",
     # Never expose the private parser destination in user-facing whitelist
     # errors. It is only the rewritten representation of `dispatch --lane`.
     "fleet_dispatch_lane": "--lane",
@@ -360,6 +361,7 @@ TOKEN_DESTS = {"set": "sets", "from": "bug_report_from", "for": "list_for",
                "active-only": "jobs_active_only",
                "once": "jobs_watch_once",
                "interval": "jobs_watch_interval",
+               "full": "jobs_full",
                # private parser spelling produced only by `dispatch --lane`;
                # mapping it here makes every fan-out whitelist reject a lane
                # before entering its handler.
@@ -504,8 +506,9 @@ Commands:
   models    [--cli BACKEND]                       what each backend can run now
   doctor    [--json] [--probe]                    check backends / setup health
   onboard   [--subscriptions …] [--reset] [--json] detect CLIs; write merge-safe prefs
-  auth      status [--cli BACKEND] [--probe]      show auth state and safe repair commands
-            repair BACKEND [--allow-auth-repair]  run one explicit vendor login flow
+  auth      status [BACKEND] [--profile NAME] [--probe]  show auth state and profiles
+            init BACKEND --profile NAME                  scaffold a private login profile
+            repair BACKEND [--profile NAME] [--allow-auth-repair]  run vendor login flow
   manifest  FILE [--concurrency …] [--results-dir D]   run a batch swarm
   council   --question "…" [--members …] [--rounds 2]  decide by consensus
   deliberate --question "…" --seats A,B --options X,Y  bounded agent deliberation
@@ -760,12 +763,16 @@ beyond it, or an identical tree). Removal uses `git worktree remove` without
 --force and `git branch -d`, so git re-checks both. --apply refuses while any
 background job is running unless --ignore-running-jobs is given. Provider-inert.
 """,
-    "auth": """summon auth status [--cli BACKEND] [--profile NAME] [--probe] [--json]
+    "auth": """summon auth status [BACKEND] [--cli BACKEND] [--profile NAME] [--probe] [--json]
+summon auth init BACKEND --profile NAME [--json]
 summon auth repair BACKEND [--profile NAME] [--allow-auth-repair] [--auth-timeout 5m] [--json]
 
-Show provider authentication state without exposing credentials. `repair` is blocked
-unless `--allow-auth-repair` is explicit; it starts only the vendor login command,
-may open a browser, never captures credentials, and never retries the original task.
+Show provider authentication state and configured account profiles without exposing
+credentials or private paths. `init` creates an isolated private account directory
+and registers a login-mode profile in ~/.agents/summon-profiles.json without
+overwriting existing profiles. `repair` is blocked unless `--allow-auth-repair` is
+explicit; it starts only the vendor login command, may open a browser, never captures
+credentials, and never retries the original task.
 """,
     "mission": """summon mission start --objective TEXT [--coordinator NAME] [--team A,B] [--max-permission TIER] [--max-waves N] [--digest]
 summon mission status MISSION_ID [--digest] [--json]
@@ -865,13 +872,16 @@ def rewrite_subcommand(argv: list) -> tuple:
         if not rest:
             return argv, "help:auth"
         action = rest[0]
-        if action not in ("status", "repair"):
-            return argv, f"error: unknown 'auth' action {action!r} (use status/repair)"
+        if action not in ("status", "repair", "init"):
+            return argv, f"error: unknown 'auth' action {action!r} (use status/init/repair)"
         if action == "status":
+            if len(rest) >= 2 and not rest[1].startswith("-"):
+                return ["--auth-action", "status", "--auth-backend", rest[1], *rest[2:]], None
             return ["--auth-action", "status", *rest[1:]], None
         if len(rest) < 2 or rest[1].startswith("-"):
-            return argv, "error: 'auth repair' needs a backend (for example kimi)"
-        return ["--auth-action", "repair", "--auth-backend", rest[1], *rest[2:]], None
+            example = "claude" if action == "init" else "kimi"
+            return argv, f"error: 'auth {action}' needs a backend (for example {example})"
+        return ["--auth-action", action, "--auth-backend", rest[1], *rest[2:]], None
     if head == "council":
         # `council resume <id>` and `council status <id>` are nested actions;
         # a bare `council …` stays the fresh-run form.
@@ -1417,7 +1427,7 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                         help="With --onboard: replace onboard section instead of merging")
     parser.add_argument("--no-write", dest="onboard_no_write", action="store_true",
                         help="With --onboard: detect only; do not write prefs")
-    parser.add_argument("--auth-action", choices=["status", "repair"],
+    parser.add_argument("--auth-action", choices=["status", "repair", "init"],
                         help="Provider authentication management action")
     parser.add_argument("--auth-backend", dest="auth_backend",
                         help="With --auth-action repair/status: backend name")
@@ -1604,7 +1614,7 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                              "argv, so backend argv limits (e.g. agy ~28k chars) apply")
     parser.add_argument("--prompt-file-internal-exact", dest="prompt_file_internal_exact",
                         action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--cwd", help="Working directory (absolute path)")
+    parser.add_argument("--cwd", help="Working directory (defaults to current directory; relative paths resolved to absolute except on --lane)")
     parser.add_argument("--agents-dir", help="Directory containing agent definitions")
     parser.add_argument("--read-root", dest="read_root", action="append", default=None,
                         metavar="DIR",
@@ -1696,6 +1706,11 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                              "defeats the clamp. Deliberately NOT a general --permission "
                              "override: one of those would let any caller escalate any "
                              "agent, which is worse than the problem it solves")
+    parser.add_argument("--permission", dest="permission",
+                        choices=("read-only", "safe-edit", "yolo"),
+                        default=None,
+                        help="Permission tier for ad-hoc --cli dispatches without --agent "
+                             "(default read-only; refused when --agent is specified)")
     parser.add_argument("--gate-with", dest="gate_with", metavar="AGENT",
                         help="Require AGENT to approve this dispatch before it runs. The gate "
                              "is forced read-only and adjudicates the request (agent, prompt, "
@@ -2015,6 +2030,8 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                         metavar="JOB_ID", help="With --jobs-wait-all: specific job IDs to wait for")
     parser.add_argument("--jobs-active-only", "--active-only", dest="jobs_active_only", action="store_true",
                         help="With --jobs-wait-all: wait only for currently running/prepared jobs")
+    parser.add_argument("--full", dest="jobs_full", action="store_true",
+                        help="With jobs status / jobs wait: include unredacted result text and report fields")
     parser.add_argument("--jobs-extend", dest="jobs_extend", metavar="JOB_ID",
                         help="Queue a bounded extension for an adaptive background job")
     parser.add_argument("--jobs-cancel", dest="jobs_cancel", metavar="JOB_ID",

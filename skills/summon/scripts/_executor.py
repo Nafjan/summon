@@ -821,6 +821,7 @@ def normalize_empty_success(response: dict) -> dict:
         "empty terminal result cannot be accepted as a completed Summon result")
     response["error_kind"] = "empty_terminal_result"
     response["retryable"] = False
+    response["result_usable"] = False
     response["suspect"] = True
     response.setdefault(
         "error",
@@ -1007,7 +1008,8 @@ def _attach_long_horizon_metrics(response: dict, processor) -> None:
         pass
 
 
-def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
+def _enrich(response: dict, processor: StreamProcessor | None,
+            *, codex_home: str | None = None) -> dict:
     """Attach telemetry + parsed report to a response (all return paths).
 
     Adds: ``session_id``, ``usage``, ``cost_usd`` (from stream events; None
@@ -1058,7 +1060,8 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
             and not response.get("model_resolved")
             and response.get("status") == "success"):
         _r_target, _r_served, _r_used = _codex_rollout_model_evidence(
-            response.get("session_id")
+            response.get("session_id"),
+            codex_home=codex_home,
         )
         if _r_target:
             if not response.get("model_targeted"):
@@ -1135,6 +1138,18 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
         }
         if processor.zcode_context_window is not None:
             response["zcode_stream"]["context_window"] = processor.zcode_context_window
+    if response.get("cli") == "zcode" and response.get("status") != "success":
+        err_blob = f"{response.get('error') or ''}\n{response.get('stderr_tail') or ''}\n{response.get('stderr') or ''}"
+        if "provider_config" in err_blob or "no provider" in err_blob.lower():
+            zcode_hint = (
+                "ZCode reported a missing provider configuration; run `zcode doctor` "
+                "or `zcode login` to initialize ~/.zcode/v2/provider_config.json"
+            )
+            response.setdefault("warnings", [])
+            if zcode_hint not in response["warnings"]:
+                response["warnings"].append(zcode_hint)
+            if response.get("error") and "zcode doctor" not in str(response["error"]):
+                response["error"] = f"{response['error']} ({zcode_hint})"
     # Baseline resume handle on EVERY path (incl. spawn-failure) so orchestrators
     # can read response["resume"] unconditionally. execute_agent enriches it with
     # the agy profile on the normal path.
@@ -1238,6 +1253,45 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
     else:
         response["confidence"] = None
     response.setdefault("files_touched", [])
+    # Output-token cutoff AFTER a complete DONE report: on AGY (e.g. W13), the
+    # agent can emit its full structured STATUS: DONE report and finish work,
+    # then a trailing stream event signals output token limit cutoff and sets
+    # status=error. Rescue a complete STATUS: DONE report with a warning.
+    if (response.get("status") == "error"
+            and not response.get("timeout")
+            and response.get("attempt_status") != "not_run"
+            and response.get("error_kind") != "provider_cancelled"
+            and response.get("report_ok")
+            and isinstance(report, dict)
+            and report.get("status")
+            and report["status"].split()[0].rstrip("|,").upper() == "DONE"):
+        _cutoff_haystack = "\n".join(
+            str(response.get(k) or "") for k in ("error", "error_hint", "output_tail")
+        )
+        if re.search(
+            r"output[\s_-]+token[\s_-]+limit|response\s+cut\s+off|max[\s_-]+output[\s_-]+tokens"
+            r"|exceeded\s+(?:the\s+)?output\s+limit|hit\s+(?:the\s+)?output\s+limit"
+            r"|subscriber\s+fell\s+behind|stalled\s+for\s+\d+(?:\.\d+)?s",
+            _cutoff_haystack,
+            re.IGNORECASE,
+        ):
+            _cutoff_orig_err = response.pop("error", None)
+            response["provider_post_report_error"] = _cutoff_orig_err
+            response["completed_before_cutoff"] = True
+            response["status"] = "success"
+            response["execution_status"] = "success"
+            response["exit_code"] = 0
+            response["dispatcher_status"] = "success"
+            response["normalized_exit_code"] = 0
+            response["normalization_reason"] = (
+                "normalized to success after complete DONE report before output-token cutoff or stream stall "
+                f"(raw backend exit {response.get('raw_backend_exit_code')})"
+            )
+            response.pop("suspect", None)
+            response.setdefault("warnings", []).append(
+                "backend reported an output-token limit cutoff or stream stall after a complete "
+                "STATUS: DONE report; status set to success (see provider_post_report_error)"
+            )
     # 1) Structured self-report wins over exit-0 "success" (never upgrades).
     if response.get("status") == "success" and report and report.get("status"):
         first = report["status"].split()[0].rstrip("|,").upper()
@@ -1288,6 +1342,28 @@ def _enrich(response: dict, processor: StreamProcessor | None) -> dict:
         response["raw_backend_exit_code"] = _raw_exit
         response["normalized_exit_code"] = _normalized_exit_code(
             response.get("status"), _raw_exit)
+    _proc_notes = list(getattr(processor, "progress_notes", None) or [])
+    _proc_final = getattr(processor, "final_message", None)
+    if response.get("report_ok") and response.get("report_text"):
+        _final_result = response["report_text"]
+        if not _proc_notes and _clean_result:
+            _status_match = re.search(r"(?m)^\s*(?:\*\*)?STATUS\s*:", _clean_result)
+            if _status_match and _status_match.start() > 0:
+                _lead = _clean_result[:_status_match.start()].strip()
+                if _lead:
+                    _proc_notes = [_lead]
+            else:
+                _idx = _clean_result.find(_final_result)
+                if _idx > 0:
+                    _lead = _clean_result[:_idx].strip()
+                    if _lead:
+                        _proc_notes = [_lead]
+    elif isinstance(_proc_final, str) and _proc_final.strip():
+        _final_result = _proc_final.strip()
+    else:
+        _final_result = _clean_result
+    response["final_result"] = _final_result
+    response["progress_notes"] = _proc_notes
     # Keep compact structured findings ahead of the potentially long narrative in
     # serialized envelopes. JSON object order is not semantic, but this makes the
     # common human/tool streaming path useful without scanning the transcript first.
@@ -1669,7 +1745,23 @@ def _attach_eligibility(resp: dict) -> dict:
     # the provider's window has elapsed.
     if (resp.get("cli") == "kimi" and resp.get("status") != "success"):
         low = text.lower()
-        if any(marker in low for marker in (
+        err_text = f"{resp.get('error') or ''} {resp.get('output_tail') or ''}".lower()
+        if "is not configured in config.toml" in err_text:
+            resp["error_kind"] = "model_not_found"
+            resp["retryable"] = False
+            resp["result_usable"] = False
+            if resp.get("attempt_status") != "not_run":
+                resp["provider_contacted"] = False
+            resp["auth_stage"] = "terminal"
+            resp["auth_outcome"] = "not_needed"
+            resp["interactive_required"] = False
+            resp["remediation_code"] = "backend_model_not_configured"
+            resp.setdefault("warnings", []).append(
+                "Kimi rejected the requested model because it is not configured in "
+                "config.toml. Run `kimi upgrade` (or `kimi update`) and `kimi login` "
+                "to refresh local Kimi models, or inspect configured models with "
+                "`summon models --cli kimi`.")
+        elif any(marker in low for marker in (
                 "too many requests", "rate limit", "rate_limited",
                 "http 429", "status code 429", " 429 ", "quota exceeded")):
             resp["error_kind"] = "rate_limited"
@@ -2399,7 +2491,8 @@ def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, mod
                            base_commit=None,
                            upstream_handoffs=None,
                            files_scope=None,
-                           depends_on=None) -> dict:
+                           depends_on=None,
+                           ad_hoc_permission=None) -> dict:
     """THE request identity, built in ONE place from RAW inputs.
 
     The dispatcher and the manifest parent each used to build their own dict, so a field
@@ -2427,11 +2520,20 @@ def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, mod
     # ONE load of the definition for the WHOLE identity: every field derived from it reads
     # this snapshot, so an A -> B -> A swap mid-construction cannot produce a hybrid identity
     # (A's hash paired with B's resolved backend, which had turned agy attestation off).
-    _defn = _defn_snapshot(agents_dir, cwd, agent,
-                           strict_agents_dir=bool(strict_agents_dir))
-    _adef = (_defn.sha, _defn.state) if _defn is not None else (None, "missing")
-    _rcli = _resolved_cli(cli, agents_dir, cwd, agent, _defn)
-    _rperm = _resolved_permission(_defn, max_permission)
+    if agent is None:
+        _defn = None
+        _adef = (None, "absent")
+        _rcli = _resolved_cli(cli, agents_dir, cwd, None, None)
+        from _builder import DEFAULT_PERMISSION as _DEFAULT_PERM, clamp_permission as _clamp_perm
+        _declared_adhoc = ad_hoc_permission or _DEFAULT_PERM
+        _rperm = (_clamp_perm(str(_declared_adhoc), str(max_permission))
+                  if max_permission else str(_declared_adhoc))
+    else:
+        _defn = _defn_snapshot(agents_dir, cwd, agent,
+                               strict_agents_dir=bool(strict_agents_dir))
+        _adef = (_defn.sha, _defn.state) if _defn is not None else (None, "missing")
+        _rcli = _resolved_cli(cli, agents_dir, cwd, agent, _defn)
+        _rperm = _resolved_permission(_defn, max_permission)
     _profile_name = profile or ((_defn.fm or {}).get("profile") if _defn else None)
     _profile_selection = None
     _profile_error = None
@@ -2662,6 +2764,7 @@ def build_request_identity(*, agent, prompt, cwd, agents_dir=None, cli=None, mod
         # codex result -- and a refusal is not free: the manifest clears the stale envelope
         # before re-dispatching, so a false refusal DESTROYED a completed answer.
         "providers_sha256": _endpoint[0],
+        "ad_hoc_permission": _rperm if (agent is None and _rcli) else None,
     }
 
 
@@ -2830,6 +2933,7 @@ def is_terminal_nonretryable(env) -> bool:
                     "resume_model_mismatch",
                     "resume_model_unverified",
                     "missing_executable",
+                    "model_not_found",
                 })
 
 
@@ -3115,6 +3219,13 @@ def finalize_exit_fields(resp: dict) -> dict:
     resp.setdefault("dispatcher_status", resp.get("status"))
     resp.setdefault("normalized_exit_code",
                     _normalized_exit_code(resp.get("status"), raw))
+    if not resp.get("dry_run") and resp.get("status") != "dry_run":
+        if resp.get("status") == "success":
+            resp["exit_code"] = 0
+        elif resp.get("status") in {"error", "cancelled"}:
+            resp["exit_code"] = (
+                raw if isinstance(raw, int) and not isinstance(raw, bool) and raw != 0 else 1
+            )
     if "normalization_reason" not in resp:
         _ec, _st = raw, resp.get("status")
         if _st == "success" and _ec not in _SUCCESS_EXIT_CODES:
@@ -3154,6 +3265,7 @@ _DETERMINISTIC_MODEL_SYNONYMS: dict[str, str] = {
     "deepseek-4.1-flash": "deepseek-v4-1-flash",
     "deepseek-v4.1-flash": "deepseek-v4-1-flash",
     "k3": "kimi-k3",
+    "k3.1-pro": "kimi-k3.1-pro",
 }
 _DATE_SNAPSHOT_SUFFIX_RE = re.compile(r"-(?:ga-)?(?:20\d{6}|\d{6})$")
 
@@ -3400,6 +3512,8 @@ def _error_response(
         "dispatcher_status": "error",
         "normalization_reason": "execution failed before a usable terminal result",
     }
+    if isinstance(partial_result, dict) and partial_result.get("partial_result"):
+        response["partial_result"] = partial_result["partial_result"]
     if not_run:
         response.update({
             "attempts": 0,
@@ -3536,7 +3650,15 @@ def build_final_response(
             "fatal missing-executable failure; report retained as advisory")
     response = {
         "result": result.get("result", "") if result else "".join(stdout_lines),
-        "exit_code": exit_code,
+        "exit_code": (
+            0 if status == "success"
+            else (
+                (exit_code if isinstance(exit_code, int)
+                 and not isinstance(exit_code, bool) and exit_code != 0 else 1)
+                if status in {"error", "cancelled"}
+                else exit_code
+            )
+        ),
         "status": status,
         "cli": cli,
         # Exit-code clarity: keep the raw backend code AND expose the normalized
@@ -3549,6 +3671,8 @@ def build_final_response(
         "normalized_exit_code": _normalized_exit_code(status, exit_code),
         "normalization_reason": norm_reason,
     }
+    if isinstance(result, dict) and result.get("partial_result"):
+        response["partial_result"] = result["partial_result"]
     if agy_terminal is not None:
         response["provider_terminal_state"] = agy_terminal[0]
         response["provider_terminal_outcome"] = agy_terminal[1]
@@ -3641,6 +3765,10 @@ def _spawn_reader(process: subprocess.Popen) -> queue.Queue:
         try:
             for line in iter(process.stdout.readline, ""):
                 line_q.put((_LINE, line))
+        except (ValueError, OSError):
+            # Main-thread stream close during abort/timeout teardown can race an
+            # in-flight readline() on Python 3.13 BufferedReader/TextIOWrapper.
+            pass
         finally:
             line_q.put((_EOF, None))
 
@@ -3846,6 +3974,61 @@ def _safe_communicate(process: subprocess.Popen, timeout: float = 3.0):
         return (None, None)
 
 
+def _extract_reported_files(report: dict | None) -> list[str] | None:
+    """Extract normalized file paths declared in an agent's FILES report field."""
+    if not isinstance(report, dict):
+        return None
+    raw = report.get("files") or report.get("files_touched")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    out: list[str] = []
+    seen: set[str] = set()
+    _sentinels = {"none", "none.", "n/a", "na", "nil", "unchanged", "nothing", "no files"}
+    for line in raw.replace(",", "\n").splitlines():
+        item = re.sub(r"^\s*(?:[-*+]|\d+\.)\s*", "", line).strip()
+        if not item:
+            continue
+        item = re.split(r"\s+(?:—|--|-|\()\s+", item, maxsplit=1)[0].strip()
+        item = item.strip("`'\"").strip()
+        if not item or item.lower() in _sentinels:
+            continue
+        if any(ch.isspace() for ch in item):
+            continue
+        norm = item.replace("\\", "/")
+        while norm.startswith("./"):
+            norm = norm[2:]
+        if ("/" in norm or "." in norm) and norm not in seen:
+            seen.add(norm)
+            out.append(norm)
+    return out or None
+
+
+def _detect_concurrent_shared_tree(cwd: str | None) -> bool:
+    """Best-effort check whether another live Summon job targets the same cwd."""
+    if os.environ.get("SUMMON_SHARED_TREE") == "1":
+        return True
+    if not cwd or not isinstance(cwd, str):
+        return False
+    try:
+        from _jobs import DEFAULT_JOB_DIR, list_jobs
+        norm_cwd = os.path.normcase(os.path.abspath(cwd))
+        self_job_id = os.environ.get("SUMMON_JOB_ID")
+        job_dir = os.environ.get("SUMMON_JOB_DIR") or DEFAULT_JOB_DIR
+        for job in list_jobs(job_dir, refresh=False, limit=64):
+            if not isinstance(job, dict):
+                continue
+            if self_job_id and job.get("job_id") == self_job_id:
+                continue
+            if job.get("state") not in {"running", "queued", "starting"}:
+                continue
+            j_cwd = job.get("cwd")
+            if isinstance(j_cwd, str) and os.path.normcase(os.path.abspath(j_cwd)) == norm_cwd:
+                return True
+    except Exception:  # noqa: BLE001 - best-effort attribution signal
+        return False
+    return False
+
+
 def _drive_process(process: subprocess.Popen, cli: str, timeout_ms: int,
                    parse_stream: bool | None = None,
                    launch_control: ProviderLaunchControl | None = None,
@@ -3856,7 +4039,8 @@ def _drive_process(process: subprocess.Popen, cli: str, timeout_ms: int,
                    finalization_ms: int | None = None,
                    attempt_kind: str = "initial",
                    attempt_ordinal: int = 1,
-                   workspace_cwd: str | None = None) -> dict:
+                   workspace_cwd: str | None = None,
+                   codex_home: str | None = None) -> dict:
     """Drive the subprocess and enrich whatever response path it takes.
 
     Single choke point: every return from the read loop (success, timeout,
@@ -3941,7 +4125,7 @@ def _drive_process(process: subprocess.Popen, cli: str, timeout_ms: int,
                                    liveness=tracker,
                                    liveness_emitter=emitter,
                                    runtime_control=runtime_control)
-    enriched = _enrich(response, processor)
+    enriched = _enrich(response, processor, codex_home=codex_home)
     enriched["liveness"] = tracker.snapshot()
     if runtime_control is not None:
         if isinstance(enriched.get("context_handoff"), dict):
@@ -4092,6 +4276,10 @@ def _drive_process_loop(
                             signals=getattr(processor, "progress_signals", None))
                     except Exception:  # noqa: BLE001 - fall back to the legacy rule
                         checkpoint_active = stream_active
+                if cli == "zcode" and process.poll() is None:
+                    # ZCode buffers a single terminal JSON document until exit;
+                    # silent stdout mid-run must not trigger adaptive no-progress termination.
+                    checkpoint_active = True
                 runtime_control.checkpoint(active=checkpoint_active)
                 breaker_decision = None
                 if breaker is not None and is_due:
@@ -4106,7 +4294,7 @@ def _drive_process_loop(
                                 _wt = _calc_work_tokens(processor.usage, cli=cli)
                         except Exception:  # noqa: BLE001 - isolate usage failure from other breaker signals
                             _wt = None
-                        _prog_rec = getattr(runtime_control, "progress", None)
+                        _prog_rec = None if cli == "zcode" else getattr(runtime_control, "progress", None)
                         _extra = (
                             ("no_progress",)
                             if _prog_rec is None and not checkpoint_active
@@ -4788,6 +4976,7 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
     _guarded_inv, _, _guard_warnings = apply_credit_guard(inv)
     _transport_budget_result = None
     _transport_budget_error = None
+    _codex_home = os.environ.get("CODEX_HOME")
     debug_argv = [inv.cli]  # what --debug-dir records; each path refines it
     # Defer the initial workspace snapshot until an actual backend spawn is known to fit.
     # An over-long argv must not cause any utility Popen merely to build its refusal
@@ -4853,13 +5042,22 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                     }
                 else:
                     _after = workspace_snapshot(inv.cwd)
+                    _reported_files = _extract_reported_files(resp.get("report"))
+                    _shared_tree = _detect_concurrent_shared_tree(inv.cwd)
                     try:
                         resp["workspace_evidence"] = workspace_evidence(
                             _workspace_before, _after, getattr(inv, "permission", None),
-                            cli=getattr(inv, "cli", None))
+                            cli=getattr(inv, "cli", None),
+                            reported_files=_reported_files,
+                            concurrent_shared_tree=_shared_tree)
                     except TypeError:
-                        resp["workspace_evidence"] = workspace_evidence(
-                            _workspace_before, _after, getattr(inv, "permission", None))
+                        try:
+                            resp["workspace_evidence"] = workspace_evidence(
+                                _workspace_before, _after, getattr(inv, "permission", None),
+                                cli=getattr(inv, "cli", None))
+                        except TypeError:
+                            resp["workspace_evidence"] = workspace_evidence(
+                                _workspace_before, _after, getattr(inv, "permission", None))
             except Exception:  # noqa: BLE001 — never hide the terminal response
                 resp["workspace_evidence"] = {
                     "before": None, "after": None, "coverage": "unavailable",
@@ -4870,6 +5068,18 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         _we = resp.get("workspace_evidence")
         if isinstance(_we, dict) and isinstance(_we.get("files_touched"), list):
             resp["files_touched"] = list(_we["files_touched"])
+            if _we.get("unreported_tree_changes"):
+                resp.setdefault("warnings", []).append(
+                    f"files_touched includes {len(_we['unreported_tree_changes'])} file(s) "
+                    "not listed in the writer's FILES report "
+                    f"(attribution={_we.get('attribution')}); tree changes may include "
+                    "parallel writers or local scripts"
+                )
+            elif _we.get("concurrent_shared_tree") and resp["files_touched"]:
+                resp.setdefault("warnings", []).append(
+                    "multiple active summon jobs detected in the same workspace without "
+                    "--worktree; files_touched attribution marked shared_tree"
+                )
         else:
             resp.setdefault("files_touched", [])
         if isinstance(_we, dict) and isinstance(_we.get("files_touched_digests"), list):
@@ -4938,10 +5148,6 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                              "kimi_model_evidence_conflict")
         if _terminal_model and not _terminal_model_invalid:
             _served = _terminal_model
-        elif (_out_tokens > 0 and _targeted
-              and not _exact_required and not _ambiguous_claude
-              and not _conflicting_kimi):
-            _served = None if _terminal_model_invalid else _targeted
         else:
             _served = None
         # Provenance is separate from the model name.  A terminal provider
@@ -5054,9 +5260,24 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                 resp.setdefault("warnings", []).append(
                     "model identity trust failure is terminal; no retry, provider "
                     "fallback, ACP fallback, repair, or resume was attempted")
+        from _builder import effective_effort as _effective_effort
+        _eff_model_for_effort = (
+            (_codex_selection.get("canonical") if inv.cli == "codex" else _guarded_inv.model)
+            or _targeted
+        )
+        _actual_effort, _effort_warn = _effective_effort(
+            inv.cli, _eff_model_for_effort, inv.effort
+        )
+        from _backend_policy import is_sandbox_enforced as _is_sandbox_enforced
         resp["permission"] = inv.permission
+        resp["sandbox_enforced"] = _is_sandbox_enforced(inv.cli, inv.permission)
         resp["transport"] = inv.transport   # which path served the run (subprocess|acp)
-        resp["effort"] = inv.effort   # requested effort; not proof of applied/served effort
+        resp["effort"] = _actual_effort
+        if inv.effort and _actual_effort != inv.effort:
+            resp["effort_requested"] = inv.effort
+            resp["effort_downgraded"] = True
+            if _effort_warn:
+                resp.setdefault("warnings", []).append(_effort_warn)
         # True only for a caller-requested continuation. Automatic schema/report
         # repair retries have their own explicit fields and do not relabel the root run.
         resp["resumed"] = bool(inv.resume_id)
@@ -5373,6 +5594,8 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
             _resp["error_kind"] = _kind
             _resp["retryable"] = bool(getattr(_build_err, "retryable", False))
         return _stamp(_enrich(_resp, None))
+    if isinstance(env_override, dict) and env_override.get("CODEX_HOME"):
+        _codex_home = env_override["CODEX_HOME"]
     try:
         command, args = _resolve_launch(command, args)
     except ValueError as _launch_err:
@@ -5751,6 +5974,7 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                                   attempt_kind=getattr(inv, "attempt_kind", "initial"),
                                   attempt_ordinal=getattr(inv, "attempt_ordinal", 1),
                                   workspace_cwd=getattr(inv, "cwd", None),
+                                  codex_home=_codex_home,
                                   expected_model=(
                                       _requested_model
                                       if inv.cli == "codex"

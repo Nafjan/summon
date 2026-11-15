@@ -93,15 +93,15 @@
       }
     },
     {
-      "key": "kimi/kimi-code/k3",
+      "key": "kimi/kimi-code/k3.1-pro",
       "identity": {
         "vendor": "moonshot",
-        "model_id": "kimi-code/k3"
+        "model_id": "kimi-code/k3.1-pro"
       },
       "display": {
         "role": "high-context research",
         "name": "Kimi",
-        "version": "K3"
+        "version": "K3.1 Pro"
       },
       "editorial": {
         "label": "frontier",
@@ -110,7 +110,7 @@
       },
       "route": {
         "backend": "kimi",
-        "target": "kimi-code/k3",
+        "target": "kimi-code/k3.1-pro",
         "dispatchable": true
       }
     },
@@ -265,6 +265,28 @@
       "route": {
         "backend": "agy",
         "target": "claude-opus-5-5-high",
+        "dispatchable": true
+      }
+    },
+    {
+      "key": "kimi/kimi-code/k3",
+      "identity": {
+        "vendor": "moonshot",
+        "model_id": "kimi-code/k3"
+      },
+      "display": {
+        "role": "previous-version high-context research",
+        "name": "Kimi",
+        "version": "K3"
+      },
+      "editorial": {
+        "label": "frontier",
+        "rank": 13,
+        "lane": "explicit-previous-version"
+      },
+      "route": {
+        "backend": "kimi",
+        "target": "kimi-code/k3",
         "dispatchable": true
       }
     },

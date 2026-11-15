@@ -186,9 +186,42 @@ def _repair(backend: str, *, allow: bool, timeout_s: float = 300.0,
     }
 
 
+def _default_vendor_auth_probe(backend: str) -> bool | None:
+    """Fast vendor auth-status check for claude/codex default home (no model call)."""
+    if backend not in ("claude", "codex"):
+        return None
+    args = ["auth", "status", "--json"] if backend == "claude" else ["login", "status"]
+    try:
+        from _spawn import run_flags
+        command = _command_for(backend, {"argv": [backend, *args]})
+        completed = subprocess.run(command, stdin=subprocess.DEVNULL,
+                                   capture_output=True, text=True, encoding="utf-8",
+                                   errors="replace", timeout=30, **run_flags())
+        authenticated = completed.returncode == 0
+        if backend == "claude":
+            import json
+            value = json.loads(completed.stdout)
+            if not isinstance(value, dict) or not isinstance(value.get("loggedIn"), bool):
+                return None
+            authenticated = authenticated and value["loggedIn"]
+        return authenticated
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
 def _status(*, backend: str | None = None, probe: bool = False) -> dict[str, Any]:
-    from _doctor import doctor
-    report = doctor(probe=probe)
+    from _doctor import _default_probe_runner, _probe_one, doctor
+    from _profiles import list_profiles, resolve_profile
+    report = doctor(probe=(probe if not backend else False))
+    if probe and backend:
+        target_item = (report.get("backends") or {}).get(backend)
+        if target_item and target_item.get("found") and target_item.get("verified"):
+            vendor_ok = _default_vendor_auth_probe(backend)
+            if vendor_ok is not None:
+                target_item["auth_ok"] = vendor_ok
+                target_item["probe_ran"] = True
+            else:
+                _probe_one(backend, target_item, _default_probe_runner)
     names = [backend] if backend else list(report.get("backends") or {})
     rows = []
     for name in names:
@@ -211,8 +244,24 @@ def _status(*, backend: str | None = None, probe: bool = False) -> dict[str, Any
             "verified": bool(item.get("verified")),
             "auth": plan,
         })
+    profiles = list_profiles(cli=backend, cwd=None)
+    for prof in profiles:
+        prof["auth_status"] = "unverified"
+        prof["probe_ran"] = False
+        if probe and prof.get("valid") and prof.get("cli") in ("claude", "codex"):
+            try:
+                sel = resolve_profile(prof["name"], prof["cli"], None)
+                if sel is not None:
+                    pstat = _profile_status(prof["cli"], sel, probe=True)
+                    prof["auth_status"] = pstat.get("auth_status", "unverified")
+                    prof["probe_ran"] = bool(pstat.get("probe_ran"))
+                    if pstat.get("error_kind"):
+                        prof["error_kind"] = pstat["error_kind"]
+            except ValueError:
+                prof["valid"] = False
     return {
         "status": "success", "probe_ran": bool(probe), "backends": rows,
+        "profiles": profiles,
         "note": ("Authentication is unverified until `--probe` performs a minimal live "
                  "check. Login commands may open a browser and still require approval."),
     }
@@ -222,11 +271,21 @@ def run_auth_action(action: str, *, backend: str | None = None,
                     allow: bool = False, probe: bool = False,
                     timeout_s: float = 300.0, profile: str | None = None) -> dict[str, Any]:
     """Run a local auth-management action without dispatching a model."""
+    if action == "init":
+        from _profiles import init_profile
+        try:
+            return init_profile(profile, backend)
+        except ValueError as exc:
+            return {
+                "status": "error",
+                "error_kind": "account_profile_invalid",
+                "message": str(exc),
+            }
     selection = None
     if profile:
         from _profiles import resolve_profile
         try:
-            selection = resolve_profile(profile, backend, os.getcwd())
+            selection = resolve_profile(profile, backend, None)
         except ValueError:
             return {"status": "error", "error_kind": "account_profile_invalid",
                     "message": "Choose --cli claude or codex and a valid private profile outside the current directory."}

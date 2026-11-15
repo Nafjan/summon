@@ -189,7 +189,8 @@ def _freeze_background_bundle(root: str, job_id: str, entry_path: str,
     bundle_scripts = bundle_root / "scripts"
     try:
         shutil.copytree(source_scripts, bundle_scripts,
-                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+                        ignore=shutil.ignore_patterns(
+                            "__pycache__", "*.pyc", "test_*.py", "conftest.py"))
         child_entry = bundle_scripts / source_entry.name
         if not child_entry.is_file():
             raise ValueError("immutable background bundle is missing its dispatcher entry script")
@@ -240,17 +241,17 @@ def child_argv(args: argparse.Namespace, result_file: str, *, private_resume: bo
     # Fresh background launches use the exact prompt bytes frozen beside their
     # immutable script bundle. Resume successors use their separate authenticated
     # private prompt channel.
+    _head = ["--agent", args.agent] if args.agent else []
     if private_resume:
         # The authenticated child replaces this bounded placeholder from its
         # private digest-bound prompt file.  Neither the continuation handle nor
         # operator steering appears in the detached process command line.
-        out = ["--agent", args.agent, "--prompt", "governed continuation",
-               "--cwd", args.cwd]
+        out = [*_head, "--prompt", "governed continuation", "--cwd", args.cwd]
     elif getattr(args, "_background_frozen_prompt_file", None):
-        out = ["--agent", args.agent, "--prompt-file",
+        out = [*_head, "--prompt-file",
                args._background_frozen_prompt_file, "--cwd", args.cwd]
     else:
-        out = ["--agent", args.agent, "--prompt", args.prompt, "--cwd", args.cwd]
+        out = [*_head, "--prompt", args.prompt, "--cwd", args.cwd]
     if getattr(args, "allow_credit", False):
         out += ["--allow-credit"]
     if getattr(args, "allow_payg", False):
@@ -305,6 +306,8 @@ def child_argv(args: argparse.Namespace, result_file: str, *, private_resume: bo
     # Same class of bug as the gate below, and reintroduced with a NEW flag three
     # releases after the gate one was fixed: a control that is not forwarded here is
     # silently absent in the child, so --background --max-permission ran UNCLAMPED.
+    if getattr(args, "permission", None) and not args.agent:
+        out += ["--permission", args.permission]
     if getattr(args, "max_permission", None):
         out += ["--max-permission", args.max_permission]
     if getattr(args, "gate_with", None):
@@ -447,7 +450,8 @@ def _load_resume_preparation(root: str, reservation) -> tuple[str, dict, str, di
 
 def spawn_background(args: argparse.Namespace, entry_path: str, summon: dict, *,
                      resume_reservation=None, resume_recovery: bool = False,
-                     resume_prepare_recovery: bool = False) -> dict:
+                     resume_prepare_recovery: bool = False,
+                     out_lock_handoff: tuple[str, str] | None = None) -> dict:
     """Re-exec the dispatcher detached, streaming its result to a job file. Writes
     a durable launch RECORD (fsynced) BEFORE the spawn so a child that dies before
     its result is still traceable, and hands the child a nonce it stamps into its
@@ -475,7 +479,7 @@ def spawn_background(args: argparse.Namespace, entry_path: str, summon: dict, *,
             mission_id,
             job_id=job_id,
             attempt_id=job_id,
-            agent=args.agent,
+            agent=(args.agent or f"adhoc-{args.cli}"),
             attempt_kind="initial",
             max_work_tokens=max_wt,
             max_cost_usd=max_cost,
@@ -522,7 +526,7 @@ def spawn_background(args: argparse.Namespace, entry_path: str, summon: dict, *,
                     "context_compilation_sha256"] = hashlib.sha256(
                         compilation_bytes).hexdigest()
             record_file = _jobs.write_prepared(
-                root, job_id, nonce=nonce, agent=args.agent,
+                root, job_id, nonce=nonce, agent=(args.agent or f"adhoc-{args.cli}"),
                 prompt_sha256=prompt_sha, cwd=args.cwd,
                 flags=_jobs.flags_projection(args), summon=execution_summon,
                 attempt_id=job_id,
@@ -551,7 +555,7 @@ def spawn_background(args: argparse.Namespace, entry_path: str, summon: dict, *,
                 settle_attempt(
                     mission_id, job_id=job_id, attempt_id=job_id,
                     provider_contacted=False, terminal_status="prepare_failed",
-                    agent=args.agent, job_dir=root)
+                    agent=(args.agent or f"adhoc-{args.cli}"), job_dir=root)
             except Exception:
                 pass
         if lease is not None:
@@ -624,13 +628,18 @@ def spawn_background(args: argparse.Namespace, entry_path: str, summon: dict, *,
                         settle_attempt(
                             mission_id, job_id=job_id, attempt_id=job_id,
                             provider_contacted=False, terminal_status="hook_setup_failed",
-                            agent=args.agent, job_dir=root)
+                            agent=(args.agent or f"adhoc-{args.cli}"), job_dir=root)
                     except Exception:
                         pass
                 if lease is not None:
                     _release_execution_lease(*lease)
                 raise ValueError(f"cannot prepare in-flight hooks: {hook_exc}") from hook_exc
         child_env.pop("SUMMON_CMD_LAUNCHER", None)
+        child_env.pop("SUMMON_OUT_LOCK_PATH", None)
+        child_env.pop("SUMMON_OUT_LOCK_TOKEN", None)
+        if out_lock_handoff is not None:
+            child_env["SUMMON_OUT_LOCK_PATH"] = str(out_lock_handoff[0])
+            child_env["SUMMON_OUT_LOCK_TOKEN"] = str(out_lock_handoff[1])
         if prompt_sha:
             child_env["SUMMON_JOB_PROMPT_SHA"] = prompt_sha   # lets the crash path verify
         context_sha = (execution_summon.get("background_bundle") or {}).get(
@@ -658,7 +667,7 @@ def spawn_background(args: argparse.Namespace, entry_path: str, summon: dict, *,
                     settle_attempt(
                         mission_id, job_id=job_id, attempt_id=job_id,
                         provider_contacted=False, terminal_status="spawn_failed",
-                        agent=args.agent, job_dir=root)
+                        agent=(args.agent or f"adhoc-{args.cli}"), job_dir=root)
                 except Exception:
                     pass
             if resume_reservation is not None:
@@ -689,6 +698,8 @@ def spawn_background(args: argparse.Namespace, entry_path: str, summon: dict, *,
     handle = {"status": "background", "job_id": job_id, "pid": proc.pid,
               "result_file": result_file, "job_dir": root,
               "record_file": record_file}
+    if getattr(args, "out", None):
+        handle["out_file"] = os.path.abspath(args.out)
     # The child is ALREADY running. A failure to stamp the pid onto the record
     # must never sink the handle -- that would strand a live job with no way for
     # the caller to find its result. Surface the metadata failure as a warning
@@ -976,6 +987,11 @@ def run_jobs_query(args, emit_error, *, entry_path: str | None = None,
         except (OSError, TypeError, ValueError):
             st["control"] = {"state": "unavailable"}
             st["heartbeat"] = None
+        raw_trusted_result = (
+            dict(st["result"])
+            if st.get("trusted") is True and isinstance(st.get("result"), dict)
+            else None
+        )
         private_control = st.pop("control", None)
         private_heartbeat = st.pop("heartbeat", None)
         st = _jobs.public_job_status(st)
@@ -993,6 +1009,12 @@ def run_jobs_query(args, emit_error, *, entry_path: str | None = None,
                 st["result"]["continuation"] = public_projection(source)
         except (OSError, TypeError, ValueError):
             pass
+        if getattr(args, "jobs_full", False):
+            st["result_file"] = _jobs.result_path(root, args.jobs_status)
+            if raw_trusted_result is not None and isinstance(st.get("result"), dict):
+                for _rk in ("result", "final_result", "report_text", "summary", "report", "verdict"):
+                    if _rk in raw_trusted_result and raw_trusted_result[_rk] is not None:
+                        st["result"][_rk] = raw_trusted_result[_rk]
         st["control"] = private_control
         st["heartbeat"] = private_heartbeat
         print(json.dumps(st, ensure_ascii=False))
@@ -1068,6 +1090,12 @@ def run_jobs_query(args, emit_error, *, entry_path: str | None = None,
                     "summary": summary_text,
                     "confidence": result.get("confidence"),
                     "files_touched": files_touched,
+                    "result": result.get("result"),
+                    "final_result": result.get("final_result"),
+                    "report_text": result.get("report_text"),
+                    "report": result.get("report"),
+                    "verdict": result.get("verdict"),
+                    "result_file": _jobs.result_path(root, jid),
                 })
             elif outcome == "timeout":
                 pid = rec.get("pid") if isinstance(rec, dict) else None

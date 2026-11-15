@@ -281,10 +281,12 @@ _PERMISSION_MAPPING = {
     },
     "zcode": {
         # ZCode calls this a "mode", not a sandbox.  Only yolo is a reliable
-        # headless write mode.  The builder rejects safe-edit and requires an
-        # explicit advisory opt-in for plan/read-only (see below).
-        "read-only": ["--mode", "plan"],
-        "safe-edit": [],
+        # headless write mode; zcode 0.17.1+ removed --mode plan in favor of
+        # --mode guarded (combined with --disallowed-tools Write,Edit,Bash,Shell).
+        # safe-edit is refused in zcode_invocation_preflight, but maps to guarded
+        # as defense-in-depth so it never emits an empty mode flag list.
+        "read-only": ["--mode", "guarded"],
+        "safe-edit": ["--mode", "guarded"],
         "yolo": ["--mode", "yolo"],
     },
 }
@@ -387,18 +389,21 @@ def _opencode_restricted_cwd_policy(cli: str, permission: str, cwd: str | None,
     """
     if cli != "opencode" or permission == "yolo" or os.name != "nt" or not cwd:
         return None
-    cwd_drive = ntpath.splitdrive(ntpath.abspath(cwd))[0].casefold()
+    abs_cwd = ntpath.abspath(cwd)
     local_temp = ntpath.abspath(tempfile.gettempdir())
-    local_drive = ntpath.splitdrive(local_temp)[0].casefold()
-    if not cwd_drive or not local_drive or cwd_drive == local_drive:
+    # Allow local Windows drives (e.g. C:\, D:\); refuse UNC network paths.
+    is_unc = abs_cwd.startswith("\\\\") and not (
+        len(abs_cwd) > 5 and abs_cwd.startswith("\\\\?\\") and abs_cwd[5] == ":"
+    )
+    if not is_unc:
         return None
     allowed_root = ntpath.join(local_temp, "opencode")
     return {
         "error_kind": "opencode_external_cwd_denied",
         "refusal": (
             "OpenCode's restricted permission policy denies external_directory for this "
-            "Windows working directory; stage a sanitized packet on the local OpenCode "
-            "volume, re-freeze its hashes, then re-run dry-run"),
+            "UNC/network Windows working directory; stage a sanitized packet on a local "
+            "drive, re-freeze its hashes, then re-run dry-run"),
         "allowed_root": allowed_root,
         "requires_packet_refreeze": True,
         "reroute": {
@@ -423,6 +428,11 @@ def read_allowlist(cli: str, permission: str, cwd: str,
             effective.append(root)
     mechanism = _READ_ROOT_FLAGS.get(cli)
     opencode_cwd_policy = _opencode_restricted_cwd_policy(cli, permission, cwd, roots)
+    enforced = bool(
+        mechanism is not None
+        and permission == "read-only"
+        and opencode_cwd_policy is None
+    )
     supported = (not roots or (mechanism is not None and permission == "read-only")) \
         and opencode_cwd_policy is None
     reason = None
@@ -439,7 +449,7 @@ def read_allowlist(cli: str, permission: str, cwd: str,
         "backend": cli,
         "permission": permission,
         "mechanism": mechanism,
-        "enforced": bool(supported),
+        "enforced": enforced,
         "would_refuse": not supported,
         **({"refusal": reason} if reason else {}),
     }
@@ -799,7 +809,7 @@ _BOUNDARY_FLAGS = {
     "opencode": ("--auto", "--model", "-m", "--session", "-s", "--continue",
                  "--agent", "--dir", "--format", "--variant"),
     "zcode": ("--cwd", "--json", "--no-color", "--mode", "--permission-mode",
-              "--model", "-m",
+              "--model", "-m", "--effort",
               "--allowed-tools", "--disallowed-tools", "--resume", "--continue",
               "--attach", "--prompt", "--settings", "--target", "--target-replace"),
 }
@@ -807,7 +817,7 @@ _BOUNDARY_FLAGS = {
 # too, or the bare value becomes a stray positional argument.
 _BOUNDARY_TAKES_VALUE = {"--permission-mode", "-s", "--sandbox", "--mode", "--approval-mode",
                          "--add-dir", "--include-directories", "--session", "-S", "--agent", "--agent-file", "--skills-dir",
-                         "--model", "-m", "--dir", "--format", "--variant",
+                         "--model", "-m", "--effort", "--dir", "--format", "--variant",
                          "--print-timeout", "--agent", "--project", "--log-file",
                          "--output-file", "--conversation", "--continue-id",
                          "--output-format", "--output", "--of", "--cwd",
@@ -1384,7 +1394,23 @@ def _build_claude_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
             and os.path.isfile(hook_settings_file.strip())
             and not os.path.islink(hook_settings_file.strip())):
         hook_settings_flags = ["--settings", hook_settings_file.strip()]
+    safe_edit_tools = []
+    if inv.permission == "safe-edit":
+        _extra = inv.extra_args or ()
+        _has_allowed = any(
+            str(tok).startswith(("--allowedTools", "--allowed-tools"))
+            for tok in _extra
+        )
+        if not _has_allowed:
+            safe_edit_tools = [
+                "--allowedTools",
+                "Edit,Write,MultiEdit,NotebookEdit,Read,Grep,Glob,LS,"
+                "Bash(python:*),Bash(python3:*),Bash(py:*),Bash(pytest:*),"
+                "Bash(git status*),Bash(git diff*),Bash(git log*),"
+                "Bash(git show*),Bash(git rev-parse*),Bash(git branch*)",
+            ]
     common = (perm + model_flag + effort_flag
+              + safe_edit_tools
               + strip_boundary_flags(inv.cli, inv.extra_args)
               + root_flags
               + setting_sources
@@ -1780,6 +1806,36 @@ def _codex_env_override() -> dict | None:
     return {"OPENAI_API_KEY": None}
 
 
+def effective_effort(cli: str | None, model: str | None,
+                     effort: str | None) -> tuple[str | None, str | None]:
+    """Return ``(applied_effort, downgrade_warning)`` after backend clamping."""
+    if not effort:
+        return None, None
+    backend = (cli or "").strip().lower()
+    raw_effort = str(effort).strip().lower()
+    canon = (model or "").strip().lower()
+    if backend == "codex":
+        if canon and not canon.startswith("gpt-6") and raw_effort in ("xhigh", "max"):
+            return (
+                "high",
+                f"requested effort {effort!r} was downgraded to 'high' for Codex model "
+                f"{model!r} (only GPT-6 family models accept {effort!r})",
+            )
+        if not canon and raw_effort in ("xhigh", "max"):
+            return (
+                "high",
+                f"requested effort {effort!r} was downgraded to 'high' for Codex "
+                "(ambient/default model is not verified as GPT-6)",
+            )
+    if backend == "agy" and raw_effort in ("xhigh", "max"):
+        return (
+            "high",
+            f"requested effort {effort!r} was downgraded to AGY thinking level 'high' "
+            f"for model {model or '(default)'!r}",
+        )
+    return raw_effort, None
+
+
 def _build_codex_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
     from _profiles import account_launch_policy
     account_flags, profile_env = account_launch_policy(inv)
@@ -1800,10 +1856,7 @@ def _build_codex_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
     # Global `-c` flags precede the subcommand.
     effort_flag = []
     if inv.effort:
-        _e = inv.effort
-        _canon = (selection["canonical"] or "").lower()
-        if not _canon.startswith("gpt-6") and _e in ("xhigh", "max"):
-            _e = "high"
+        _e, _ = effective_effort("codex", selection["canonical"], inv.effort)
         effort_flag = ["-c", f"model_reasoning_effort={_e}"]
     env = {**(env_override_for("codex") or {}), **profile_env} or None
     passthrough = strip_codex_model_selectors(inv.extra_args)
@@ -1832,7 +1885,11 @@ def _build_cursor_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
         "--model", model, "--output-format", "json", "-p", _concatenated_prompt(inv)], env_override
 
 
-def _opencode_permission_env(permission: str) -> str:
+def _opencode_permission_env(
+    permission: str,
+    cwd: str | None = None,
+    read_roots: tuple[str, ...] = (),
+) -> str:
     """Return a strict OpenCode permission policy for a Summon tier.
 
     OpenCode defaults most tools to ``allow``.  The CLI documents ``--auto`` as
@@ -1843,13 +1900,27 @@ def _opencode_permission_env(permission: str) -> str:
     """
     if permission == "yolo":
         return json.dumps({"*": "allow"}, separators=(",", ":"))
+    roots = [r for r in (cwd, *(read_roots or ())) if isinstance(r, str) and r.strip()]
+    if roots:
+        ext_policy: str | dict[str, str] = {"*": "deny"}
+        for raw_root in roots:
+            abs_root = os.path.abspath(raw_root)
+            fwd_root = abs_root.replace("\\", "/").rstrip("/")
+            native_root = abs_root.rstrip("/\\")
+            for root_variant in (native_root, fwd_root):
+                if root_variant:
+                    ext_policy[root_variant] = "allow"
+                    ext_policy[f"{root_variant}/*"] = "allow"
+                    ext_policy[f"{root_variant}/**"] = "allow"
+    else:
+        ext_policy = "deny"
     # OpenCode evaluates matching object rules in order, with the last match
     # winning.  Put the catch-all deny first and the explicitly allowed tools
     # after it; placing ``*`` last would silently deny the tools we intended to
     # make usable in a headless read-only turn.
     allowed = {
         "*": "deny",
-        "external_directory": "deny",
+        "external_directory": ext_policy,
         "read": "allow",
         "glob": "allow",
         "grep": "allow",
@@ -2228,7 +2299,9 @@ def _build_opencode_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
     # documented OpenCode flags preserve the injected config while disabling
     # project discovery and external plugin/skill loading for this invocation.
     env = {
-        "OPENCODE_PERMISSION": _opencode_permission_env(inv.permission),
+        "OPENCODE_PERMISSION": _opencode_permission_env(
+            inv.permission, cwd=inv.cwd, read_roots=inv.read_roots,
+        ),
         "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
         "OPENCODE_PURE": "1",
         "OPENCODE_DISABLE_EXTERNAL_SKILLS": "1",
@@ -2247,7 +2320,46 @@ def _build_opencode_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
 # --- Z.AI ZCode ---------------------------------------------------------------
 
 _ZCODE_RESUME_RE = re.compile(r"^sess_[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
+_ZCODE_PROVIDER_MODEL_RE = re.compile(r"^[^/\s]+/[^/\s]+(?:/[^/\s]+)?$")
+_ZCODE_EFFORT_LEVELS = frozenset({"low", "medium", "high", "max"})
+_ZCODE_ZAI_PROVIDERS = frozenset({
+    "zai-coding-plan", "zai-api", "zai", "glm-coding-plan-global", "glm-coding-plan-china",
+})
+# Update when Z.AI adds official GLM models to ZCode's `zai-api` template.
+_ZCODE_OFFICIAL_GLM_CASING = {
+    m.lower(): m for m in (
+        "GLM-5.3", "GLM-5.3-Flash", "GLM-5V-Turbo", "GLM-5.2", "GLM-5.1",
+        "GLM-5.1-Highspeed", "GLM-5", "GLM-5-Turbo", "GLM-4.7", "GLM-4.7-FlashX",
+        "GLM-4.7-Flash", "GLM-4.6", "GLM-4.5-Air", "GLM-4.5", "GLM-4.6V",
+        "GLM-4.6V-Flash", "GLM-4.6V-FlashX", "GLM-4.1V-Thinking-FlashX",
+        "GLM-4.1V-Thinking-Flash", "GLM-4-FlashX-250414", "GLM-4-Flash-250414",
+        "GLM-4V-Flash",
+    )
+}
 _ZCODE_FIXED_PROMPT = "Follow the attached task exactly and finish with the required report."
+
+
+def normalize_zcode_model_selector(model: str | None) -> str | None:
+    """Normalize a `provider/model` selector for `zcode-app-cli` (`kingsword09/zcode-cli`).
+
+    Returns None when `model` is not a valid `<provider>/<model>` selector.
+    Normalizes official GLM model IDs (e.g. `glm-5.3-flash` -> `GLM-5.3-Flash`)
+    only when the provider belongs to the official Z.AI provider family
+    (`zai-coding-plan`, `zai-api`, etc.), preserving lowercase selectors for
+    third-party providers such as `openrouter/` or `nous/`.
+    """
+    if not isinstance(model, str):
+        return None
+    trimmed = model.strip()
+    if not _ZCODE_PROVIDER_MODEL_RE.fullmatch(trimmed):
+        return None
+    provider, model_id = trimmed.split("/", 1)
+    prov_lower = provider.lower()
+    if prov_lower in _ZCODE_ZAI_PROVIDERS or prov_lower.startswith(("zai-", "builtin:", "account:")):
+        canon_model = _ZCODE_OFFICIAL_GLM_CASING.get(model_id.lower(), model_id)
+    else:
+        canon_model = model_id
+    return f"{provider}/{canon_model}"
 _ZCODE_STALE_ATTACHMENT_TTL_SECONDS = 60 * 60
 _ZCODE_STALE_ATTACHMENT_SCAN_LIMIT = 32
 
@@ -2392,12 +2504,12 @@ def zcode_invocation_preflight(inv: AgentInvocation) -> dict | None:
     """
     if inv.cli != "zcode":
         return None
-    if inv.model:
+    if inv.model and normalize_zcode_model_selector(inv.model) is None:
         return {
             "error_kind": "zcode_model_selector_unsupported",
             "message": (
-                "zcode has no reviewed headless --model selector; select the model "
-                "in ZCode itself and leave the Summon model field unset"),
+                "zcode requires a provider/model selector (e.g. zai-coding-plan/GLM-5.3-Flash "
+                "via zcode-app-cli) or an unset Summon model field; bare model IDs are not supported"),
         }
     if inv.permission == "safe-edit":
         return {
@@ -2436,6 +2548,11 @@ def zcode_invocation_preflight(inv: AgentInvocation) -> dict | None:
             "error_kind": "zcode_resume_id_invalid",
             "message": "ZCode resume id must be a sess_ identifier",
         }
+    if inv.effort and str(inv.effort).strip().lower() not in _ZCODE_EFFORT_LEVELS:
+        return {
+            "error_kind": "invalid_input",
+            "message": f"ZCode effort must be one of {sorted(_ZCODE_EFFORT_LEVELS)}, got {inv.effort!r}",
+        }
     return None
 
 
@@ -2443,13 +2560,11 @@ def _build_zcode_args(inv: AgentInvocation, *, resource_register=None
                       ) -> tuple[str, list, dict | None]:
     """Build one headless ZCode invocation without reading local ZCode config.
 
-    ZCode does not expose an argv model selector.  Consequently this backend
-    never accepts an explicit Summon model pin: its configured provider/model
-    remains an unverified local selection until a future provider-authored
-    terminal receipt proves it.  ``build`` and ``edit`` modes are deliberately
-    rejected because ZCode's headless permission client can block writes while
-    returning exit zero; broad, disposable work uses its explicit ``yolo``
-    mode instead.
+    Supports `<provider>/<model>` selectors and `--effort` via `zcode-app-cli`
+    (`kingsword09/zcode-cli`) while rejecting bare model IDs.  ``build`` and
+    ``edit`` modes are deliberately rejected because ZCode's headless permission
+    client can block writes while returning exit zero; broad, disposable work
+    uses its explicit ``yolo`` mode instead.
     """
     refusal = zcode_invocation_preflight(inv)
     if refusal:
@@ -2460,9 +2575,14 @@ def _build_zcode_args(inv: AgentInvocation, *, resource_register=None
     except Exception as exc:  # noqa: BLE001 - discovery must not expose internals
         raise ValueError("ZCode CLI discovery failed") from exc
     if target is None:
+        env_override = os.environ.get("ZCODE_CLI", "").strip()
+        if env_override and Path(env_override).suffix.lower() in {".cmd", ".bat", ".ps1"}:
+            raise ValueError(
+                "ZCODE_CLI points to a shell wrapper without a sibling zcode-app-cli bundle; "
+                "set ZCODE_CLI directly to zcode.js or zcode.cjs")
         raise ValueError(
             "ZCode CLI was not found; set ZCODE_CLI to its local executable/bundle "
-            "or install the ZCode desktop app")
+            "or install zcode-app-cli / the ZCode desktop app")
     text = _resume_prompt(inv) if inv.resume_id else _concatenated_prompt(inv)
     attachment = _write_zcode_attachment(text)
     try:
@@ -2472,15 +2592,26 @@ def _build_zcode_args(inv: AgentInvocation, *, resource_register=None
             except Exception as exc:  # noqa: BLE001 - do not orphan prompt material
                 raise ValueError(
                     "zcode prompt attachment: controlled cleanup registration failed") from exc
-        args = [*target.prefix_args, "--cwd", inv.cwd, "--json", "--no-color"]
+        args = [*target.prefix_args]
+        args += strip_boundary_flags("zcode", inv.extra_args)
+        args += ["--cwd", inv.cwd, "--json", "--no-color"]
         args += permission_flags("zcode", inv.permission)
         # plan turns subtract write/shell tools as defence in depth. This is a
         # deny list, not a claim that ZCode supplies an allowlist sandbox.
         if inv.permission == "read-only":
             args += ["--disallowed-tools", "Write,Edit,Bash,Shell"]
+        if inv.model:
+            norm_model = normalize_zcode_model_selector(inv.model)
+            if not norm_model:
+                raise ValueError(f"Unsupported ZCode model selector: {inv.model!r}")
+            args += ["--model", norm_model]
+        if inv.effort:
+            eff = str(inv.effort).strip().lower()
+            if eff not in _ZCODE_EFFORT_LEVELS:
+                raise ValueError(f"Unsupported ZCode effort level: {inv.effort!r}")
+            args += ["--effort", eff]
         if inv.resume_id:
             args += ["--resume", inv.resume_id]
-        args += strip_boundary_flags("zcode", inv.extra_args)
         args += ["--attach", attachment, "--prompt", _ZCODE_FIXED_PROMPT]
         return target.command, args, {
             "SUMMON_ZCODE_DISCOVERY_SOURCE": target.source,
@@ -3931,6 +4062,20 @@ def _kimi_set_toml_value(text: str, section: str, key: str, value: str) -> str:
     return "".join(lines)
 
 
+_KIMI_EFFORT_MODELS = frozenset({
+    "k3", "kimi-code/k3",
+    "k3-256k", "kimi-code/k3-256k",
+    "k3.1-pro", "kimi-code/k3.1-pro",
+})
+
+
+def kimi_model_supports_effort(model: str | None) -> bool:
+    """Return whether ``model`` is in the reviewed Kimi K3 effort-capable family."""
+    if not isinstance(model, str):
+        return False
+    return model.strip().lower() in _KIMI_EFFORT_MODELS
+
+
 def _kimi_model_key(model: str | None, config: str) -> str | None:
     """Resolve a Kimi model alias to the config section name, if known."""
     selected = (model or "").strip()
@@ -3940,6 +4085,7 @@ def _kimi_model_key(model: str | None, config: str) -> str | None:
         selected = match.group(1).strip() if match else ""
     if not selected:
         return None
+    selected = selected.lower()
     if "/" not in selected:
         selected = f"kimi-code/{selected}"
     return selected
@@ -3981,10 +4127,11 @@ def _configure_kimi_effort(profile: str, model: str | None, effort: str | None) 
         section_text = match.group(0) if match else ""
     supports = bool(section_text and re.search(
         rf"support_efforts\s*=.*[\"']{re.escape(mapped)}[\"']", section_text))
-    # Minimal configs used by older Kimi installs may omit the model table; the
-    # two K3 aliases are still safe to configure because the provider advertises
-    # these levels. Unknown/K2.7 models are intentionally left alone.
-    supports = supports or selected in {"kimi-code/k3", "kimi-code/k3-256k"}
+    # Minimal configs used by older Kimi installs or unit tests may omit the model
+    # table; only fall back to the static K3-family allowlist when no model section
+    # exists in config.toml.
+    if not section_text and kimi_model_supports_effort(selected):
+        supports = True
     if not supports:
         return None
 
@@ -4254,16 +4401,17 @@ def model_backend_compatibility(cli: str, model: str | None) -> dict | None:
     if not isinstance(cli, str) or not isinstance(model, str) or not model.strip():
         return None
     if cli == "zcode":
+        if normalize_zcode_model_selector(model) is not None:
+            return None
         return {
             "error_kind": "zcode_model_selector_unsupported",
             "backend": cli,
             "model_requested": model,
-            "compatible_backends": ["openai-compat", "opencode"],
-            "recommended_backend": "opencode",
+            "compatible_backends": ["openai-compat", "opencode", "zcode"],
+            "recommended_backend": "zcode",
             "message": (
-                "ZCode has no reviewed headless per-call model selector or terminal "
-                "provider-authored served-model receipt; remove `model:` for the "
-                "generic native preview seat, or use an explicit OpenCode/direct "
+                "ZCode requires a <provider>/<model> selector (e.g. zai-coding-plan/GLM-5.3-Flash "
+                "via zcode-app-cli), an unset `model:` field, or an explicit OpenCode/direct "
                 "Coding Plan model seat"),
         }
     normalized = model.strip().lower()

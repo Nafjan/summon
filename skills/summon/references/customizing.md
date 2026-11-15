@@ -43,8 +43,20 @@ values are validated before anything is written. `--new-agent` never overwrites;
 
 ### Multiple Claude and Codex accounts
 
-When one backend has multiple local accounts or installations, keep the paths and
-credentials out of the repository. Put named entries in `~/.agents/summon-profiles.json`:
+When one backend has multiple local accounts (for example, a personal and a work login),
+keep the paths and credentials out of the repository. You can initialize a private login
+profile in one command or edit `~/.agents/summon-profiles.json` directly:
+
+```text
+summon auth init claude --profile claude-work
+summon auth init codex --profile codex-work
+```
+
+`summon auth init` creates an isolated directory under `~/.agents/summon-account-homes/<profile>`
+(with `cli_auth_credentials_store = "file"`, `forced_login_method = "chatgpt"`, and
+`model_provider = "openai"` preconfigured in `config.toml` for Codex so credentials are stored
+inside that profile's directory rather than a shared OS keyring) and registers it in
+`~/.agents/summon-profiles.json`:
 
 ```json
 {
@@ -64,21 +76,70 @@ credentials out of the repository. Put named entries in `~/.agents/summon-profil
 ```
 
 Create each directory outside your project, with access restricted to your OS user.
-Do not copy credentials from your personal account. Sign in once to each chosen account:
+Do not copy credentials from your personal account. Sign in once to each chosen account
+and verify all configured profiles:
 
 ```text
 summon auth repair claude --profile claude-work --allow-auth-repair
-summon auth status --cli claude --profile claude-work --probe --json
+summon auth status claude --probe --json
 summon auth repair codex --profile codex-work --allow-auth-repair
-summon auth status --cli codex --profile codex-work --probe --json
+summon auth status codex --probe --json
 ```
 
-The vendor opens its sign-in flow; choose the intended account yourself. With a profile,
-`auth status --probe` runs only the vendor's auth-status command, not a model prompt.
-Without `--probe`, it checks local profile resolution and reports auth as unverified.
-Status output omits emails, organization identifiers, keys, and raw vendor output.
+The vendor opens its sign-in flow; choose the intended account yourself. Running
+`summon auth status claude --probe` or `summon auth status codex --probe` (without
+`--profile`) inspects both the default home and every configured profile for that backend
+in `~/.agents/summon-profiles.json`. With a profile, `auth status --probe` runs only the
+vendor's auth-status command, not a model prompt. Without `--probe`, it checks local
+profile resolution and reports auth as unverified. Status output omits emails,
+organization identifiers, keys, and raw vendor output. If two profiles intentionally use
+the same vendor OAuth account (for example, a general profile and a model-restricted
+alias), point both at the same `config_dir` so OAuth refresh-token rotation in one
+directory does not invalidate the other.
 
-Then pass `--profile claude-work` or `--profile codex-work` on a dispatch. A trusted local
+#### Using secondary profiles directly from your shell (outside Summon)
+
+If you also want to invoke `claude` or `codex` interactively in your terminal as a
+secondary profile, add lightweight shell wrappers or `.cmd` shims on `PATH` that bind
+`CLAUDE_CONFIG_DIR` or `CODEX_HOME` for that invocation:
+
+```powershell
+# PowerShell ($PROFILE)
+function claude-work {
+    $prev = $env:CLAUDE_CONFIG_DIR
+    try {
+        $env:CLAUDE_CONFIG_DIR = "$HOME\.agents\summon-account-homes\claude-work"
+        claude --setting-sources user @args
+    } finally {
+        $env:CLAUDE_CONFIG_DIR = $prev
+    }
+}
+
+function codex-work {
+    $prev = $env:CODEX_HOME
+    try {
+        $env:CODEX_HOME = "$HOME\.agents\summon-account-homes\codex-work"
+        codex -c 'cli_auth_credentials_store="file"' -c 'forced_login_method="chatgpt"' -c 'model_provider="openai"' @args
+    } finally {
+        $env:CODEX_HOME = $prev
+    }
+}
+```
+
+```sh
+# POSIX sh / bash / zsh
+claude_work() {
+  CLAUDE_CONFIG_DIR="$HOME/.agents/summon-account-homes/claude-work" \
+    claude --setting-sources user "$@"
+}
+
+codex_work() {
+  CODEX_HOME="$HOME/.agents/summon-account-homes/codex-work" \
+    codex -c 'cli_auth_credentials_store="file"' -c 'forced_login_method="chatgpt"' -c 'model_provider="openai"' "$@"
+}
+```
+
+Then pass `--profile claude-work` or `--profile codex-work` on a Summon dispatch. A trusted local
 agent can also declare `profile: claude-work`. A missing profile, wrong backend, or failed
 login never selects another account automatically. Existing agents without a profile
 keep their current routing. Use neutral names if you share receipts: profile names are

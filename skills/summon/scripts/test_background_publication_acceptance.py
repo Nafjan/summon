@@ -174,14 +174,42 @@ def test_actual_background_bundle_preserves_source_and_publication_boundaries(tm
         owned.close()
 
 
-def test_background_out_is_refused_before_detaching_or_writing_output(tmp_path):
+def test_background_out_enforces_lock_and_publishes_sanitized_receipt(tmp_path):
+    import run_subagent as _rs
     env, argv, jobs, shim, _prompt, workspace = _fixture(tmp_path, "claude-opus-5")
     output = tmp_path / "public-out.json"
+    _rs._release_current_out_lock()
+    try:
+        owner = _rs._acquire_out_lock(str(output))
+        assert owner is None
+        collided = subprocess.run(argv + ["--out", str(output)], cwd=workspace, env=env,
+                                  capture_output=True, text=True, encoding="utf-8", timeout=30,
+                                  **run_flags())
+        assert collided.returncode != 0
+        assert not jobs.exists() and not output.exists()
+        assert not (shim.parent / "invocations.txt").exists()
+        _no_private_marker(collided.stdout)
+        _no_private_marker(collided.stderr)
+    finally:
+        _rs._release_current_out_lock()
+
     parent = subprocess.run(argv + ["--out", str(output)], cwd=workspace, env=env,
-                            capture_output=True, text=True, encoding="utf-8", timeout=30,
+                            capture_output=True, text=True, encoding="utf-8", timeout=45,
                             **run_flags())
-    assert parent.returncode != 0
-    assert not jobs.exists() and not output.exists()
-    assert not (shim.parent / "invocations.txt").exists()
-    _no_private_marker(parent.stdout)
-    _no_private_marker(parent.stderr)
+    assert parent.returncode == 0, "background --out parent refused unlocked fixture"
+    handle = json.loads(parent.stdout)
+    assert handle["status"] == "background"
+    assert Path(handle["out_file"]).resolve() == output.resolve()
+    owned = _OwnedDispatcher(handle["pid"], env)
+    try:
+        assert owned.wait(45000), "detached --out fixture did not reach terminal exit"
+        terminal = _jobs.read_json(_jobs.result_path(str(jobs), handle["job_id"]))
+        assert terminal is not None and terminal["status"] == "success"
+        assert output.is_file(), "detached --out fixture did not write out_file"
+        assert not Path(str(output) + ".active.lock").exists()
+        observation = continuation.read_launch_binding(str(jobs), handle["job_id"])
+        for public in (parent.stdout, parent.stderr, terminal, output.read_text(encoding="utf-8")):
+            _no_private_marker(public, observation)
+        assert json.loads(output.read_text(encoding="utf-8"))["status"] == "success"
+    finally:
+        owned.close()

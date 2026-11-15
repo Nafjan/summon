@@ -8,6 +8,45 @@ allowed-tools: Bash Read
 
 Spawns external CLI AIs (`claude`, `cursor-agent`, `codex`, `gemini`, `kimi`, `agy`, `arkcli`, `opencode`, and `zcode`) as isolated sub-agents with dedicated context. Supports session resume, per-call model/effort overrides, isolated git worktrees, background dispatch, structured report parsing (`summary`, `confidence`, `files_touched`), loose-file provenance, and provider cost/usage telemetry. Optional local diagnostics (`summon telemetry`, `summon stats`) are disabled by default, bounded/sanitized, and never sent anywhere without an explicit user action.
 
+## Zero-Error Quickstart for Calling Agents (Read This First)
+
+### 1. How to Invoke Summon (Never wrap `summon.cmd` in `cmd /c` or `cmd //c`)
+Always invoke `run_subagent.py` directly through Python with `--prompt-file "<file>"` so shell quoting and OS command-line length limits never break across Git Bash, PowerShell, or POSIX shells (`<SKILL_DIR>` is the directory containing this `SKILL.md`, e.g. `~/.agents/skills/summon` or `~/.claude/skills/summon`):
+
+```bash
+# Windows (Git Bash, PowerShell, or cmd — use `py -3` or `python`):
+py -3 "<SKILL_DIR>/scripts/run_subagent.py" dispatch --agent <seat> --cwd "<abs-path>" --prompt-file "<file>"
+
+# macOS / Linux:
+python3 "<SKILL_DIR>/scripts/run_subagent.py" dispatch --agent <seat> --cwd "<abs-path>" --prompt-file "<file>"
+```
+
+- **Do NOT run `cmd //c "...\summon.cmd"` from Git Bash or PowerShell** — `cmd.exe` strips quotes when multiple arguments are quoted. (`summon.ps1` invokes `py -3 run_subagent.py` directly with `@args` and preserves inline/multiline `--prompt`; `summon.cmd` is for raw `cmd.exe` only and requires `--prompt-file` or `--prompt -`.)
+
+### 2. Worktrees, `--isolated-lane`, and `--allow-tool-credentials`
+- **Let Summon create the worktree (preferred for all `yolo` / writer seats):** Pass `--cwd "<repo-root>" --worktree <lane-name>` (`<lane-name>` uses `[A-Za-z0-9._-]`). Summon creates the isolated git worktree automatically and satisfies all `yolo` isolation checks for every backend (`opencode`, `kimi`, `agy`, `zcode`).
+- **If you already created a disposable worktree/copy yourself (or reuse an existing worktree path via `--cwd "<worktree-path>"` without passing `--worktree`):** You **must** add **`--isolated-lane`** when dispatching `opencode` or `zcode` in `yolo` mode (e.g., `zai-glm-5-3-flash-opencode`, `zcode-native`). (`--isolated-lane` is also harmless if passed alongside `--worktree`.)
+- **When to pass `--allow-tool-credentials`:** Required for `zcode` in `yolo` mode (`zcode-native`), and required for `opencode` in `yolo` mode only when bridging a Summon-managed `openrouter/` or `nous/` key.
+
+### 3. Ready-to-Use Seats (Default Pinned Models & Copy-Paste Launch Patterns)
+
+| Seat (`--agent`) | Backend | Default Pinned Model & Effort | Tier | Required Flags & Copy-Paste Launch Pattern |
+|---|---|---|---|---|
+| `sol-review` | `codex` | `gpt-6.1-sol` (`high`, exact) | `read-only` | `--agent sol-review --cwd "<repo>" --prompt-file "<f>"` |
+| `astra` | `codex` | `gpt-6-astra` (`high`, exact) | `read-only` | `--agent astra --cwd "<repo>" --prompt-file "<f>"` |
+| `luna-review` | `codex` | `gpt-6-luna` (`high`, exact) | `read-only` | `--agent luna-review --cwd "<repo>" --prompt-file "<f>"` |
+| `fable` | `claude` | `claude-fable-5-1` (`high`, exact) | `read-only` | `--agent fable --cwd "<repo>" --prompt-file "<f>"` (pass `--profile fable` only if `summon profile list` shows `fable`) |
+| `architect` / `planner` / `security-auditor` | `claude` | `claude-opus-5` (`high`, exact) | `read-only` | `--agent architect --cwd "<repo>" --prompt-file "<f>"` |
+| `implementer` | `claude` | `claude-sonnet-5-5` (`high`) | `safe-edit` | `--agent implementer --worktree <name> --cwd "<repo>" --prompt-file "<f>"` |
+| `pair` / `editor` | `claude` | `claude-sonnet-5` (`high`) | `safe-edit` | `--agent pair --worktree <name> --cwd "<repo>" --prompt-file "<f>"` *(Note: `claude` `safe-edit` auto-approves `Write`/`Edit` in `-p` mode; use `codex` `safe-edit` or `--permission yolo` in a worktree if the lane must run `Bash`/`pytest`)* |
+| `kimi-coder` / `kimi-worker` | `kimi` | `kimi-code/k3.1-pro` (`max` effort already pinned) | `yolo` | `--agent kimi-coder --worktree <name> --cwd "<repo>" --prompt-file "<f>"` (no `--model` override needed for K3.1 Pro!) |
+| `kimi-k27-coder` | `opencode` | `nous/kimi-k2.7` (`high`) | `safe-edit` | `--agent kimi-k27-coder --worktree <name> --cwd "<repo>" --prompt-file "<f>"` (no `--isolated-lane` needed at `safe-edit`) |
+| `zcode-native` (GLM via `zcode-app-cli`) | `zcode` | Saved ZCode default (or pass `--model zai-coding-plan/GLM-5.3-Flash`) | `yolo` | `--agent zcode-native --model zai-coding-plan/GLM-5.3-Flash --worktree <name> --allow-tool-credentials --cwd "<repo>" --prompt-file "<f>"` (or `--isolated-lane` if `--cwd` is already a disposable worktree) |
+| `glm-coder` | `opencode` | `coding-plan/glm-5-3-flash` (`high`) | `safe-edit` | `--agent glm-coder --worktree <name> --cwd "<repo>" --prompt-file "<f>"` (no `--isolated-lane` needed at `safe-edit`) |
+| `deepseek-r8-review` | `opencode` | `coding-plan/deepseek-v4-pro` (`high`) | `read-only` | `--agent deepseek-r8-review --cwd "<repo>" --prompt-file "<f>"` |
+| `zai-glm-5-3-flash-opencode` | `opencode` | `zai-coding-plan/glm-5.3-flash` (`high`) | `yolo` | `--agent zai-glm-5-3-flash-opencode --worktree <name> --cwd "<repo>" --prompt-file "<f>"` (or `--isolated-lane` if `--cwd` is already a disposable worktree) |
+| `argon-reviewer` / `flash-reviewer` | `agy` | `gemini-4-argon-high` / `gemini-3.8-flash-high` | `yolo` | `--agent argon-reviewer --worktree <name> --cwd "<repo>" --prompt-file "<f>"` |
+
 ## Public GitHub privacy boundary
 
 Keep local diagnostics out of public GitHub text. Do not publish usernames, email addresses, absolute paths, host names, process IDs, profile or plugin labels, account or billing details, telemetry state, session IDs, prompts, raw output, credentials, per-run receipts, machine hashes, drift inventories, or unsanitized screenshots. Use placeholders such as `<project-root>`, `<session-id>`, and `<sha256>`, and report aggregate results instead of a workstation inventory. Store release evidence outside the source tree.
@@ -31,9 +70,9 @@ Use Summon in a goal-directed loop: inspect, delegate, check evidence, then choo
 - **[fan-out.md](references/fan-out.md)** - Batch `--manifest` swarms and `--council` consensus
 - **[examples/](examples/)** - Document-audit schema, manifest, question, and role-specialized council agents
 
-**Script Path**: On Windows, use `{SKILL_DIR}\scripts\summon.cmd` (requires `--prompt-file` for dispatches). On macOS/Linux, use `python3 {SKILL_DIR}/scripts/run_subagent.py` (Python 3.10+).
+**Script Path**: Prefer `py -3 "{SKILL_DIR}/scripts/run_subagent.py"` on Windows (or `python3 "{SKILL_DIR}/scripts/run_subagent.py"` on macOS/Linux). `{SKILL_DIR}\scripts\summon.cmd` is for raw `cmd.exe` only and requires `--prompt-file` for dispatches.
 
-**Command surface**: accepts git-style subcommands — `dispatch` (default), `list [--for TASK]`, `agents validate`, `models`, `doctor`, `onboard`, `auth status|repair`, `manifest FILE`, `mission start|status|watch|steer|reply|resume|cancel|list`, `memory search QUERY`, `council`, `deliberate`, `workspace`, `chat`, `swarm`, `agent new|set NAME`, `role propose|approve|list|resolve`, `jobs list|status|watch|wait|extend|cancel|steer|resume|revalidate`, `wait [--all]`, `worktree gc`, `telemetry enable|disable|status|clear|stats`, `stats`, `usage status|import|refresh|export|example`, `result project|validate|consume`, `fleet propose|validate|inspect|explain|approval`, `bug-report`, `version`. Legacy flat flags work unchanged.
+**Command surface**: accepts git-style subcommands — `dispatch` (default), `list [--for TASK]`, `agents validate`, `models`, `doctor`, `onboard`, `auth status|init|repair`, `manifest FILE`, `mission start|status|watch|steer|reply|resume|cancel|list`, `memory search QUERY`, `council`, `deliberate`, `workspace`, `chat`, `swarm`, `agent new|set NAME`, `role propose|approve|list|resolve`, `jobs list|status|watch|wait|extend|cancel|steer|resume|revalidate`, `wait [--all]`, `worktree gc`, `telemetry enable|disable|status|clear|stats`, `stats`, `usage status|import|refresh|export|example`, `result project|validate|consume`, `fleet propose|validate|inspect|explain|approval`, `bug-report`, `version`. Legacy flat flags work unchanged.
 
 ## CLI-Specific Notes
 
@@ -43,9 +82,10 @@ Use Summon in a goal-directed loop: inspect, delegate, check evidence, then choo
 
 | Parameter | Source |
 |-----------|--------|
-| `--agent` | Agent name from user request (run `--list` or `--list --for <task>` first if unspecified) |
-| `--prompt` / `--prompt-file` | Task instruction part (prefer `--prompt-file` for multiline or large prompts; Windows caps `CreateProcess` command lines at `32,767` characters) |
-| `--cwd` | Current working directory (absolute path) |
+| `--agent` / ad-hoc `--cli` | Roster agent name (`--list` / `--list --for <task>`), or omit `--agent` and pass `--cli <backend>` directly (uses `--permission`, default `read-only`) |
+| `--permission` | Ad-hoc `--cli` permission tier (`read-only`, `safe-edit`, `yolo`; refused when `--agent` is set — use `--max-permission` to clamp a roster agent) |
+| `--prompt` / `--prompt-file` | Task instruction text, UTF-8 file, or `-` to read from `stdin` (prefer `--prompt-file` or `-` on `summon.cmd`; `summon.ps1` preserves multiline inline prompts directly) |
+| `--cwd` | Working directory (defaults to current directory when omitted; relative paths are resolved to absolute) |
 
 ## Important: Permission and Timeout
 
@@ -91,26 +131,28 @@ Each seat reports `run_agent`, `permission`, `model`, `effort`, `capability_tier
 
 ### Private backend profiles
 
-Define secondary local account/config profiles in `~/.agents/summon-profiles.json` and select one with `--profile <name>` (or `profile: <name>` in an agent definition). Receipts record only the profile `name`, `cli`, and `sha256` digests (`path_sha256`, `registry_sha256`, `command_sha256`), never raw filesystem paths or credentials.
+Initialize secondary local account/config profiles with `summon auth init <claude|codex> --profile <name>` (or define them in `~/.agents/summon-profiles.json`) and select one with `--profile <name>` (or `profile: <name>` in an agent definition; named Codex profiles require an explicit model in the agent or `--model`). Sign in with `summon auth repair <backend> --profile <name> --allow-auth-repair` and inspect all configured profiles for a backend with `summon auth status <backend> --probe` (or per-profile with `--profile <name>`). When two profile names intentionally use the same OAuth login (such as a general profile and a model-restricted alias), point both at the same `config_dir` so refresh-token rotation does not log the other out. Receipts record only the profile `name`, `cli`, and `sha256` digests (`path_sha256`, `registry_sha256`, `command_sha256`), never raw filesystem paths or credentials. See [references/customizing.md](references/customizing.md#multiple-claude-and-codex-accounts).
 
 ### Recommended cross-vendor roster lanes & decision leads
 
 - **Gemini (`gemini-4-argon-high`, `gemini-3.8-flash-high`)**: `argon-reviewer` targets Gemini 4 Argon (`gemini-4-argon-high`); `flash-reviewer`, `researcher`, `frontend`, `docs-writer`, and `antigravity` target Gemini 3.8 Flash (`gemini-3.8-flash-high`) via `agy`. `agy` has no enforced sandbox: declared `safe-edit` runs with full authority, advisory `read-only` requires `SUMMON_ALLOW_UNENFORCED_READONLY=1`, and forced `--max-permission` clamps are refused. Run `agy` in a disposable clone/`--worktree` with `yolo`.
 - **OpenAI Codex (`gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-luna`, `gpt-6-codex`, `gpt-5.4-codex-mini`)**: `astra` pins `gpt-6-astra`, `sol-review` pins `gpt-6.1-sol`, and `luna-review` pins `gpt-6-luna` at high effort with exact-model verification.
 - **Claude (`claude-opus-5`, `claude-sonnet-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`, `claude-fable-5-1`)**: `architect`/`planner`/`deep-debugger`/`security-auditor` pin `claude-opus-5`; `pair`/`editor`/`quick-reviewer`/`pr-prep` pin `claude-sonnet-5`; `fable` pins `claude-fable-5-1` (`--profile fable`) as the escalation decision lead.
+- **Kimi Code (`kimi-code/k3.1-pro`, `kimi-code/k3`, `kimi-code/kimi-for-coding`)**: `kimi-worker` and `kimi-coder` pin `kimi-code/k3.1-pro` at `effort: max`; `kimi-k27-coder` pins `kimi-code/kimi-for-coding`. `summon models --cli kimi` reads configured models from `~/.kimi-code/config.toml`; if a newly released model fails with `model_not_found`, run `kimi upgrade` (or `kimi update`) followed by `kimi login`.
 - **BytePlus ModelArk Coding Plan (`deepseek-v4-pro`, `glm-5-3-flash`)**: `byteplus-coder` (`deepseek-v4-pro`) and `byteplus-glm-5-3-flash` (`glm-5-3-flash`) run over the subscription `byteplus-coding` route (`/api/coding/v3`, text-only).
 
 ### Step 2: Execute Agent & Capability Boundary
 
 ```bash
-scripts/run_subagent.py --agent <name> --prompt-file <file> --cwd <absolute-path>
+scripts/run_subagent.py --agent <name> --prompt-file <file> --cwd <path>
+scripts/run_subagent.py --cli codex --permission safe-edit --prompt -
 ```
 
-A child does not inherit the parent's connector/MCP surface, interactive browser sessions, or application credentials merely because the parent can use them. Materialize external content into files under `--cwd` and use repeatable `--artifact FILE` to bind loose untracked inputs to the provenance receipt.
+You may omit `--agent` and pass `--cli <backend>` for quick ad-hoc dispatches (`--permission` defaults to `read-only` and is only allowed on ad-hoc `--cli` runs), omit `--cwd` (defaults to current directory) or pass a relative path, pipe stdin with `--prompt -` / `--prompt-file -`, and combine `--background` with `--out <file>` (which locks `<file>` until the detached worker completes). A child does not inherit the parent's connector/MCP surface, interactive browser sessions, or application credentials merely because the parent can use them. Materialize external content into files under `--cwd` and use repeatable `--artifact FILE` to bind loose untracked inputs to the provenance receipt.
 
 ### Step 3: Handle Response & Review-First Boundary
 
-Branch on `status` (`success`, `blocked`, `partial`, `error`), `execution_status`, `verdict` (`block`, `conditional`, `pass`), and top-level `summary`, `confidence`, and `files_touched`. Follow the review-first implementer boundary: children do not commit, push, merge, or reset work, and every child must report `LEFT_BEHIND` (`environment_handoff`) for any temporary files, servers, or worktrees it left behind.
+Check the top-level `overview` summary block first (`status`, `exit_code`, `result_usable`, `model_requested`, `model_served`, `served_model_evidence`, `sandbox_enforced`, `elapsed_ms`, `files_touched_count`, `files_attribution`, `error_kind`, `warning_count`), plus `final_result` / `progress_notes`, `execution_status`, `verdict` (`block`, `conditional`, `pass`), `summary`, `confidence`, and `files_touched`. Use `summon jobs wait --all` (which returns completed report fields directly) or `summon jobs status <id> --full` for unredacted background text. Follow the review-first implementer boundary: children do not commit, push, merge, or reset work, and every child must report `LEFT_BEHIND` (`environment_handoff`) for any temporary files, servers, or worktrees it left behind.
 
 | exit_code | Meaning | Resolution |
 |-----------|---------|------------|
@@ -156,7 +198,7 @@ Use an explicit unit in every invocation: `ms` for milliseconds, `s` for seconds
 | `--doctor`, `--probe`, `--json`, `--version`, `--help` | Check backend CLIs, wrapper deps, git, and install drift (`doctor --json`); `--probe` runs a minimal live check. |
 | `--worktree-gc`, `--gc-base REV`, `--gc-min-age-hours N`, `--gc-apply`, `--gc-ignore-running-jobs` | `worktree gc`: plan (dry run) or apply reclamation of Summon `agents/*` worktrees that are unlocked, idle, clean, and integrated into the base; removal never forces. |
 | `--onboard`, `--subscriptions LIST`, `--reset`, `--no-write` | Detect CLIs and write merge-safe preferences to `~/.agents/summon.json` without storing secrets. |
-| `--auth-action {status,repair}`, `--auth-backend BACKEND`, `--allow-auth-repair`, `--auth-timeout DURATION` | Inspect auth status or run one allowlisted vendor login flow with explicit authorization. |
+| `--auth-action {status,init,repair}`, `--auth-backend BACKEND`, `--allow-auth-repair`, `--auth-timeout DURATION` | Inspect auth status, scaffold a private login profile, or run one allowlisted vendor login flow with explicit authorization. |
 | `--new-agent NAME`, `--set-agent NAME`, `--set KEY=VALUE` | Scaffold or edit an agent definition frontmatter (`run-agent`, `model`, `model-policy`, `permission`, `args`, `profile`, `lifecycle`, `successor`). |
 | `--role-propose ALIAS TARGET`, `--role-approve ALIAS`, `--role-list`, `--role-resolve ALIAS`, `--enable-roles` | Propose, approve, inspect, or opt into private global role aliases. |
 | `--agent NAME`, `--prompt TEXT`, `--prompt-file FILE`, `--cwd DIR` | Core dispatch target, prompt input, and absolute working directory. |
@@ -188,7 +230,7 @@ Use an explicit unit in every invocation: `ms` for milliseconds, `s` for seconds
 |---------|-------|
 | **Fleet (`fleet`)** | `--fleet-action`, `--fleet-file`, `--fleet-lane`, `--fleet-seats`, `--fleet-provider-allowlist`, `--fleet-model-allowlist`, `--fleet-required-capabilities`, `--fleet-permission-ceiling`, `--fleet-data-boundary`, `--fleet-allow-contract-repair`, `--fleet-allow-retry`, `--fleet-allow-fallback`, `--fleet-allow-continuation`, `--fleet-allow-subscription`, `--fleet-allow-credit`, `--fleet-allow-payg`, `--fleet-max-provider-contacts`, `--fleet-max-billable-attempts`, `--fleet-max-parallel`, `--fleet-approval-id`, `--fleet-data-proof`, `--fleet-expires-in`, `--fleet-expect-generation`. Private store overrides: `SUMMON_FLEET_APPROVAL_STORE`, `SUMMON_FLEET_APPROVAL_KEY`. |
 | **Manifest (`manifest`)** | `--manifest FILE`, `--concurrency auto\|default=N\|BACKEND=N,…`, `--results-dir DIR`, optional `--mission-id ID`, `--mission-max-work-tokens N`, `--mission-max-cost-usd USD`. Put `timeout`, `worktree`, `link_deps`, `depends_on`, `files_scope`, `max_permission`, and `forward_handoff` inside manifest JSON. Rejects CLI `--timeout`, `--out`, and `--in-flight-hooks`; use CLI `--results-dir` for per-job envelopes, with a separate directory for each concurrent run. |
-| **Mission (`mission`)** | `summon mission start --objective "..." [--goal "..."] [--coordinator <agent>] [--team A,B] [--plan-file FILE] [--max-waves N] [--mission-max-work-tokens N] [--mission-max-cost-usd USD]` (`--goal` aliases `--objective`; `--objective-file FILE` also supported). `summon mission status\|watch\|steer\|reply\|resume\|cancel\|list <id> [--digest]` (`list` takes no ID; `steer` needs `--message TEXT`, `reply` needs `--question-id QID --answer TEXT`; `watch` accepts `--once`/`--interval SEC`). |
+| **Mission (`mission`)** | `summon mission start --objective "..." [--goal "..."] [--coordinator <agent>] [--team A,B] [--plan-file FILE] [--max-waves N] [--mission-max-work-tokens N] [--mission-max-cost-usd USD]` (`--goal` aliases `--objective`; `--objective-file FILE` also supported). `summon mission status\|watch\|steer\|reply\|resume\|cancel\|list <id> [--digest]` (`list` takes no ID; `steer` needs `--message TEXT`, `reply` needs `--question-id QID --answer TEXT`; `watch` accepts `--once`/`--interval SEC`). Flat syntax: `--mission-action`, `--mission-objective`, `--mission-objective-file`, `--mission-coordinator`, `--mission-team`, `--mission-plan-file`, `--mission-max-waves`, `--mission-no-integrate`, `--mission-digest`, `--mission-message`, `--mission-question-id`, `--mission-answer`, `--mission-task-id`, `--mission-reason`. |
 | **Memory (`memory`)** | `summon memory search <query> [--query <q>] [--limit N]` (use positional query or `--query`); flat syntax: `summon --memory-action search --memory-query <q> --memory-limit N`. Searches project-local memory and handoffs via SQLite FTS5/BM25 with canonical file verification. |
 | **Council (`council`)** | `--council`, `--question`, `--question-file`, `--members`, `--chairman` (default: `architect`), `--chairman-fallback`, `--rounds`, `--quorum`, `--min-successful-members`, `--member-timeout`, `--chair-timeout`, `--overall-timeout`, `--run-dir`, `--resume-run`, `--council-status`, `--pause-after-round`, `--council-context-submit`, `--council-context-file`, `--council-operation-key`, `--council-expect-generation`, `--council-continue`. |
 | **Deliberate (`deliberate`)** | `--deliberate`, `--seats`, `--options`, `--max-attempts`, `--deadline`, `--require-human-approval`, `--text-only-consent`, `--full-authority-consent`, `--context-file`, `--context-observation-file`, `--accept-stale-file`, `--deliberate-status`, `--deliberate-replay`, `--deliberate-recover`, `--deliberate-cancel`, `--command-id`, `--deliberate-open`, `--browser`, `--deliberate-resume`, `--retry-indeterminate`. |
@@ -248,4 +290,4 @@ End every response with the structured `Final report` block (`STATUS`, `SUMMARY`
 ## CLI Selection Priority & Common Mistakes
 
 1. `--cli` argument -> 2. Agent `run-agent` frontmatter -> 3. Auto-detect caller -> 4. Default `codex`.
-- Always pass an absolute `--cwd`, keep referenced files under `--cwd`, and set your host timeout above `--timeout`.
+- `--cwd` defaults to the current working directory (relative paths are resolved automatically); keep referenced files under it and set your host timeout above `--timeout`.

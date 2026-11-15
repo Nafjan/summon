@@ -641,7 +641,7 @@ def _validate_schema_value(schema: str, value: Any) -> None:
                     "reordered", "reconnects", "tools"}
                 or value.get("last_trusted_kind") not in {None} | {
                     "transport_started", "stream_event", "output_text", "tool_activity",
-                    "reconnect", "finalizing", "terminal", "cancelled"}
+                    "reconnect", "step_start", "finalizing", "terminal", "cancelled"}
                 or value.get("last_activity_kind") not in {None, "tool", "generation"}
                 or not all(isinstance(item, int) and not isinstance(item, bool)
                            and item >= 0 for item in value["counts"].values())):

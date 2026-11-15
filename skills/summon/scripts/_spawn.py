@@ -96,6 +96,8 @@ _INTERNAL_PROVIDER_ENV_NAMES = frozenset({
     # the operator-held key through to a vendor CLI child.
     "SUMMON_CHAT_MIGRATION_KEY",
     "SUMMON_JOBS_DIR",
+    "SUMMON_OUT_LOCK_PATH",
+    "SUMMON_OUT_LOCK_TOKEN",
     "SUMMON_MISSION_ID",
     "SUMMON_MISSION_MAX_WORK_TOKENS",
     "SUMMON_MISSION_MAX_COST_USD",

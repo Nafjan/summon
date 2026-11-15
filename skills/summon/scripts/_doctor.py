@@ -120,44 +120,53 @@ def classify_ineligibility(text, backend=None):
     return None
 
 
-# Install/auth hints are static strings shown to humans; they never execute.
+# Install/auth/upgrade hints are static strings shown to humans; they never execute.
 _BACKENDS = {
     "claude": {
         "install": "npm install -g @anthropic-ai/claude-code",
         "auth": "claude auth login",
+        "upgrade": "claude update  (or `npm update -g @anthropic-ai/claude-code`)",
     },
     "codex": {
         "install": "npm install -g @openai/codex",
         "auth": "codex login  (ChatGPT subscription; a stray OPENAI_API_KEY is stripped by default)",
+        "upgrade": "npm update -g @openai/codex",
     },
     "cursor-agent": {
         "install": "https://cursor.com/cli",
         "auth": "cursor-agent login  (or CLI_API_KEY env, forwarded as CURSOR_API_KEY)",
+        "upgrade": "cursor-agent update  (or reinstall from https://cursor.com/cli)",
     },
     "gemini": {
         "install": "npm install -g @google/gemini-cli",
         "auth": "gemini  (first interactive run) or GEMINI_API_KEY",
+        "upgrade": "Frozen in Summon; prefer the `agy` (Antigravity) backend",
     },
     "kimi": {
         "install": "Kimi Code CLI (https://moonshotai.github.io/kimi-code/)",
         "auth": "kimi login",
+        "upgrade": "kimi upgrade  (or `kimi update`, then `kimi login` to refresh models)",
     },
     "agy": {
         "install": "Antigravity CLI (https://antigravity.google)",
         "auth": "agy login  - Windows-only out of the box (ConPTY wrapper); "
                 "POSIX needs AGY_PTY_WRAPPER (see docs)",
+        "upgrade": "Update via Antigravity IDE / installer (https://antigravity.google)",
     },
     "opencode": {
         "install": "npm install -g opencode-ai",
         "auth": "opencode auth login  (or `opencode providers login`)",
+        "upgrade": "opencode upgrade  (or `npm update -g opencode-ai`)",
     },
     "zcode": {
         "install": "Z.AI ZCode desktop app (bundled CLI) or set ZCODE_CLI",
         "auth": "open ZCode and complete its provider sign-in; use `zcode login` when supported by the installed CLI",
+        "upgrade": "Update via Z.AI ZCode desktop app",
     },
     "arkcli": {
         "install": "npm install -g @byteplus/ark-cli",
         "auth": "arkcli auth login",
+        "upgrade": "npm update -g @byteplus/ark-cli",
     },
 }
 
@@ -299,6 +308,42 @@ def _check_backends() -> dict:
         else:
             entry["install"] = _BACKENDS[name]["install"]
         entry["auth_hint"] = _BACKENDS[name]["auth"]
+        if _BACKENDS[name].get("upgrade"):
+            entry["upgrade_hint"] = _BACKENDS[name]["upgrade"]
+        if name == "kimi" and path:
+            try:
+                import re as _re
+                ver_str = versions.get("kimi") or ""
+                m_ver = _re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", ver_str)
+                warnings_list = []
+                if m_ver and int(m_ver.group(1)) < 2:
+                    entry["upgrade_needed"] = True
+                    warnings_list.append(
+                        f"installed kimi CLI ({ver_str}) is older than 2.0; run `kimi upgrade` "
+                        "(or `kimi update`) and `kimi login`"
+                    )
+                from _loader import bundled_roster_dir, list_agents
+                from _resolver import _kimi_configured_models
+                k_cfg = _kimi_configured_models()
+                cfg_models = set(k_cfg.get("models") or ())
+                if cfg_models:
+                    b_dir = bundled_roster_dir()
+                    b_agents = list_agents(b_dir) if b_dir else []
+                    pinned = sorted({
+                        str(a.get("model")) for a in b_agents
+                        if a.get("run_agent") == "kimi" and a.get("model")
+                    })
+                    missing = [m for m in pinned if m not in cfg_models]
+                    if missing:
+                        entry["missing_bundled_models"] = missing
+                        warnings_list.append(
+                            f"bundled Kimi model(s) {', '.join(missing)} not in local config.toml; "
+                            "run `kimi upgrade` (or `kimi update`) and `kimi login` to refresh models"
+                        )
+                if warnings_list:
+                    entry["config_warning"] = "; ".join(warnings_list)
+            except Exception:  # noqa: BLE001 - advisory; never break doctor
+                pass
         # Native ACP transport (gemini/kimi/cursor-agent): whether the INSTALLED
         # version actually speaks it, so a too-old CLI is discovered here
         # rather than when the automatic ACP fallback fires mid-incident.
@@ -561,6 +606,17 @@ def _check_zai_coding_plan() -> dict:
                 "hint": "Z.AI Coding Plan diagnostics are unavailable"}
 
 
+def _check_zcode_config() -> dict:
+    """ZCode local config readiness only; never reads secrets."""
+    try:
+        from _zcode import zcode_config_status
+        return zcode_config_status()
+    except Exception:  # noqa: BLE001 - doctor never raises
+        return {"configured": False, "v2_provider_config_present": False,
+                "cli_config_present": False,
+                "hint": "ZCode config diagnostics are unavailable"}
+
+
 def _check_onboard_prefs() -> dict:
     """Onboard prefs summary (subscriptions only; no secrets)."""
     try:
@@ -593,6 +649,15 @@ def _opencode_cwd_policy(cwd: str | None) -> dict:
     return out
 
 
+def _check_account_profiles(cwd: str | None = None) -> list[dict]:
+    """Enumerate private account profiles without exposing machine paths or secrets."""
+    try:
+        from _profiles import list_profiles
+        return list_profiles(cwd=None)
+    except Exception:  # noqa: BLE001 - doctor never raises
+        return []
+
+
 def doctor(agents_dir: str | None = None, cwd: str | None = None,
            probe: bool = False, probe_runner=None) -> dict:
     backends = _check_backends()
@@ -604,6 +669,7 @@ def doctor(agents_dir: str | None = None, cwd: str | None = None,
         "backends": backends,
         "agy_extras": _check_agy_extras(backends),
         "agents_dir": _check_agents_dir(agents_dir, cwd),
+        "account_profiles": _check_account_profiles(cwd),
         "git": {"found": bool(shutil.which("git"))},
         "billing_guard": {
             "openai_api_key_present": bool(os.environ.get("OPENAI_API_KEY")),
@@ -613,6 +679,7 @@ def doctor(agents_dir: str | None = None, cwd: str | None = None,
         },
         "byteplus_coding": _check_byteplus_coding(),
         "zai_coding_plan": _check_zai_coding_plan(),
+        "zcode_config": _check_zcode_config(),
         "onboard_prefs": _check_onboard_prefs(),
         "read_root_capabilities": dict(_READ_ROOT_CAPABILITIES),
         "opencode_cwd_policy": _opencode_cwd_policy(cwd),
@@ -733,6 +800,10 @@ def render(report: dict) -> str:
                     detail = f"{ver} - installed; eligibility unverified  ({b['path']})"
         lines.append(f"  {mark} {name:<13} {detail}")
         lines.append(f"       auth: {b['auth_hint']}")
+        if b.get("upgrade_hint"):
+            lines.append(f"       upgrade: {b['upgrade_hint']}")
+        if b.get("config_warning"):
+            lines.append(f"       warning: [!!] {b['config_warning']}")
         _auth_plan = auth_repair_plan(name)
         if _auth_plan:
             lines.append("       repair: "
@@ -765,6 +836,18 @@ def render(report: dict) -> str:
         )
         lines.append(f"  shadow : [!!] active roster shadows bundled agent pins: {names_str} "
                      "(re-run `python install.py --target agents --force` to sync)")
+    profiles = report.get("account_profiles") or []
+    if profiles:
+        lines += ["", "account profiles (~/.agents/summon-profiles.json):"]
+        for p in profiles:
+            pmark = "[OK]" if p.get("valid") else "[!!]"
+            pdetail = f"cli={p.get('cli')} auth_mode={p.get('auth_mode')}"
+            if p.get("models"):
+                pdetail += f" models={','.join(p['models'])}"
+            if not p.get("valid") and p.get("error"):
+                pdetail += f" ({p['error']})"
+            lines.append(f"  {pmark} {p.get('name', '?'):<16} {pdetail}")
+            lines.append(f"       check: `{p.get('status_command')}`  |  login: `{p.get('repair_command')}`")
     rr = report.get("read_root_capabilities") or {}
     if rr:
         lines.append("read roots: only %s enforce extra roots at read-only; %s"
@@ -808,6 +891,14 @@ def render(report: dict) -> str:
     else:
         lines.append("  [--] direct text-seat credential not resolvable; "
                      "set ZAI_CODING_API_KEY or configure the official helper")
+    zc = report.get("zcode_config") or {}
+    lines += ["", "zcode native config:"]
+    if zc.get("configured"):
+        v2_mark = "present" if zc.get("v2_provider_config_present") else "absent"
+        cli_mark = "present" if zc.get("cli_config_present") else "absent"
+        lines.append(f"  [OK] provider_config (v2): {v2_mark}; cli config: {cli_mark}")
+    else:
+        lines.append(f"  [--] {zc.get('hint') or 'ZCode local provider config not found'}")
     op = report.get("onboard_prefs") or {}
     lines += ["", "onboard prefs:"]
     if op.get("present"):

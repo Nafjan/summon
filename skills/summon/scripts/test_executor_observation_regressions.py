@@ -176,7 +176,7 @@ def test_kimi_actual_conflict_producer_reaches_final_envelope(
         assert response["served_model_evidence"] == "absent"
         assert any("different models" in warning for warning in response["warnings"])
     else:
-        assert response["model"]["served"] == target
+        assert response["model"]["served"] is None
         assert response["served_model_evidence"] == "inferred"
     if exact:
         assert response["status"] == "blocked"
