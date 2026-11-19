@@ -103,7 +103,7 @@ from _resolver import discover_models, resolve_cli  # noqa: E402
 # Keep a literal assignment: the release-contract parser uses the dispatcher
 # source as a machine-checkable companion.  `_telemetry.SUMMON_VERSION` must be
 # updated in the same release; the release contract checks both literals.
-__version__ = "3.8.1"  # summon dispatcher version (see CHANGELOG.md)
+__version__ = "3.9.0"  # summon dispatcher version (see CHANGELOG.md)
 
 # When set (a --background child), the final JSON goes to this file (atomically,
 # via .tmp + rename) instead of stdout, so the parent can poll for completion.
@@ -457,6 +457,8 @@ def _request_identity(args) -> dict:
         require_exact_model=bool(getattr(args, "require_exact_model", False)),
         link_deps=getattr(args, "link_deps", None),
         link_deps_allow_mutation=bool(getattr(args, "link_deps_allow_mutation", False)),
+        files_scope=(getattr(args, "_files_scope_normalized", None)
+                     or getattr(args, "files_scope", None) or None),
         ad_hoc_permission=getattr(args, "permission", None))
 
 
@@ -786,9 +788,57 @@ def _public_submission_projection(envelope: dict) -> dict:
     return projected
 
 
+def _format_text_footer(obj: dict, invocation, args) -> str:
+    """Build a compact UTF-8 stderr summary + copy-paste resume hint for ``--text``."""
+    import shlex
+
+    status = obj.get("status") or "unknown"
+    cli_name = obj.get("cli") or invocation.cli
+    model_name = obj.get("model_resolved") or obj.get("model") or invocation.model
+    parts = [f"status={status}", f"cli={cli_name}"]
+    if model_name:
+        parts.append(f"model={model_name}")
+    cost = obj.get("cost_usd")
+    if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+        parts.append(f"cost=${cost:.4f}")
+    wt = obj.get("worktree")
+    if isinstance(wt, dict) and wt.get("branch"):
+        parts.append(f"worktree={wt['branch']}")
+    po = obj.get("patch_out")
+    if isinstance(po, dict) and po.get("path"):
+        parts.append(f"patch={po['path']}")
+    lines = ["\n[summon] " + " | ".join(parts)]
+
+    resume = obj.get("resume") if isinstance(obj.get("resume"), dict) else {}
+    sid = resume.get("session_id")
+    rcli = resume.get("cli") or cli_name
+    if rcli in ("claude", "codex", "cursor-agent", "opencode", "zcode") and isinstance(sid, str) and sid.strip():
+        if rcli == "codex" and getattr(invocation, "profile", None):
+            lines.append("resume: unavailable (codex does not allow resuming with a named profile)")
+        else:
+            cmd_parts = ["summon", "dispatch"]
+            if getattr(args, "agent", None):
+                cmd_parts.extend(["--agent", shlex.quote(str(args.agent))])
+            else:
+                cmd_parts.extend(["--cli", shlex.quote(str(rcli))])
+            if getattr(invocation, "profile", None) and rcli != "codex":
+                cmd_parts.extend(["--profile", shlex.quote(str(invocation.profile))])
+            cmd_parts.extend([
+                "--resume", shlex.quote(sid.strip()),
+                "--cwd", shlex.quote(str(invocation.cwd)),
+                "--prompt", '"<follow-up>"',
+            ])
+            lines.append("resume: " + " ".join(cmd_parts))
+    return "\n".join(lines) + "\n"
+
+
 def _emit(obj: dict, *, operation: str | None = None,
           trusted_executor_result: bool = False,
-          continuation_context=None) -> None:
+          continuation_context=None,
+          text_mode: bool = False,
+          streamed_text: bool = False,
+          streamed_ended_newline: bool = True,
+          text_footer: str | None = None) -> None:
     """Write the response as JSON — to the job file (background) or stdout."""
     # Primary emission point: guarantee the exit-code-clarity fields on EVERY
     # dispatch-shaped envelope routed here, including the pre-dispatch validation/
@@ -878,7 +928,22 @@ def _emit(obj: dict, *, operation: str | None = None,
                     _JOB_FILE, public_obj,
                     getattr(exc, "kind", "resume_terminalization_failed"))
     else:
-        print(text)
+        if text_mode:
+            if not streamed_text:
+                fallback_out = public_obj.get("result") or public_obj.get("error") or ""
+                if isinstance(fallback_out, str) and fallback_out:
+                    sys.stdout.write(
+                        fallback_out if fallback_out.endswith("\n") else fallback_out + "\n"
+                    )
+                    sys.stdout.flush()
+            elif not streamed_ended_newline:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+            if text_footer:
+                sys.stderr.write(text_footer)
+                sys.stderr.flush()
+        else:
+            print(text)
 
 
 def _job_file_has_terminal_envelope(job_file: str) -> bool:
@@ -1222,10 +1287,21 @@ def _inject_memory(system_context: str, cwd: str, raw: bytes | None = None) -> s
     return f"{system_context}\n\n## Project memory (from .agents/memory.md)\n{mem}"
 
 
+def _agent_has_report_contract(raw_body: str | None) -> bool:
+    """Return True when a roster agent definition declares a structured report contract."""
+    if not isinstance(raw_body, str) or not raw_body:
+        return False
+    return "STATUS:" in raw_body or "final report" in raw_body.lower()
+
+
 def _initial_system_context(system_context: str, cwd: str,
-                            memory_raw: bytes | None = None) -> str:
+                            memory_raw: bytes | None = None,
+                            *, include_handoff: bool = True) -> str:
     """Build the system context for a fresh child, including caller-owned cleanup handoff."""
-    return environment_handoff_context(_inject_memory(system_context, cwd, memory_raw))
+    injected = _inject_memory(system_context, cwd, memory_raw)
+    if not include_handoff:
+        return injected
+    return environment_handoff_context(injected)
 
 
 _WORKTREE_LOCK_TIMEOUT_SEC = 10.0
@@ -1575,6 +1651,10 @@ def main() -> None:
     # raises UnicodeEncodeError on stdout.
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
 
@@ -2406,6 +2486,7 @@ def main() -> None:
     if (args.jobs_list or getattr(args, "jobs_watch", False)
             or args.jobs_status or args.jobs_wait
             or getattr(args, "jobs_wait_all", False)
+            or getattr(args, "jobs_wait_any", False)
             or args.jobs_extend or args.jobs_cancel or args.jobs_steer
             or args.jobs_resume or getattr(args, "jobs_revalidate", None)):
         sys.exit(_background.run_jobs_query(
@@ -2616,6 +2697,29 @@ def main() -> None:
     if args.worktree is not None and getattr(args, "artifacts", None):
         _die("--artifact and --worktree are incompatible: loose files are measured under "
              "the original --cwd but an isolated worktree may not contain them")
+    args._files_scope_normalized = []
+    if not getattr(args, "fleet_dispatch_lane", None):
+        if getattr(args, "text", False):
+            if getattr(args, "background", False):
+                _die("--text and --background are incompatible: detached jobs emit no live text stream")
+            if getattr(args, "json_schema", None):
+                _die("--text and --json-schema are incompatible: structured schemas require JSON output")
+        if getattr(args, "files_scope", None):
+            if args.worktree is None:
+                _die("--files-scope requires --worktree on single dispatch",
+                     error_kind="invalid_files_scope")
+            try:
+                args._files_scope_normalized = _receipt.normalize_files_scope(
+                    args.files_scope, allow_csv=True)
+            except ValueError as e:
+                _die(f"--files-scope invalid: {e}", error_kind="invalid_files_scope")
+        if getattr(args, "patch_out", None) is not None:
+            if args.worktree is None:
+                _die("--patch-out requires --worktree", error_kind="invalid_patch_out")
+            try:
+                _receipt.validate_patch_out_path(args.patch_out)
+            except ValueError as e:
+                _die(f"--patch-out invalid: {e}", error_kind="invalid_patch_out")
 
     # --prompt-file: resolve to a prompt BEFORE the background handler (its
     # validation needs args.prompt). The public/external form retains the
@@ -2729,6 +2833,10 @@ def main() -> None:
                 ("--retry-nonretryable", bool(args.retry_nonretryable)),
                 ("--transient-retries", bool(args.transient_retries)),
                 ("--json-schema", bool(args.json_schema)),
+                ("--contract-repair", bool(getattr(args, "contract_repair", False))),
+                ("--files-scope", bool(getattr(args, "files_scope", None))),
+                ("--patch-out", bool(getattr(args, "patch_out", None))),
+                ("--text", bool(getattr(args, "text", False))),
                 ("--artifact", bool(args.artifacts)),
                 ("--enable-roles", bool(args.enable_roles))):
             if _used:
@@ -2755,6 +2863,7 @@ def main() -> None:
             args.agent = _fleet_lanes[0]["candidates"][0]["seat"]
             # Disable every corrective path even when ambient environment opts
             # into one; the runtime calls execute_agent exactly once below.
+            args.contract_repair = False
             args.no_contract_repair = True
             _fleet_live_context = {
                 "fleet": _fleet_document, "plan": _fleet_plan,
@@ -3146,6 +3255,16 @@ def main() -> None:
         receipt["ad_hoc"] = True
         receipt.update(_receipt.receipt_agent(args, None))
 
+    _raw_agent_body = system_context if args.agent else ""
+    if schema is not None:
+        _output_contract = "schema"
+    elif getattr(args, "text", False):
+        _output_contract = "text"
+    elif not args.agent or not _agent_has_report_contract(_raw_agent_body):
+        _output_contract = "freeform"
+    else:
+        _output_contract = "report"
+
     # Shared project memory: inject {cwd}/.agents/memory.md (standing conventions,
     # constraints, durable decisions) so callers don't re-explain project context
     # every prompt. Read from the ORIGINAL cwd (before any worktree rewrite).
@@ -3169,7 +3288,10 @@ def main() -> None:
             _die("project memory (.agents/memory.md) changed between fingerprinting and "
                  f"dispatch ({_mem_expected} -> {_mem_actual}); re-run rather than record a "
                  "result under instructions the envelope does not name")
-        system_context = _initial_system_context(system_context, args.cwd, _mem_raw)
+        system_context = _initial_system_context(
+            system_context, args.cwd, _mem_raw,
+            include_handoff=(_output_contract not in ("schema", "text")),
+        )
 
     try:
         cli = args.cli or resolve_cli(run_agent_cli)
@@ -3394,6 +3516,10 @@ def main() -> None:
         _initial_attempt_id = _job_attempt_id
     else:
         _initial_attempt_id = None
+    _schema_inline = (
+        json.dumps(schema, separators=(",", ":"), ensure_ascii=False)
+        if schema is not None else None
+    )
     invocation = AgentInvocation(
         cli=cli,
         prompt=args.prompt,
@@ -3451,6 +3577,8 @@ def main() -> None:
         # job id when no chat attempt is present.
         attempt_id=_initial_attempt_id,
         request_sha256=receipt.get("request_sha256"),
+        output_contract=_output_contract,
+        json_schema_inline=_schema_inline,
     )
 
     if profile_selection:
@@ -3793,6 +3921,20 @@ def main() -> None:
     # errors rather than tracebacks. All other CLI-side failures are already
     # shaped into the response by execute_agent.
     _fleet_runtime_state = None
+    _streamed_any = [False]
+    _stream_ended_nl = [True]
+    _on_text_chunk = None
+    if getattr(args, "text", False):
+        def _on_text_chunk(chunk: str) -> None:
+            if not isinstance(chunk, str) or not chunk:
+                return
+            redacted = _executor._redact_output_secrets(chunk)
+            if not redacted:
+                return
+            sys.stdout.write(redacted)
+            sys.stdout.flush()
+            _streamed_any[0] = True
+            _stream_ended_nl[0] = redacted.endswith("\n")
     try:
         if _fleet_live_context is not None:
             import _fleet_runtime
@@ -3813,7 +3955,8 @@ def main() -> None:
                 invocation, timeout_ms=args.timeout, debug_dir=args.debug_dir,
                 max_tool_output_bytes=getattr(args, "max_tool_output_bytes", None),
                 launch_control=provider_launch_control(
-                    _governed_resume_context, gate=False))
+                    _governed_resume_context, gate=False),
+                on_text_chunk=_on_text_chunk)
         elif _fleet_runtime_state is not None:
             result = execute_agent(
                 invocation, timeout_ms=args.timeout, debug_dir=args.debug_dir,
@@ -3823,7 +3966,8 @@ def main() -> None:
         else:
             result = _dispatch_with_retries(
                 invocation, args, agents_dir,
-                launch_control=_chat_launch_control(invocation))
+                launch_control=_chat_launch_control(invocation),
+                on_text_chunk=_on_text_chunk)
     except (OSError, ValueError, _evidence.EvidenceError) as e:
         if _fleet_runtime_state is not None:
             try:
@@ -3862,6 +4006,9 @@ def main() -> None:
         result.setdefault("effort_transport", "kimi-profile-config")
     elif invocation.cli == "opencode" and invocation.effort:
         result.setdefault("effort_transport", "opencode-variant")
+    if getattr(invocation, "json_schema_inline", None):
+        from _builder import schema_transport_for as _schema_transport_for
+        result.setdefault("schema_transport", _schema_transport_for(invocation))
     # Allowed text seats: stamp recovery object + loud warning every time
     # (capability: text-only is opt-in, not a silent gate-off).
     if _ts is not None and _ts.get("allowed"):
@@ -3880,12 +4027,20 @@ def main() -> None:
     # --json-schema: structured-output contract with ONE corrective retry.
     if schema is not None and result.get("status") == "success":
         result = _apply_schema(result, schema, invocation, args, agents_dir)
+        if result.get("parse_ok"):
+            result["report_ok"] = True
+            result["report_source"] = "json_schema"
+            result.pop("suspect", None)
+        if getattr(invocation, "json_schema_inline", None):
+            from _builder import schema_transport_for as _schema_transport_for
+            result.setdefault("schema_transport", _schema_transport_for(invocation))
 
-    # Report-contract auto-repair: a suspect success (status=success but the report
-    # block is malformed -> report_ok false) gets ONE constrained corrective resume,
-    # unless disabled. Cheaper and more targeted than the caller re-dispatching the
-    # whole task. Runs after --json-schema so a still-suspect envelope gets one shot.
-    if not getattr(args, "no_contract_repair", False):
+    # Report-contract repair: a suspect success (status=success but the report
+    # block is malformed -> report_ok false) gets ONE constrained corrective resume
+    # only when explicitly requested via --contract-repair (and not suppressed).
+    if (schema is None and not getattr(args, "text", False)
+            and bool(getattr(args, "contract_repair", False))
+            and not bool(getattr(args, "no_contract_repair", False))):
         result = _apply_contract_repair(result, invocation, args, agents_dir)
 
     # Receipt LAST, from main()-scope values: a schema-correction retry replaces
@@ -3979,16 +4134,89 @@ def main() -> None:
         worktree_info.pop("_linked_deps_authority", None)
         if isinstance(worktree_info.get("linked_deps"), dict):
             worktree_info["linked_deps"] = dict(worktree_info["linked_deps"])
+        _ld_obj = worktree_info.get("linked_deps")
+        _ld_scope_paths: list[str] = []
+        if (isinstance(_ld_obj, dict) and _ld_obj.get("deps_mutated") is False
+                and _ld_obj.get("links_intact") is True):
+            _ld_scope_paths = [
+                p for p in (_ld_obj.get("paths") or ())
+                if isinstance(p, str) and p.strip()
+            ]
+        _files_scope_decl = getattr(args, "_files_scope_normalized", None) or []
+        if _files_scope_decl:
+            try:
+                _scope_changes = _receipt.collect_worktree_changes(
+                    worktree_info["cwd"],
+                    base_head=worktree_info.get("base_head") or receipt.get("git_head_before"),
+                    linked_deps_paths=_ld_scope_paths,
+                )
+                _out_of_scope = [
+                    p for p in _scope_changes["changed_files"]
+                    if not _receipt.path_matches_scope(p, _files_scope_decl)
+                ]
+                result["files_scope"] = {
+                    "declared": list(_files_scope_decl),
+                    "changed_files": _scope_changes["changed_files"],
+                    "out_of_scope": _out_of_scope,
+                    "ok": not _out_of_scope,
+                }
+                if _out_of_scope and result.get("status") == "success":
+                    _scope_msg = (
+                        "agent modified files outside declared --files-scope: "
+                        + ", ".join(_out_of_scope)
+                    )
+                    result["status"] = "error"
+                    result["execution_status"] = "error"
+                    result["error_kind"] = "files_scope_violation"
+                    result["error"] = _scope_msg
+                    result["result_usable"] = False
+                    result["retryable"] = False
+                    result.setdefault("warnings", []).append(_scope_msg)
+                    finalize_exit_fields(result)
+            except (RuntimeError, ValueError, OSError) as exc:
+                _scope_err = f"worktree --files-scope verification failed: {exc}"
+                result["status"] = "error"
+                result["execution_status"] = "error"
+                result["error_kind"] = "files_scope_verification_failed"
+                result["error"] = _scope_err
+                result["result_usable"] = False
+                result["retryable"] = False
+                result.setdefault("warnings", []).append(_scope_err)
+                finalize_exit_fields(result)
+        if getattr(args, "patch_out", None) is not None and result.get("status") == "success":
+            _patch_base = worktree_info.get("base_head") or receipt.get("git_head_before")
+            try:
+                result["patch_out"] = _receipt.export_worktree_patch(
+                    worktree_info["cwd"],
+                    args.patch_out,
+                    base_head=_patch_base,
+                    linked_deps_paths=_ld_scope_paths,
+                )
+            except (ValueError, OSError) as exc:
+                _patch_err = f"--patch-out export failed: {exc}"
+                result["status"] = "error"
+                result["execution_status"] = "error"
+                result["error_kind"] = "patch_export_failed"
+                result["error"] = _patch_err
+                result["result_usable"] = False
+                result["retryable"] = False
+                result.setdefault("warnings", []).append(_patch_err)
+                finalize_exit_fields(result)
         result["worktree"] = worktree_info
     _tags = _agent_tags_from_file(agent_file)
     if _tags:
         result["agent_tags"] = _tags
     if args.out:
         _write_out(args.out, result)
+    _is_text_mode = bool(getattr(args, "text", False))
     _emit(result, operation="resume" if args.resume else "dispatch",
           trusted_executor_result=True,
           continuation_context=(
-              None if _fleet_runtime_state is not None else (invocation, args)))
+              None if _fleet_runtime_state is not None else (invocation, args)),
+          text_mode=_is_text_mode,
+          streamed_text=_streamed_any[0],
+          streamed_ended_newline=_stream_ended_nl[0],
+          text_footer=_format_text_footer(result, invocation, args) if _is_text_mode else None)
     sys.exit(0 if result["status"] == "success" else 1)
 
 
@@ -4151,7 +4379,8 @@ def _effective_decision_view(invocation, args) -> dict:
             "unenforceable_authorized": unenforceable_authorized,
             "corrective_allowed": bool(
                 getattr(args, "json_schema", None)
-                or not getattr(args, "no_contract_repair", False)),
+                or (bool(getattr(args, "contract_repair", False))
+                    and not bool(getattr(args, "no_contract_repair", False)))),
             "retry_allowed": _retry_allowed,
             "fallback_allowed": _fallback_allowed,
             "require_fresh": False,
@@ -4282,7 +4511,7 @@ def _dry_run_view(invocation, args, agents_dir: str,
                           credit_spend_allowed, selects_credit_only,
                           model_backend_compatibility, codex_model_selection,
                           read_allowlist, opencode_yolo_isolation_error,
-                          effective_effort)
+                          effective_effort, schema_transport_for)
     _guarded, _, _guard_warnings = apply_credit_guard(invocation)
     _codex_selection = (codex_model_selection(
                             invocation.model, invocation.extra_args,
@@ -4715,7 +4944,7 @@ def _dry_run_view(invocation, args, agents_dir: str,
     elif (not _selection_conflict
           and not view["read_allowlist"].get("would_refuse")):
         try:
-            cmd, argv, env = build_invocation_args(invocation)
+            cmd, argv, env = build_invocation_args(invocation, dry_run=True)
             if invocation.profile_command:
                 # The executable is private registry data.  Keep dry-run useful
                 # without placing the absolute machine path in a shareable
@@ -4761,6 +4990,8 @@ def _dry_run_view(invocation, args, agents_dir: str,
             "openai-compat is a single Chat Completions call — prefer a CLI agent "
             "loop for multi-step coding")
     _sync_effective_decision_refusal(view)
+    if getattr(invocation, "json_schema_inline", None):
+        view["schema_transport"] = schema_transport_for(invocation)
     return view
 
 
@@ -5288,7 +5519,7 @@ def _reserve_secondary_mission_attempt(args, invocation, next_attempt_id: str,
 
 
 def _dispatch_with_retries(invocation, args, agents_dir=None, *,
-                           launch_control=None) -> dict:
+                           launch_control=None, on_text_chunk=None) -> dict:
     """execute_agent with --retries: exponential backoff on error/partial only
     (blocked won't improve by retrying — its cause is structural).
 
@@ -5333,7 +5564,8 @@ def _dispatch_with_retries(invocation, args, agents_dir=None, *,
         result = execute_agent(
             attempt_invocation, timeout_ms=args.timeout, debug_dir=args.debug_dir,
             max_tool_output_bytes=getattr(args, "max_tool_output_bytes", None),
-            launch_control=(launch_control if attempt == 0 else None))
+            launch_control=(launch_control if attempt == 0 else None),
+            on_text_chunk=(on_text_chunk if attempt == 0 else None))
         attempt += 1
         _attempt_history.append(_attempt_projection(result, attempt_id))
         # Structural preflight/refusal paths never reach a provider. Stop before

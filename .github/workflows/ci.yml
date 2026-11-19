@@ -284,9 +284,11 @@ jobs:
       - name: Unit tests (backend/model routing preflight)
         run: python -m unittest skills.summon.scripts.test_model_routing
 
-      - name: Unit tests (v3.8.0 orchestration and v3.8.1 hindrance regressions)
+      - name: Unit tests (v3.8.0 orchestration, v3.8.1 hindrance, and v3.9.0 reliability/ergonomics)
         run: >-
           python -m pytest -q
+          skills/summon/scripts/test_v390_ci_and_reliability.py
+          skills/summon/scripts/test_v390_schema_worktree_ergonomics.py
           skills/summon/scripts/test_v381_hindrance_fixes.py
           skills/summon/scripts/test_manifest_dag.py
           skills/summon/scripts/test_mission.py

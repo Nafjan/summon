@@ -85,7 +85,7 @@ def test_observational_write_preserves_driver_terminal(monkeypatch, tmp_path, fa
         assert json.loads(heartbeat.read_text(encoding="utf-8"))["liveness"]["phase"] == "terminal"
     else:
         assert failed_phases == ["terminal"]
-    assert process.terminated == 1 and process.communicated == 1
+    assert process.terminated == 0 and process.communicated == 1
 
 
 @pytest.mark.parametrize("boundary", ["durable_control", "heartbeat_auth"],

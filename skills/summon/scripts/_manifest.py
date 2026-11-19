@@ -863,13 +863,22 @@ def _child_cmd(job: dict, args, out_file: str, *, effective_prompt: str | None =
 
 def run_manifest(args) -> int:
     """Entry point for ``--manifest``. Returns the process exit code."""
+    source_label = "stdin (-)" if args.manifest == "-" else args.manifest
     try:
-        with open(args.manifest, encoding="utf-8") as fh:
-            doc = json.load(fh)
+        if args.manifest == "-":
+            doc = json.load(sys.stdin)
+        else:
+            with open(args.manifest, encoding="utf-8") as fh:
+                doc = json.load(fh)
     except (OSError, ValueError) as e:
-        return _fail(f"cannot load manifest {args.manifest}: {e}")
+        return _fail(f"cannot load manifest {source_label}: {e}")
 
-    jobs, err = _normalize_jobs(doc, os.path.dirname(os.path.abspath(args.manifest)))
+    manifest_base = (
+        os.path.abspath(args.cwd or os.getcwd())
+        if args.manifest == "-"
+        else os.path.dirname(os.path.abspath(args.manifest))
+    )
+    jobs, err = _normalize_jobs(doc, manifest_base)
     if err:
         return _fail(err)
     try:
@@ -1147,7 +1156,7 @@ def run_manifest(args) -> int:
                 envelope_dirty = True
             if job.get("files_scope") and envelope.get("status") == "success":
                 try:
-                    from _mission import path_matches_scope
+                    from _receipt import collect_worktree_changes, path_matches_scope
                     from _spawn import run_flags
                     wt_obj = envelope.get("worktree") if isinstance(envelope.get("worktree"), dict) else {}
                     check_dir = str(wt_obj.get("path") or os.path.abspath(job.get("cwd") or base_cwd))
@@ -1170,73 +1179,24 @@ def run_manifest(args) -> int:
                         envelope_dirty = True
                     else:
                         base_ref = str(wt_obj.get("base_head") or envelope.get("git_head_before") or "HEAD")
-                        touched: set[str] = set()
-                        d_proc = subprocess.run(
-                            ["git", "-C", repo_root, "diff", "--no-renames", "--name-only", "-z", base_ref],
-                            capture_output=True, timeout=15, **run_flags(),
+                        ld_info = wt_obj.get("linked_deps") if isinstance(wt_obj.get("linked_deps"), dict) else {}
+                        ld_paths: list[str] = []
+                        if ld_info.get("deps_mutated") is False and ld_info.get("links_intact") is True:
+                            ld_paths = [str(lp) for lp in (ld_info.get("paths") or ()) if lp]
+                        changes = collect_worktree_changes(
+                            repo_root,
+                            base_head=base_ref,
+                            head_ref=None,
+                            include_dirty=True,
+                            linked_deps_paths=ld_paths,
                         )
-                        s_proc = subprocess.run(
-                            ["git", "-C", repo_root, "status", "--porcelain=v1", "--untracked-files=all", "-z"],
-                            capture_output=True, timeout=15, **run_flags(),
-                        )
-                        if d_proc.returncode != 0 or s_proc.returncode != 0:
+                        violations = [p for p in changes["changed_files"] if not path_matches_scope(p, job["files_scope"])]
+                        if violations:
                             envelope["status"] = "blocked"
-                            envelope["error_kind"] = "scope_verification_failed"
-                            envelope["error"] = (
-                                f"job {job['id']!r} files_scope git check failed "
-                                f"(diff rc={d_proc.returncode}, status rc={s_proc.returncode})"
-                            )
+                            envelope["error_kind"] = "scope_violation"
+                            envelope["error"] = f"job {job['id']!r} modified files outside files_scope: {violations}"
+                            envelope["scope_violations"] = violations
                             envelope_dirty = True
-                        else:
-                            d_raw = d_proc.stdout.decode("utf-8", errors="replace") if isinstance(d_proc.stdout, bytes) else str(d_proc.stdout or "")
-                            for token in (d_raw.split("\x00") if "\x00" in d_raw else d_raw.splitlines()):
-                                if token.strip():
-                                    touched.add(token.strip())
-                            s_raw = s_proc.stdout.decode("utf-8", errors="replace") if isinstance(s_proc.stdout, bytes) else str(s_proc.stdout or "")
-                            if "\x00" in s_raw:
-                                entries = [e for e in s_raw.split("\x00") if e]
-                                idx = 0
-                                while idx < len(entries):
-                                    entry = entries[idx]
-                                    if len(entry) >= 4:
-                                        xy = entry[:2]
-                                        rel = entry[3:]
-                                        if rel:
-                                            touched.add(rel)
-                                        if "R" in xy or "C" in xy:
-                                            idx += 1
-                                            if idx < len(entries) and entries[idx]:
-                                                touched.add(entries[idx])
-                                    idx += 1
-                            else:
-                                for ln in s_raw.splitlines():
-                                    if len(ln) > 3:
-                                        rel = ln[3:].strip()
-                                        if " -> " in rel:
-                                            old_p, new_p = rel.split(" -> ", 1)
-                                            if old_p.strip().strip('"'):
-                                                touched.add(old_p.strip().strip('"'))
-                                            if new_p.strip().strip('"'):
-                                                touched.add(new_p.strip().strip('"'))
-                                        elif rel.strip('"'):
-                                            touched.add(rel.strip('"'))
-                            ld_info = wt_obj.get("linked_deps") if isinstance(wt_obj.get("linked_deps"), dict) else {}
-                            if ld_info.get("deps_mutated") is False and ld_info.get("links_intact") is True:
-                                ld_exact = {str(lp).replace("\\", "/").strip("/") for lp in (ld_info.get("paths") or ()) if lp}
-                                ld_prefixes = [f"{lp}/" for lp in ld_exact if lp]
-                                filtered_touched: set[str] = set()
-                                for p in touched:
-                                    norm_p = p.replace("\\", "/").strip("/")
-                                    if norm_p not in ld_exact and not any(norm_p.startswith(pref) for pref in ld_prefixes):
-                                        filtered_touched.add(p)
-                                touched = filtered_touched
-                            violations = [p for p in sorted(touched) if not path_matches_scope(p, job["files_scope"])]
-                            if violations:
-                                envelope["status"] = "blocked"
-                                envelope["error_kind"] = "scope_violation"
-                                envelope["error"] = f"job {job['id']!r} modified files outside files_scope: {violations}"
-                                envelope["scope_violations"] = violations
-                                envelope_dirty = True
                 except Exception as exc:  # noqa: BLE001
                     envelope["status"] = "blocked"
                     envelope["error_kind"] = "scope_verification_failed"

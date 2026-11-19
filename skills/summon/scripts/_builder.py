@@ -114,9 +114,11 @@ class AgentInvocation:
     # Explicit additional directories the read-only seat may inspect.  These are
     # normalized absolute paths, never arbitrary backend flags.
     read_roots: tuple = ()
-    # Ordinary dispatches use the report contract. Receipt-bound deliberation
-    # turns use a typed ballot contract and must not receive the report nudge.
+    # Ordinary dispatches use the report contract. Receipt-bound deliberation,
+    # native --json-schema, --text, and freeform runs select distinct contracts
+    # so only report-bearing seats receive the trailing Final report reminder.
     output_contract: str = "report"
+    json_schema_inline: str | None = None
     # Stable identity for one physical backend launch. Retries and transport
     # fallbacks receive a fresh value; direct callers may leave it unset and
     # the executor will mint one before any provider contact. This is an
@@ -175,8 +177,10 @@ def environment_handoff_context(system_context: str) -> str:
 
 
 def _resume_prompt(inv: AgentInvocation) -> str:
-    """Prompt for a resume run: the raw task + a short contract reminder only."""
-    return inv.prompt + _RESUME_REMINDER
+    """Prompt for a resume run: the raw task + a short contract reminder only when required."""
+    if inv.output_contract == "report":
+        return inv.prompt + _RESUME_REMINDER
+    return inv.prompt
 
 
 def build_command(cli: str, prompt: str) -> tuple[str, list]:
@@ -472,6 +476,18 @@ def read_allowlist(cli: str, permission: str, cwd: str,
 
 
 _ORIG_SHUTIL_WHICH = shutil.which
+
+
+def _is_patched_which(fn) -> bool:
+    """Detect monkeypatched ``shutil.which`` even if ``_builder`` was lazily imported after patching."""
+    if fn is None:
+        return False
+    return (
+        fn is not _ORIG_SHUTIL_WHICH
+        or shutil.which is not _ORIG_SHUTIL_WHICH
+        or getattr(fn, "__module__", None) != "shutil"
+        or getattr(shutil.which, "__module__", None) != "shutil"
+    )
 _CODEX_BIN_VERSION_CACHE: dict[tuple[str, int, int], tuple[int, int, int, int]] = {}
 _CODEX_SEMVER_RE = re.compile(r"(?i)\bcodex(?:-cli)?\s+([0-9]+)\.([0-9]+)\.([0-9]+)(?:-([0-9A-Za-z.-]+))?")
 
@@ -561,7 +577,7 @@ def resolve_codex_binary(
 
     eff_which = which_fn or shutil.which
     # Respect unit tests that monkeypatch shutil.which unless explicit test dirs are passed.
-    if (eff_which is not _ORIG_SHUTIL_WHICH or shutil.which is not _ORIG_SHUTIL_WHICH) and localappdata is None and codex_home is None:
+    if _is_patched_which(eff_which) and localappdata is None and codex_home is None:
         hit = eff_which("codex")
         if hit and os.name == "nt" and str(hit).lower().endswith((".cmd", ".bat")):
             exes = _expand_codex_shim_exe(str(hit))
@@ -649,7 +665,7 @@ def resolve_agy_binary(
 
     eff_which = which_fn or shutil.which
     # Respect unit tests that monkeypatch shutil.which unless explicit localappdata is passed.
-    if (eff_which is not _ORIG_SHUTIL_WHICH or shutil.which is not _ORIG_SHUTIL_WHICH) and localappdata is None:
+    if _is_patched_which(eff_which) and localappdata is None:
         hit = eff_which("agy")
         if hit and os.name == "nt" and str(hit).lower().endswith((".cmd", ".bat")):
             sibling_exe = os.path.join(os.path.dirname(str(hit)), "agy.exe")
@@ -1307,7 +1323,7 @@ def _claude_system_prompt(inv: AgentInvocation) -> str:
             + "\n".join(f"- {root}" for root in inv.read_roots)
             + "\nDo not access other directories."
         )
-    if inv.output_contract != "deliberation":
+    if inv.output_contract == "report":
         system_prompt += (
             "\n\nReminder before responding: your final message MUST end with the exact "
             "'Final report' block from your agent definition above, with every field "
@@ -1321,7 +1337,7 @@ def _agy_prompt(inv: AgentInvocation) -> str:
         return _resume_prompt(inv)
     prompt = (f"[System Context]\n{inv.system_context}\n\n"
               f"[User Prompt]\n{inv.prompt}")
-    if inv.output_contract != "deliberation":
+    if inv.output_contract == "report":
         prompt += (
             "\n\n[Reminder] Your final message MUST end with the exact 'Final report' "
             "block from your agent definition above, with every field present "
@@ -1409,12 +1425,18 @@ def _build_claude_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
                 "Bash(git status*),Bash(git diff*),Bash(git log*),"
                 "Bash(git show*),Bash(git rev-parse*),Bash(git branch*)",
             ]
+    schema_flags = (
+        ["--json-schema", inv.json_schema_inline]
+        if schema_transport_for(inv) == "claude-json-schema"
+        else []
+    )
     common = (perm + model_flag + effort_flag
               + safe_edit_tools
               + strip_boundary_flags(inv.cli, inv.extra_args)
               + root_flags
               + setting_sources
-              + hook_settings_flags)
+              + hook_settings_flags
+              + schema_flags)
 
     if inv.resume_id:
         # Resume: the session already carries the agent definition, so we don't
@@ -1836,7 +1858,8 @@ def effective_effort(cli: str | None, model: str | None,
     return raw_effort, None
 
 
-def _build_codex_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
+def _build_codex_args(inv: AgentInvocation, *, resource_register=None,
+                      dry_run: bool = False) -> tuple[str, list, dict | None]:
     from _profiles import account_launch_policy
     account_flags, profile_env = account_launch_policy(inv)
     perm = permission_flags(inv.cli, inv.permission)
@@ -1870,6 +1893,23 @@ def _build_codex_args(inv: AgentInvocation) -> tuple[str, list, dict | None]:
             "exec", "resume", inv.resume_id, "--json", "--skip-git-repo-check",
             _resume_prompt(inv)], env
     command, base_args = build_command(inv.cli, _concatenated_prompt(inv))
+    if schema_transport_for(inv) == "codex-output-schema":
+        if dry_run:
+            schema_arg = "<temp-schema.json>"
+        else:
+            schema_path = _write_codex_schema_file(inv.json_schema_inline or "")
+            if resource_register is not None:
+                try:
+                    resource_register(schema_path, "codex-output-schema")
+                except Exception as exc:  # noqa: BLE001 - do not orphan schema file
+                    try:
+                        os.remove(schema_path)
+                    except OSError:
+                        pass
+                    raise ValueError(
+                        "codex output schema: controlled cleanup registration failed") from exc
+            schema_arg = schema_path
+        base_args = [*base_args[:-1], "--output-schema", schema_arg, base_args[-1]]
     return inv.profile_command or command, head + base_args, env
 
 
@@ -2490,6 +2530,98 @@ def cleanup_zcode_attachment(args: list | tuple | None) -> None:
         temp_root = os.path.realpath(tempfile.gettempdir())
         if (os.path.dirname(candidate) == temp_root
                 and os.path.basename(candidate).startswith("summon-zcode-")):
+            os.remove(candidate)
+    except OSError:
+        pass
+
+
+_CLAUDE_INLINE_SCHEMA_MAX_BYTES = 16_384
+_CODEX_STALE_SCHEMA_TTL_SECONDS = 60 * 60
+_CODEX_STALE_SCHEMA_SCAN_LIMIT = 32
+
+
+def schema_transport_for(inv: AgentInvocation) -> str | None:
+    """Return how ``inv.json_schema_inline`` is delivered to ``inv.cli``."""
+    raw = getattr(inv, "json_schema_inline", None)
+    if not raw:
+        return None
+    if inv.cli == "claude" and len(raw.encode("utf-8")) <= _CLAUDE_INLINE_SCHEMA_MAX_BYTES:
+        return "claude-json-schema"
+    if inv.cli == "codex" and not inv.resume_id:
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError):
+            return "prompt"
+        from _schema import is_codex_strict_schema_compatible
+        if is_codex_strict_schema_compatible(parsed):
+            return "codex-output-schema"
+    return "prompt"
+
+
+def _reap_stale_codex_schemas() -> None:
+    """Bounded next-launch cleanup for Codex schema temp files left by hard kills."""
+    try:
+        root = tempfile.gettempdir()
+        cutoff = time.time() - _CODEX_STALE_SCHEMA_TTL_SECONDS
+        candidates = 0
+        with os.scandir(root) as entries:
+            for entry in entries:
+                if candidates >= _CODEX_STALE_SCHEMA_SCAN_LIMIT:
+                    break
+                if (not entry.name.startswith("summon-codex-schema-")
+                        or not entry.name.endswith(".json")
+                        or entry.is_symlink()
+                        or not entry.is_file(follow_symlinks=False)):
+                    continue
+                candidates += 1
+                try:
+                    if entry.stat(follow_symlinks=False).st_mtime < cutoff:
+                        os.remove(entry.path)
+                except OSError:
+                    continue
+    except OSError:
+        return
+
+
+def _write_codex_schema_file(schema_text: str) -> str:
+    """Write a private per-turn JSON schema file for ``codex exec --output-schema``."""
+    _reap_stale_codex_schemas()
+    fd, path = tempfile.mkstemp(prefix="summon-codex-schema-", suffix=".json")
+    try:
+        _lock_zcode_attachment(path)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            handle.write(schema_text)
+        return path
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+
+
+def cleanup_codex_schema_file(args: list | tuple | None) -> None:
+    """Best-effort removal of a per-turn private Codex ``--output-schema`` file."""
+    if not isinstance(args, (list, tuple)):
+        return
+    try:
+        index = list(args).index("--output-schema")
+        path = args[index + 1]
+    except (ValueError, IndexError):
+        return
+    if not isinstance(path, str) or not path or os.path.islink(path):
+        return
+    try:
+        candidate = os.path.realpath(path)
+        temp_root = os.path.realpath(tempfile.gettempdir())
+        name = os.path.basename(candidate)
+        if (os.path.dirname(candidate) == temp_root
+                and name.startswith("summon-codex-schema-")
+                and name.endswith(".json")):
             os.remove(candidate)
     except OSError:
         pass
@@ -4440,7 +4572,8 @@ def model_backend_compatibility(cli: str, model: str | None) -> dict | None:
 
 
 def build_invocation_args(inv: AgentInvocation, timeout_ms: int | None = None, *,
-                          resource_register=None
+                          resource_register=None,
+                          dry_run: bool = False
                           ) -> tuple[str, list, dict | None]:
     """Dispatch to a SUBPROCESS backend's argument builder.
 
@@ -4477,6 +4610,9 @@ def build_invocation_args(inv: AgentInvocation, timeout_ms: int | None = None, *
             inv, resource_register=resource_register)
     elif inv.cli == "zcode":
         cmd, args, env = _build_zcode_args(inv, resource_register=resource_register)
+    elif inv.cli == "codex":
+        cmd, args, env = _build_codex_args(
+            inv, resource_register=resource_register, dry_run=dry_run)
     else:
         cmd, args, env = b["build"](inv)
     if credit_env:

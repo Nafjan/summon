@@ -5,6 +5,13 @@ notes, and test evidence, see the [detailed engineering history](docs/ENGINEERIN
 
 ## [Unreleased]
 
+## [3.9.0] - 2026-11-19
+
+- **Fix CI lazy-import `which` detection & natural subprocess exit:** Detect monkeypatched `shutil.which` even when `_builder` is lazily imported after patching (`resolve_codex_binary`, `resolve_agy_binary`), fixing clean-runner doctor probe failures. Grant subprocesses a `2.5s` natural exit grace window after parsing a terminal stream event before falling back to `terminate()`, letting healthy backends exit `0` naturally instead of `raw_backend_exit_code: 1`.
+- **End double-turn contract-repair tax & phantom report instructions:** Flip report-contract repair to opt-in (`--contract-repair`; keep `--no-contract-repair` as an override/no-op alias) and suppress `'Final report'` prompt suffixes and `suspect` warnings on non-report dispatches (`freeform`, `text`, `schema`, `deliberation`).
+- **Native `--json-schema` compilation (`claude` & `codex`):** Compile `--json-schema` natively to `claude --json-schema` (up to `16 KiB`, capturing `structured_output`) and strict-subset `codex exec --output-schema` (private temp file with cleanup and side-effect-free `--dry-run` preview), recording `schema_transport` and setting `report_ok: true` (`report_source: "json_schema"`) on valid output.
+- **Single-dispatch `--files-scope`, read-only `--patch-out` & ergonomics:** Consolidate worktree change collection into `_receipt.py`, add single-dispatch `--files-scope` enforcement and read-only `--patch-out` export (`--worktree`, zero `git add`), add `-t` / `--text` live redacted terminal streaming with a UTF-8 summary/`resume:` footer, add `--manifest -` stdin input, and add `jobs wait --any` / `wait --any` (`--jobs-wait-any`).
+
 ## [3.8.1] - 2026-11-15
 
 - **Fix status & completion signal reliability:** Exit `0` whenever terminal dispatch `status == "success"` while preserving `raw_backend_exit_code` in the envelope. Rescue runs whose backend emits an output-token cutoff or stream stall after the agent already returned a complete `STATUS: DONE` report (`completed_before_cutoff: true`, `provider_post_report_error`, non-fatal warning). Reject empty non-writable seat completions (`empty_terminal_result`) unless verified workspace edits occurred. Validate `--background` launch arguments synchronously before returning a `job_id`, hold an exclusive `<out>.active.lock` across the full `--out` lifecycle (`out_path_collision`) including `--background --out` child handoff, buffer long `agy` `step_update` streams with clean-EOF partial recovery, and report accurate elapsed milliseconds and timeout stages in timeout headlines.

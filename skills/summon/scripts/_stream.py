@@ -182,9 +182,10 @@ class StreamProcessor:
       ``turn.completed`` or ``turn.failed``
     """
 
-    def __init__(self, event_observer=None, cli: str | None = None):
+    def __init__(self, event_observer=None, cli: str | None = None, on_text_chunk=None):
         self._event_observer = event_observer
         self._declared_cli = cli
+        self._on_text_chunk = on_text_chunk
         self._tool_progress = 0
         # Some provider stream dialects do not assign an event id to progress
         # records.  Keep only fixed-size hashes of their semantic payloads, so
@@ -192,6 +193,7 @@ class StreamProcessor:
         # text, tool arguments, or provider identifiers in parser state.
         self._liveness_semantic_ids: set[str] = set()
         self.result_json = None
+        self.structured_output = None
         self.gemini_parts = []
         self.codex_messages = []
         self.is_gemini = False
@@ -272,6 +274,14 @@ class StreamProcessor:
 
     _AGY_BUFFER_MAX_BYTES = 512 * 1024
 
+    def _emit_text_chunk(self, text: object) -> None:
+        if self._on_text_chunk is None or not isinstance(text, str) or not text:
+            return
+        try:
+            self._on_text_chunk(text)
+        except Exception:  # noqa: BLE001 - streaming callback must never disrupt parsing
+            pass
+
     def _append_agy_step_text(self, step: dict) -> None:
         """Buffer bounded AGY step_update assistant output across long runs."""
         text_delta = step.get("text_delta")
@@ -284,6 +294,7 @@ class StreamProcessor:
             if chunk:
                 self.agy_parts.append(chunk)
                 self._agy_buffered_bytes += len(chunk.encode("utf-8", errors="ignore"))
+                self._emit_text_chunk(chunk)
             return
         snapshot = step.get("response") or step.get("content")
         if not isinstance(snapshot, str) or not snapshot:
@@ -294,6 +305,8 @@ class StreamProcessor:
                 :self._AGY_BUFFER_MAX_BYTES].decode("utf-8", errors="ignore")
             self.agy_parts = [bounded] if bounded else []
             self._agy_buffered_bytes = len(bounded.encode("utf-8", errors="ignore"))
+            if len(bounded) > len(current):
+                self._emit_text_chunk(bounded[len(current):])
             return
         if not self.agy_parts or snapshot != self.agy_parts[-1]:
             remaining = self._AGY_BUFFER_MAX_BYTES - self._agy_buffered_bytes
@@ -304,6 +317,7 @@ class StreamProcessor:
             if chunk:
                 self.agy_parts.append(chunk)
                 self._agy_buffered_bytes += len(chunk.encode("utf-8", errors="ignore"))
+                self._emit_text_chunk(chunk)
 
     def _flush_opencode_step(self) -> None:
         """Record accumulated OpenCode text from one step into text blocks."""
@@ -724,7 +738,10 @@ class StreamProcessor:
                                        semantic_identity=("claude_tool", message.get("id"),
                                                           index, block))
                 if _root_texts:
-                    self._claude_text_blocks.append("\n".join(_root_texts))
+                    joined = "\n".join(_root_texts)
+                    prefix = "\n" if self._claude_text_blocks else ""
+                    self._claude_text_blocks.append(joined)
+                    self._emit_text_chunk(prefix + joined)
             return False
 
         if (data.get("type") == "user"
@@ -751,6 +768,7 @@ class StreamProcessor:
             content = data.get("content", "")
             if isinstance(content, str):
                 self.gemini_parts.append(content)
+                self._emit_text_chunk(content)
                 self._liveness("output_text", data,
                                output_chars=self._meaningful_chars(content),
                                semantic_identity=("gemini_text", content))
@@ -802,6 +820,7 @@ class StreamProcessor:
                 self.progress_usage = item["usage"]
             if item.get("type") == "agent_message" and isinstance(item.get("text"), str):
                 self.codex_messages.append(item["text"])
+                self._emit_text_chunk(item["text"] + "\n")
                 self._liveness("output_text", data,
                                output_chars=self._meaningful_chars(item["text"]),
                                semantic_identity=("codex_text", item.get("id"),
@@ -906,6 +925,7 @@ class StreamProcessor:
                 if isinstance(text, str):
                     self.opencode_parts.append(text)
                     self._opencode_step_parts.append(text)
+                    self._emit_text_chunk(text)
                     self._liveness("output_text", data,
                                    output_chars=self._meaningful_chars(text),
                                    semantic_identity=("opencode_text", part.get("id"),
@@ -972,6 +992,7 @@ class StreamProcessor:
             if part.get("type") == "text" and isinstance(part.get("text"), str):
                 self.opencode_parts.append(part["text"])
                 self._opencode_step_parts.append(part["text"])
+                self._emit_text_chunk(part["text"])
                 self._liveness("output_text", data,
                                output_chars=self._meaningful_chars(part["text"]),
                                semantic_identity=("opencode_part_text", part.get("id"),
@@ -1160,6 +1181,9 @@ class StreamProcessor:
                     self.final_message = self._claude_text_blocks[-1]
                 elif len(self._claude_text_blocks) == 1:
                     self.final_message = self._claude_text_blocks[0]
+                if (isinstance(data, dict) and "structured_output" in data
+                        and data["structured_output"] is not None):
+                    self.structured_output = data["structured_output"]
                 self.result_json = data
             self._liveness("terminal", data)
             return True
@@ -1529,6 +1553,8 @@ class StreamProcessor:
         timeout forensic artifact from growing with a long or hostile stream.
         """
         self.kimi_parts.append(content)
+        if content:
+            self._emit_text_chunk(content if content.endswith("\n") else content + "\n")
         if not content:
             return
         self._kimi_partial_part_count += 1

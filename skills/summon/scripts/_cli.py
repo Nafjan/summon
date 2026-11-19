@@ -210,7 +210,7 @@ MODE_FLAGS = {
     "jobs-watch": {"jobs_watch", "jobs_watch_once", "jobs_watch_interval",
                    "jobs_active_only", "job_dir", "mission_id", "json", "job_file"},
     "jobs-status": {"jobs_status", "jobs_full", "job_dir", "json", "job_file"},
-    "jobs-wait": {"jobs_wait", "jobs_wait_all", "jobs_wait_ids", "jobs_active_only", "jobs_full", "job_dir", "timeout", "json", "job_file"},
+    "jobs-wait": {"jobs_wait", "jobs_wait_all", "jobs_wait_any", "jobs_wait_ids", "jobs_active_only", "jobs_full", "job_dir", "timeout", "json", "job_file"},
     "jobs-extend": {"jobs_extend", "job_duration", "job_dir", "json", "job_file"},
     "jobs-cancel": {"jobs_cancel", "job_dir", "json", "job_file"},
     "jobs-steer": {"jobs_steer", "job_message", "job_dir", "json", "job_file"},
@@ -384,7 +384,7 @@ def fanout_mode(args: argparse.Namespace) -> str | None:
         return "jobs-watch"
     if getattr(args, "jobs_status", None):
         return "jobs-status"
-    if getattr(args, "jobs_wait", None) or getattr(args, "jobs_wait_all", False):
+    if getattr(args, "jobs_wait", None) or getattr(args, "jobs_wait_all", False) or getattr(args, "jobs_wait_any", False):
         return "jobs-wait"
     if getattr(args, "jobs_extend", None):
         return "jobs-extend"
@@ -456,7 +456,9 @@ def unsupported_mode_flags(argv: list, args: argparse.Namespace) -> str | None:
     allowed = MODE_FLAGS[mode]
     present = set()
     for tok in argv:
-        if tok.startswith("--"):
+        if tok == "-t":
+            present.add("text")
+        elif tok.startswith("--"):
             name = tok[2:].split("=", 1)[0]
             present.add(TOKEN_DESTS.get(name, name.replace("-", "_")))
     offending = sorted(
@@ -1074,12 +1076,14 @@ def rewrite_subcommand(argv: list) -> tuple:
                 else:
                     translated.append(tok)
             return translated, None
-        if rest[0] == "wait" and ("--all" in rest[1:] or "--active-only" in rest[1:] or "--jobs-active-only" in rest[1:]):
-            translated = ["--jobs-wait-all"]
+        if rest[0] == "wait" and ("--all" in rest[1:] or "--any" in rest[1:] or "--active-only" in rest[1:] or "--jobs-active-only" in rest[1:]):
+            if "--all" in rest[1:] and "--any" in rest[1:]:
+                return argv, "error: 'jobs wait' cannot combine --all and --any"
+            translated = ["--jobs-wait-any"] if "--any" in rest[1:] else ["--jobs-wait-all"]
             idx = 1
             while idx < len(rest):
                 tok = rest[idx]
-                if tok == "--all":
+                if tok in ("--all", "--any"):
                     idx += 1
                     continue
                 if tok in ("--active-only", "--jobs-active-only"):
@@ -1598,6 +1602,10 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                              "permission, args, profile, lifecycle, successor")
     parser.add_argument("--json", action="store_true",
                         help="Emit machine-readable JSON where supported by the selected command")
+    parser.add_argument("-t", "--text", dest="text", action="store_true",
+                        help="Stream readable assistant text to stdout as it arrives (redacted) "
+                             "and print a compact UTF-8 summary and resume hint to stderr "
+                             "(single dispatch only; incompatible with --background and --json-schema)")
     parser.add_argument("--probe", action="store_true",
                         help="With --doctor: run a minimal LIVE call per backend to verify "
                              "account/client eligibility (catches e.g. Gemini IneligibleTierError "
@@ -1758,6 +1766,13 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                              "(repeatable): path, bytes, sha256, and page metadata where "
                              "available; re-check after dispatch and mark changed baselines "
                               "suspect")
+    parser.add_argument("--files-scope", dest="files_scope", action="append", default=[],
+                        metavar="PATH_OR_GLOB",
+                        help="Enforce a post-hoc worktree scope allowlist (repeatable or "
+                             "comma-separated relative paths/globs; requires --worktree)")
+    parser.add_argument("--patch-out", dest="patch_out", metavar="FILE",
+                        help="Export a read-only unified diff of worktree changes against "
+                             "base HEAD to FILE without staging or committing (requires --worktree)")
     parser.add_argument("--context-input-file", dest="context_input_file",
                         help="Append one typed summon.context-input/v1 packet to this "
                              "dispatch. Summon reads and compiles it locally before any "
@@ -1775,10 +1790,13 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                              "out of public receipts")
     parser.add_argument("--context-compilation-json", dest="context_compilation_json",
                         help=argparse.SUPPRESS)
+    parser.add_argument("--contract-repair", dest="contract_repair", action="store_true",
+                        help="Enable the ONE-shot corrective resume that repairs a malformed "
+                             "report contract on a suspect success (status=success but "
+                             "report_ok=false). Off by default to avoid extra paid turns")
     parser.add_argument("--no-contract-repair", dest="no_contract_repair", action="store_true",
-                        help="Disable the automatic ONE-shot corrective resume that fixes a "
-                             "malformed report contract on a suspect success (status=success but "
-                             "report_ok=false). Off by default; set this to save the extra call")
+                        help="Explicitly disable contract repair (now the default behavior; "
+                             "overrides --contract-repair when both are supplied)")
     parser.add_argument("--debug-dir", dest="debug_dir",
                         help="Dump per-run argv + raw output + envelope into this dir")
     parser.add_argument("--max-tool-output-bytes", dest="max_tool_output_bytes",
@@ -2026,6 +2044,9 @@ def build_parser(version: str, envelope_version) -> argparse.ArgumentParser:
                         help="Wait for a background job's result (read-only poll; --timeout)")
     parser.add_argument("--jobs-wait-all", dest="jobs_wait_all", action="store_true",
                         help="Wait for all active/specified background jobs and return a compact summary")
+    parser.add_argument("--jobs-wait-any", dest="jobs_wait_any", action="store_true",
+                        help="Wait until the first specified/active background job reaches a "
+                             "terminal state and return it plus remaining job IDs")
     parser.add_argument("--jobs-wait-ids", dest="jobs_wait_ids", action="append", default=[],
                         metavar="JOB_ID", help="With --jobs-wait-all: specific job IDs to wait for")
     parser.add_argument("--jobs-active-only", "--active-only", dest="jobs_active_only", action="store_true",

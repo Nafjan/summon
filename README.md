@@ -145,7 +145,7 @@ not installed or required.
 - **Route named local logins:** keep multiple Claude config directories behind private
   profile names, so a public agent definition never carries a machine path or credential.
 
-The workspace and roster changes above ship in **Summon 3.8.1**, whose workspace
+The workspace and roster changes above ship in **Summon 3.9.0**, whose workspace
 features are a preview: provider-free acceptance covers them, but live adapters are
 not stable-certified. See the
 [release gates](docs/planning/EXPECTED_NEXT_RELEASE.md) for what each profile
@@ -384,7 +384,7 @@ python tools/release_gates.py --require-clean --output "${RUNNER_TEMP:-${TMPDIR:
 python tools/release_manifest.py \
   --evidence-file "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/summon-release-evidence.json" \
   --output "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/summon-release-manifest.json" \
-  --expected-version 3.8.1 --check
+  --expected-version 3.9.0 --check
 ```
 
 The runner executes the fixed suites, records output digests, strips backend credentials and
@@ -830,7 +830,7 @@ vendors.
   "raw_backend_exit_code": null,
   "normalized_exit_code": null,
   "exit_code": null,
-  "summon":  { "version": "3.8.1", "scripts_sha256": "<sha256>" },
+  "summon":  { "version": "3.9.0", "scripts_sha256": "<sha256>" },
   "permission": "safe-edit", "permission_flags": ["--permission-mode", "acceptEdits"],
   "usage": { "input_tokens": 12038, "output_tokens": 981 }, "cost_usd": 0.084,
   "billing": { "source": "subscription", "note": "Claude login" },
@@ -1212,6 +1212,12 @@ the dispatch receipt must carry `reported` evidence and `named_model_verified: t
 before an exact served-model claim is accepted. `--list --json` shows each
 seat's declared model and effort. Luna is deliberately separate from Sol and Terra, so a
 cost-efficient Luna turn cannot be mistaken for a Sol review.
+
+Landed in **3.9.0**:
+- **Zero-waste dispatches & clean natural exit**: flips `--contract-repair` to opt-in (ending the automatic double-turn cost on valid freeform/report responses while keeping `--no-contract-repair`), removes phantom `'Final report'` prompt instructions on non-report (`freeform`/`text`/`schema`) turns, grants subprocesses a `2.5s` natural exit grace window after terminal events so healthy CLIs exit `0` without premature `terminate()`, and fixes lazy `_builder` import detection when `shutil.which` is monkeypatched in bare-runner CI tests.
+- **Native `--json-schema` compilation**: compiles schemas natively onto `claude --json-schema` (capturing `structured_output`, up to `16 KiB`) and strict-subset `codex exec --output-schema` (side-effect-free `--dry-run` preview + private per-launch temp cleanup), surfaces `schema_transport`, and marks clean parses `report_ok: true` with `report_source: "json_schema"`.
+- **Single-dispatch `--files-scope` & read-only `--patch-out`**: consolidates porcelain `-z`, committed `--no-renames`, and `linked_deps` worktree auditing into `_receipt.py` and exposes `--files-scope` plus read-only `--patch-out` (zero `git add`, refusing `120000`/`160000` modes and symlinks).
+- **Terminal & piping ergonomics**: adds `-t` / `--text` live redacted streaming to stdout with a UTF-8 stderr summary & `resume:` footer, `--manifest -` stdin support, and `jobs wait --any` / `wait --any` (`--jobs-wait-any`).
 
 Landed in **3.8.1**:
 - **Trustworthy exit codes, cutoffs & background signals**: exits `0` on `status == "success"`,

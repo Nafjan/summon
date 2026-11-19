@@ -15,7 +15,7 @@ from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parent
 RUN = SCRIPTS / "run_subagent.py"
-SERVER_VERSION = "3.8.1"
+SERVER_VERSION = "3.9.0"
 
 
 def _rpc_ok(id_, result):

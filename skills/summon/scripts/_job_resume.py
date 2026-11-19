@@ -1245,6 +1245,7 @@ def validate_loaded_invocation(context: ChildContext, invocation, args, receipt:
             or int(getattr(args, "max_runtime", 0) or 0) != context.max_runtime_ms
             or int(getattr(args, "retries", 0)) != 0
             or not bool(getattr(args, "no_contract_repair", False))
+            or bool(getattr(args, "contract_repair", False))
             or not bool(getattr(args, "no_acp_fallback", False))):
         raise ResumeError("resume_child_drift", "resolved successor differs from its authenticated claim")
     _validate_profile_state(context, invocation, require_path=False)

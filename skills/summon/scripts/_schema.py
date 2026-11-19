@@ -233,6 +233,75 @@ def unsupported_keywords(schema, path: str = "$") -> list:
     return found
 
 
+# Keywords/constructs outside OpenAI/Codex strict JSON-Schema structured outputs.
+_CODEX_STRICT_FORBIDDEN_KEYS = frozenset({
+    "$ref", "$defs", "definitions", "anyOf", "oneOf", "allOf", "not",
+    "if", "then", "else", "patternProperties", "dependencies",
+    "dependentSchemas", "dependentRequired", "const",
+})
+_VALID_SCHEMA_TYPES = frozenset({
+    "object", "array", "string", "integer", "number", "boolean", "null",
+})
+
+
+def is_codex_strict_schema_compatible(schema: object) -> bool:
+    """Return True iff ``schema`` satisfies Codex ``--output-schema`` strict mode."""
+    def _walk(node: object, *, is_root: bool) -> bool:
+        if not isinstance(node, dict):
+            return False
+        if any(key in node for key in _CODEX_STRICT_FORBIDDEN_KEYS):
+            return False
+        node_type = node.get("type")
+        if is_root:
+            if node_type != "object":
+                return False
+        elif node_type is not None:
+            if isinstance(node_type, str):
+                if node_type not in _VALID_SCHEMA_TYPES:
+                    return False
+            elif isinstance(node_type, list):
+                if not node_type or not all(
+                    isinstance(item, str) and item in _VALID_SCHEMA_TYPES
+                    for item in node_type
+                ):
+                    return False
+            else:
+                return False
+
+        is_object = (
+            node_type == "object"
+            or (isinstance(node_type, list) and "object" in node_type)
+            or "properties" in node
+        )
+        if is_object:
+            if node.get("additionalProperties") is not False:
+                return False
+            props = node.get("properties")
+            if props is None:
+                props_dict: dict = {}
+            elif isinstance(props, dict):
+                props_dict = props
+            else:
+                return False
+            req = node.get("required")
+            if not isinstance(req, list) or not all(isinstance(k, str) for k in req):
+                return False
+            if set(req) != set(props_dict.keys()):
+                return False
+            for prop_schema in props_dict.values():
+                if not _walk(prop_schema, is_root=False):
+                    return False
+
+        if "items" in node:
+            items_schema = node["items"]
+            if not isinstance(items_schema, dict) or not _walk(items_schema, is_root=False):
+                return False
+
+        return True
+
+    return _walk(schema, is_root=True)
+
+
 def attach_parsed(response: dict, schema: dict) -> None:
     """Extract + validate the agent's final JSON against ``schema`` and attach
     ``parsed`` / ``parse_ok`` / ``parse_errors`` to the envelope in place.
@@ -244,6 +313,13 @@ def attach_parsed(response: dict, schema: dict) -> None:
              for p, k in unsupported_keywords(schema)]
     if warns:
         response["parse_warnings"] = warns
+    if "structured_output" in response and response["structured_output"] is not None:
+        value = response["structured_output"]
+        errs = validate(value, schema)
+        response["parsed"] = value
+        response["parse_ok"] = not errs
+        response["parse_errors"] = errs
+        return
     value, why = extract_json(response.get("result") or "")
     # Key on the ERROR reason, not `value is None` — a valid JSON `null` extracts
     # as (None, None) and must flow through to validation, not read as a failure.
@@ -264,6 +340,5 @@ def correction_prompt(schema: dict, errors: list) -> str:
         "Your previous reply's JSON did not satisfy the required schema. "
         f"Validation errors: {'; '.join(errors[:10])}\n\n"
         "Reply with ONLY the corrected JSON value (no prose before it) that "
-        f"satisfies this JSON schema:\n{json.dumps(schema)}\n\n"
-        "Then end with your exact 'Final report' block as usual."
+        f"satisfies this JSON schema:\n{json.dumps(schema)}"
     )

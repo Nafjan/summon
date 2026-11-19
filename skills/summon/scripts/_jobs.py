@@ -219,7 +219,7 @@ _FLAG_ALLOWLIST = ("agent", "cli", "model", "effort", "timeout", "cwd",
                    "strict_agents_dir", "enable_roles", "read_root", "isolated_lane",
                    "allow_tool_credentials", "adaptive_timeout", "hard_timeout",
                    "max_runtime", "mission_id", "mission_max_work_tokens",
-                   "mission_max_cost_usd")
+                   "mission_max_cost_usd", "files_scope", "patch_out")
 
 
 def flags_projection(args) -> dict:

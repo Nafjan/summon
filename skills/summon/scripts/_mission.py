@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 import _mission_budget
+import _receipt
 import _resource_governor
 import _rundir
 from _builder import clamp_permission
@@ -75,54 +76,13 @@ def normalize_files_scope(files_scope: Any) -> list[str]:
             "task files_scope must be a list of relative path patterns",
             error_kind="invalid_files_scope",
         )
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for raw in files_scope:
-        if not isinstance(raw, str) or not raw.strip():
-            raise MissionError(
-                "task files_scope entries must be non-empty strings",
-                error_kind="invalid_files_scope",
-            )
-        clean = raw.strip().replace("\\", "/")
-        if clean.startswith("/") or re.match(r"^[A-Za-z]:", clean):
-            raise MissionError(
-                f"task files_scope entry {raw!r} must be relative, not absolute",
-                error_kind="invalid_files_scope",
-            )
-        norm = posixpath.normpath(clean)
-        if norm in ("", ".") or norm == ".." or norm.startswith("../") or "/../" in f"/{norm}/":
-            raise MissionError(
-                f"task files_scope entry {raw!r} escapes the repository root",
-                error_kind="invalid_files_scope",
-            )
-        if clean.endswith("/") and not norm.endswith("/"):
-            norm = norm + "/"
-        if norm not in seen:
-            seen.add(norm)
-            normalized.append(norm)
-    return normalized
+    try:
+        return _receipt.normalize_files_scope(files_scope, allow_csv=False)
+    except ValueError as exc:
+        raise MissionError(str(exc), error_kind="invalid_files_scope") from exc
 
 
-def path_matches_scope(rel_path: str, files_scope: list[str]) -> bool:
-    """Return True if ``rel_path`` is covered by ``files_scope`` (empty scope = unrestricted)."""
-    if not files_scope:
-        return True
-    candidate = rel_path.strip().replace("\\", "/").lstrip("/")
-    cand_norm = posixpath.normpath(candidate)
-    for pattern in files_scope:
-        pat = pattern.strip().replace("\\", "/")
-        if pat.endswith("/"):
-            prefix = pat.rstrip("/")
-            if cand_norm == prefix or cand_norm.startswith(prefix + "/"):
-                return True
-        elif "*" in pat or "?" in pat or "[" in pat:
-            if fnmatch.fnmatchcase(cand_norm, pat):
-                return True
-        else:
-            pat_norm = posixpath.normpath(pat)
-            if cand_norm == pat_norm or cand_norm.startswith(pat_norm + "/"):
-                return True
-    return False
+path_matches_scope = _receipt.path_matches_scope
 
 
 def _clamp_tier(proposed: str | None, ceiling: str) -> tuple[str, bool]:
@@ -505,46 +465,24 @@ def verify_and_integrate_task(
 
     try:
         # Auto-commit any uncommitted edits left in the task worktree so diff/merge is complete.
-        status_proc = subprocess.run(
-            [*git_wt, "status", "--porcelain=v1", "--untracked-files=all", "-z"],
-            capture_output=True,
-            timeout=20,
-            **run_flags(),
-        )
-        if status_proc.returncode != 0:
+        ld_info = wt_info.get("linked_deps") if isinstance(wt_info.get("linked_deps"), dict) else {}
+        ld_paths: list[str] = []
+        if ld_info.get("deps_mutated") is False and ld_info.get("links_intact") is True:
+            ld_paths = [str(lp) for lp in (ld_info.get("paths") or ()) if lp]
+        try:
+            pre_changes = _receipt.collect_worktree_changes(
+                task_wt,
+                include_dirty=True,
+                linked_deps_paths=ld_paths,
+            )
+        except RuntimeError:
             return {
                 "task_id": tid,
                 "status": "git_verification_failed",
                 "merged": False,
                 "reason": "git status failed in task worktree",
             }
-        dirty_paths: list[str] = []
-        if status_proc.stdout:
-            entries = [e.decode("utf-8", errors="replace") for e in status_proc.stdout.split(b"\x00") if e]
-            idx = 0
-            while idx < len(entries):
-                entry = entries[idx]
-                if len(entry) >= 4:
-                    xy = entry[:2]
-                    rel = entry[3:]
-                    dirty_paths.append(rel)
-                    if "R" in xy or "C" in xy:
-                        idx += 1
-                        if idx < len(entries):
-                            dirty_paths.append(entries[idx])
-                idx += 1
-
-        ld_info = wt_info.get("linked_deps") if isinstance(wt_info.get("linked_deps"), dict) else {}
-        ld_exact: set[str] = set()
-        if ld_info.get("deps_mutated") is False and ld_info.get("links_intact") is True:
-            ld_exact = {str(lp).replace("\\", "/").strip("/") for lp in (ld_info.get("paths") or ()) if lp}
-            ld_prefixes = [f"{lp}/" for lp in ld_exact if lp]
-            filtered_dirty: list[str] = []
-            for p in dirty_paths:
-                norm_p = p.replace("\\", "/").strip("/")
-                if norm_p not in ld_exact and not any(norm_p.startswith(pref) for pref in ld_prefixes):
-                    filtered_dirty.append(p)
-            dirty_paths = filtered_dirty
+        dirty_paths: list[str] = list(pre_changes["dirty_paths"])
 
         files_scope = task.get("files_scope") or []
         # Check dirty paths against files_scope BEFORE staging/committing!
@@ -553,7 +491,7 @@ def verify_and_integrate_task(
         ]
 
         if dirty_paths and not out_of_scope:
-            add_cmd = [*git_wt, "add", "--", *dirty_paths] if ld_exact else [*git_wt, "add", "-A"]
+            add_cmd = [*git_wt, "add", "--", *dirty_paths] if ld_paths else [*git_wt, "add", "-A"]
             add_proc = subprocess.run(add_cmd, capture_output=True, timeout=20, **run_flags())
             if add_proc.returncode != 0:
                 return {
@@ -598,26 +536,22 @@ def verify_and_integrate_task(
             }
 
         # Inspect all files changed between base_head and task_head.
-        diff_proc = subprocess.run(
-            [*git_wt, "diff", "--no-renames", "--name-only", "-z", f"{base_head}..{task_head}"],
-            capture_output=True,
-            timeout=20,
-            **run_flags(),
-        )
-        if diff_proc.returncode != 0:
+        try:
+            post_changes = _receipt.collect_worktree_changes(
+                task_wt,
+                base_head=base_head,
+                head_ref=task_head,
+                include_dirty=False,
+                linked_deps_paths=ld_paths,
+            )
+        except RuntimeError:
             return {
                 "task_id": tid,
                 "status": "git_verification_failed",
                 "merged": False,
                 "reason": "git diff failed in task worktree",
             }
-        committed_paths: list[str] = []
-        if diff_proc.stdout:
-            committed_paths = [
-                p.decode("utf-8", errors="replace")
-                for p in diff_proc.stdout.split(b"\x00")
-                if p
-            ]
+        committed_paths: list[str] = list(post_changes["committed_files"])
 
         for p in committed_paths:
             if not path_matches_scope(p, files_scope) and p not in out_of_scope:

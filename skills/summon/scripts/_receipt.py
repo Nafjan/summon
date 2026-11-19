@@ -10,13 +10,17 @@ receipt's ``script``/``version`` always name run_subagent.py, never THIS module
 from __future__ import annotations
 
 import argparse
+import difflib
+import fnmatch
 import hashlib
 import ntpath
 import os
+import posixpath
 import queue
 import re
 import stat as _stat
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -750,3 +754,378 @@ def workspace_evidence(before: dict | None, after: dict | None,
         if writer_reported_only:
             result["writer_reported_only"] = writer_reported_only
     return result
+
+
+def normalize_files_scope(values, *, allow_csv: bool = True) -> list[str]:
+    """Validate and normalize ``files_scope`` entries into relative POSIX patterns."""
+    if values is None:
+        return []
+    raw_items: list[str] = []
+    if isinstance(values, str):
+        if not allow_csv:
+            raise ValueError("files_scope must be a list of relative path patterns")
+        raw_items = values.split(",")
+    else:
+        try:
+            seq = list(values)
+        except TypeError as exc:
+            raise ValueError("files_scope must be a sequence of relative path patterns") from exc
+        for item in seq:
+            if not isinstance(item, str):
+                raise ValueError("files_scope entries must be non-empty strings")
+            if allow_csv and "," in item:
+                raw_items.extend(item.split(","))
+            else:
+                raw_items.append(item)
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_items:
+        if not isinstance(raw, str) or not raw.strip() or "\x00" in raw:
+            raise ValueError("files_scope entries must be non-empty relative path patterns")
+        clean = raw.strip().strip("'\"").replace("\\", "/")
+        if not clean:
+            raise ValueError("files_scope entries must be non-empty relative path patterns")
+        if clean.startswith("/") or re.match(r"^[A-Za-z]:", clean):
+            raise ValueError(f"files_scope entry {raw!r} must be relative, not absolute")
+        norm = posixpath.normpath(clean)
+        if norm in ("", ".") or norm == ".." or norm.startswith("../") or "/../" in f"/{norm}/":
+            raise ValueError(f"files_scope entry {raw!r} escapes the repository root")
+        if clean.endswith("/") and not norm.endswith("/"):
+            norm = norm + "/"
+        if norm not in seen:
+            seen.add(norm)
+            normalized.append(norm)
+    return normalized
+
+
+def path_matches_scope(rel_path: str, scope) -> bool:
+    """Return True if ``rel_path`` matches ``scope`` (empty scope = unrestricted)."""
+    if not scope:
+        return True
+    candidate = str(rel_path or "").strip().replace("\\", "/").lstrip("/")
+    cand_norm = posixpath.normpath(candidate)
+    for pattern in scope:
+        pat = str(pattern or "").strip().replace("\\", "/")
+        if pat.startswith("./"):
+            pat = pat[2:]
+        if pat.endswith("/"):
+            prefix = pat.rstrip("/")
+            if cand_norm == prefix or cand_norm.startswith(prefix + "/"):
+                return True
+        elif "*" in pat or "?" in pat or "[" in pat:
+            if fnmatch.fnmatchcase(cand_norm, pat):
+                return True
+            if "**/" in pat and fnmatch.fnmatchcase(cand_norm, pat.replace("**/", "")):
+                return True
+        else:
+            pat_norm = posixpath.normpath(pat)
+            if cand_norm == pat_norm or cand_norm.startswith(pat_norm + "/"):
+                return True
+    return False
+
+
+def _filter_excluded_paths(
+    paths: list[str], ld_exact: set[str], ld_prefixes: list[str],
+    excluded_sink: list[str],
+) -> list[str]:
+    if not ld_exact:
+        return list(paths)
+    kept: list[str] = []
+    for p in paths:
+        norm_p = p.replace("\\", "/").strip("/")
+        if norm_p in ld_exact or any(norm_p.startswith(pref) for pref in ld_prefixes):
+            excluded_sink.append(p)
+        else:
+            kept.append(p)
+    return kept
+
+
+def _parse_porcelain_z(raw_stdout: bytes | str | None) -> tuple[list[str], list[str]]:
+    """Parse ``git status --porcelain=v1 -z`` into ``(tracked_dirty, untracked_files)``."""
+    raw = raw_stdout.decode("utf-8", errors="replace") if isinstance(raw_stdout, bytes) else str(raw_stdout or "")
+    tracked_dirty: list[str] = []
+    untracked: list[str] = []
+    if not raw:
+        return tracked_dirty, untracked
+    entries = [e for e in raw.split("\x00") if e]
+    idx = 0
+    while idx < len(entries):
+        entry = entries[idx]
+        if len(entry) >= 4:
+            xy = entry[:2]
+            rel = entry[3:]
+            if xy == "??":
+                if rel:
+                    untracked.append(rel)
+            else:
+                if rel:
+                    tracked_dirty.append(rel)
+                if ("R" in xy or "C" in xy) and idx + 1 < len(entries):
+                    idx += 1
+                    extra = entries[idx]
+                    if extra:
+                        tracked_dirty.append(extra)
+        idx += 1
+    return tracked_dirty, untracked
+
+
+def collect_worktree_changes(
+    worktree_cwd: str,
+    *,
+    base_head: str | None = None,
+    head_ref: str | None = "HEAD",
+    include_dirty: bool = True,
+    linked_deps_paths: list[str] | tuple[str, ...] = (),
+) -> dict:
+    """Collect changed, committed, dirty, and untracked files in ``worktree_cwd``."""
+    from _spawn import run_flags
+
+    ld_exact = {
+        str(lp).replace("\\", "/").strip("/")
+        for lp in (linked_deps_paths or ())
+        if isinstance(lp, str) and lp.strip()
+    }
+    ld_prefixes = [f"{lp}/" for lp in ld_exact if lp]
+    excluded: list[str] = []
+
+    raw_tracked_dirty: list[str] = []
+    raw_untracked: list[str] = []
+    if include_dirty:
+        status_proc = subprocess.run(
+            [
+                "git", "--no-optional-locks", "-C", worktree_cwd,
+                "status", "--porcelain=v1", "-z", "--untracked-files=all",
+            ],
+            capture_output=True,
+            timeout=20,
+            **run_flags(),
+        )
+        if status_proc.returncode != 0:
+            raise RuntimeError(f"git status failed (rc={status_proc.returncode})")
+        raw_tracked_dirty, raw_untracked = _parse_porcelain_z(status_proc.stdout)
+
+    raw_committed: list[str] = []
+    if base_head:
+        diff_target = f"{base_head}..{head_ref}" if head_ref else str(base_head)
+        diff_proc = subprocess.run(
+            [
+                "git", "--no-optional-locks", "-C", worktree_cwd,
+                "diff", "--no-renames", "--name-only", "-z", diff_target,
+            ],
+            capture_output=True,
+            timeout=20,
+            **run_flags(),
+        )
+        if diff_proc.returncode != 0:
+            raise RuntimeError(f"git diff failed (rc={diff_proc.returncode})")
+        diff_raw = (
+            diff_proc.stdout.decode("utf-8", errors="replace")
+            if isinstance(diff_proc.stdout, bytes)
+            else str(diff_proc.stdout or "")
+        )
+        raw_committed = [tok for tok in diff_raw.split("\x00") if tok]
+
+    tracked_dirty = _filter_excluded_paths(raw_tracked_dirty, ld_exact, ld_prefixes, excluded)
+    untracked_files = _filter_excluded_paths(raw_untracked, ld_exact, ld_prefixes, excluded)
+    committed_files = _filter_excluded_paths(raw_committed, ld_exact, ld_prefixes, excluded)
+    dirty_paths = sorted(set(tracked_dirty) | set(untracked_files))
+    changed_files = sorted(set(dirty_paths) | set(committed_files))
+    return {
+        "changed_files": changed_files,
+        "committed_files": sorted(set(committed_files)),
+        "dirty_paths": dirty_paths,
+        "tracked_dirty": sorted(set(tracked_dirty)),
+        "untracked_files": sorted(set(untracked_files)),
+        "excluded_linked_deps": sorted(set(excluded)),
+    }
+
+
+def _is_reparse_point(path: str) -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        attrs = getattr(os.lstat(path), "st_file_attributes", 0)
+        return bool(attrs & 0x400)
+    except OSError:
+        return False
+
+
+def validate_patch_out_path(out_path: str) -> str:
+    """Validate a ``--patch-out`` destination before opening or writing."""
+    if not isinstance(out_path, str) or not out_path.strip():
+        raise ValueError("patch output path must be non-empty")
+    if "\x00" in out_path:
+        raise ValueError("patch output path contains NUL byte")
+    abs_out = os.path.abspath(out_path)
+    if os.path.lexists(abs_out):
+        if os.path.isdir(abs_out):
+            raise ValueError(f"patch output path is a directory: {abs_out}")
+        if os.path.islink(abs_out) or _is_reparse_point(abs_out):
+            raise ValueError(f"refusing symlink/reparse patch output path: {abs_out}")
+    parent = os.path.dirname(abs_out)
+    if parent and os.path.lexists(parent):
+        if not os.path.isdir(parent):
+            raise ValueError(f"patch output parent is not a directory: {parent}")
+        if os.path.islink(parent) or _is_reparse_point(parent):
+            raise ValueError(f"refusing symlink/reparse parent directory: {parent}")
+    return abs_out
+
+
+def export_worktree_patch(
+    worktree_cwd: str,
+    out_path: str,
+    *,
+    base_head: str,
+    linked_deps_paths: list[str] | tuple[str, ...] = (),
+    max_bytes: int = 10 * 1024 * 1024,
+) -> dict:
+    """Export a read-only unified patch against ``base_head`` (zero ``git add``)."""
+    from _spawn import run_flags
+
+    abs_out = validate_patch_out_path(out_path)
+    if not isinstance(base_head, str) or not base_head.strip():
+        raise ValueError("base_head is required for patch export")
+
+    ld_exact = {
+        str(lp).replace("\\", "/").strip("/")
+        for lp in (linked_deps_paths or ())
+        if isinstance(lp, str) and lp.strip()
+    }
+    ld_prefixes = [f"{lp}/" for lp in ld_exact if lp]
+
+    raw_proc = subprocess.run(
+        ["git", "--no-optional-locks", "-C", worktree_cwd, "diff", "--raw", "-z", base_head],
+        capture_output=True,
+        timeout=20,
+        **run_flags(),
+    )
+    if raw_proc.returncode != 0:
+        raise ValueError(f"git diff --raw failed (rc={raw_proc.returncode})")
+    raw_tokens = [tok.decode("utf-8", errors="replace") for tok in (raw_proc.stdout or b"").split(b"\x00") if tok]
+    idx = 0
+    while idx < len(raw_tokens):
+        hdr = raw_tokens[idx]
+        idx += 1
+        if not hdr.startswith(":") or idx >= len(raw_tokens):
+            continue
+        parts = hdr[1:].split()
+        if len(parts) < 5:
+            continue
+        old_mode, new_mode, status_flag = parts[0], parts[1], parts[4]
+        rel_p = raw_tokens[idx]
+        idx += 1
+        extra_p = None
+        if status_flag[:1] in ("R", "C") and idx < len(raw_tokens):
+            extra_p = raw_tokens[idx]
+            idx += 1
+        candidates = [p for p in (rel_p, extra_p) if p]
+        non_dep = [
+            p for p in candidates
+            if p.replace("\\", "/").strip("/") not in ld_exact
+            and not any(p.replace("\\", "/").strip("/").startswith(pref) for pref in ld_prefixes)
+        ]
+        if non_dep and (old_mode in ("120000", "160000") or new_mode in ("120000", "160000")):
+            raise ValueError(
+                f"refusing patch export containing symlink or gitlink entry ({old_mode}->{new_mode}): {non_dep[0]}"
+            )
+
+    if ld_exact:
+        diff_cmd = [
+            "git", "--no-optional-locks", "-C", worktree_cwd,
+            "diff", "--binary", base_head, "--", ".",
+        ]
+        for lp in sorted(ld_exact):
+            diff_cmd.append(f":(exclude){lp}")
+        diff_proc = subprocess.run(diff_cmd, capture_output=True, timeout=20, **run_flags())
+    else:
+        diff_proc = subprocess.run(
+            ["git", "--no-optional-locks", "-C", worktree_cwd, "diff", "--binary", base_head],
+            capture_output=True,
+            timeout=20,
+            **run_flags(),
+        )
+    if diff_proc.returncode != 0:
+        raise ValueError(f"git diff --binary failed (rc={diff_proc.returncode})")
+    tracked_bytes = diff_proc.stdout or b""
+
+    changes = collect_worktree_changes(
+        worktree_cwd,
+        base_head=None,
+        include_dirty=True,
+        linked_deps_paths=tuple(sorted(ld_exact)),
+    )
+    untracked_chunks: list[bytes] = []
+    included_untracked: list[str] = []
+    total_size = len(tracked_bytes)
+    for rel in changes["untracked_files"]:
+        full = os.path.join(worktree_cwd, *rel.split("/"))
+        if os.path.islink(full) or _is_reparse_point(full):
+            raise ValueError(f"refusing symlink/reparse untracked file in patch export: {rel}")
+        st = os.lstat(full)
+        if _stat.S_ISLNK(st.st_mode) or not _stat.S_ISREG(st.st_mode):
+            raise ValueError(f"refusing non-regular untracked file in patch export: {rel}")
+        if total_size + st.st_size > max_bytes:
+            raise ValueError(f"patch export exceeds max_bytes limit ({max_bytes})")
+        data = Path(full).read_bytes()
+        if b"\x00" in data:
+            raise ValueError(f"refusing binary untracked file in read-only patch export: {rel}")
+        rel_posix = rel.replace("\\", "/")
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"refusing non-UTF-8 untracked file in patch export: {rel}") from exc
+        lines = text.splitlines(keepends=True)
+        diff_lines = [
+            f"diff --git a/{rel_posix} b/{rel_posix}\n",
+            "new file mode 100644\n",
+        ]
+        if lines:
+            hunks = list(difflib.unified_diff(
+                [],
+                lines,
+                fromfile="/dev/null",
+                tofile=f"b/{rel_posix}",
+                lineterm="\n",
+            ))
+            diff_lines.extend(hunks)
+            if not lines[-1].endswith(("\n", "\r")):
+                diff_lines.append("\n\\ No newline at end of file\n")
+        chunk_bytes = "".join(diff_lines).encode("utf-8")
+        total_size += len(chunk_bytes)
+        if total_size > max_bytes:
+            raise ValueError(f"patch export exceeds max_bytes limit ({max_bytes})")
+        untracked_chunks.append(chunk_bytes)
+        included_untracked.append(rel_posix)
+
+    untracked_bytes = b"".join(untracked_chunks)
+    if tracked_bytes and untracked_bytes and not tracked_bytes.endswith(b"\n"):
+        patch_bytes = tracked_bytes + b"\n" + untracked_bytes
+    else:
+        patch_bytes = tracked_bytes + untracked_bytes
+    if len(patch_bytes) > max_bytes:
+        raise ValueError(f"patch export exceeds max_bytes limit ({max_bytes})")
+
+    parent_dir = os.path.dirname(abs_out)
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".summon-patch-", dir=parent_dir or None)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(patch_bytes)
+        os.replace(tmp_path, abs_out)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+    return {
+        "path": abs_out,
+        "bytes": len(patch_bytes),
+        "sha256": hashlib.sha256(patch_bytes).hexdigest(),
+        "base_head": base_head,
+        "tracked_diff_bytes": len(tracked_bytes),
+        "untracked_files_included": included_untracked,
+    }

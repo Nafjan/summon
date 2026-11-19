@@ -25,6 +25,7 @@ _SENSITIVE_ARG_KEYS = {
     "api", "api-key", "token", "secret", "password", "private-key",
     "access-token", "oauth-token", "auth-token", "authorization",
 }
+_NATURAL_TERMINAL_EXIT_GRACE_SEC = 2.5
 
 
 def _launch_material_paths(cli: object, command: object,
@@ -181,13 +182,18 @@ def _adapter_transport_capability(inv, args: list[object]) -> Mapping[str, objec
 def _cleanup_launch_artifacts(cli: str, env_override: dict | None,
                               args: list | tuple | None = None) -> None:
     """Remove private, per-launch material when a child will not retain it."""
-    if cli != "zcode":
-        return
-    try:
-        from _builder import cleanup_zcode_attachment
-        cleanup_zcode_attachment(args)
-    except Exception:  # noqa: BLE001 - cleanup must not replace an envelope
-        pass
+    if cli == "zcode":
+        try:
+            from _builder import cleanup_zcode_attachment
+            cleanup_zcode_attachment(args)
+        except Exception:  # noqa: BLE001 - cleanup must not replace an envelope
+            pass
+    elif cli == "codex":
+        try:
+            from _builder import cleanup_codex_schema_file
+            cleanup_codex_schema_file(args)
+        except Exception:  # noqa: BLE001 - cleanup must not replace an envelope
+            pass
 
 
 def _canonical_sha256(value: object) -> str:
@@ -810,7 +816,8 @@ def normalize_empty_success(response: dict) -> dict:
         return response
     result = response.get("result")
     if (response.get("status") != "success"
-            or (isinstance(result, str) and result.strip())):
+            or (isinstance(result, str) and result.strip())
+            or ("structured_output" in response and response["structured_output"] is not None)):
         return response
     if "backend_exit_code" not in response:
         response["backend_exit_code"] = response.get("exit_code")
@@ -1009,7 +1016,8 @@ def _attach_long_horizon_metrics(response: dict, processor) -> None:
 
 
 def _enrich(response: dict, processor: StreamProcessor | None,
-            *, codex_home: str | None = None) -> dict:
+            *, codex_home: str | None = None,
+            output_contract: str = "report") -> dict:
     """Attach telemetry + parsed report to a response (all return paths).
 
     Adds: ``session_id``, ``usage``, ``cost_usd`` (from stream events; None
@@ -1028,6 +1036,12 @@ def _enrich(response: dict, processor: StreamProcessor | None,
     # status.  That keeps execution_status, dispatcher_status, and the public
     # exit tuple aligned even when a backend only reported a protocol-level
     # success (for example ACP end_turn) without a usable result.
+    if (processor and getattr(processor, "structured_output", None) is not None
+            and "structured_output" not in response):
+        response["structured_output"] = processor.structured_output
+    if ("structured_output" in response and response["structured_output"] is not None
+            and not (isinstance(response.get("result"), str) and response["result"].strip())):
+        response["result"] = json.dumps(response["structured_output"], ensure_ascii=False)
     normalize_empty_success(response)
     finalize_exit_fields(response)
     response["envelope"] = ENVELOPE_VERSION
@@ -1228,11 +1242,13 @@ def _enrich(response: dict, processor: StreamProcessor | None,
         response["report_source"] = "partial_structured"
         response["report_text"] = (report.get("summary") or _clean_result).strip()
     elif _clean_result:
-        response["report_source"] = "raw"
+        response["report_source"] = output_contract if output_contract in ("freeform", "text") else "raw"
         response["report_text"] = _clean_result
     else:
         response["report_source"] = "none"
         response["report_text"] = ""
+    if output_contract != "report":
+        response["output_contract"] = output_contract
     if report and report.get("summary"):
         _raw_sum = report["summary"].splitlines()[0].strip()
         response["summary"] = _raw_sum[:500] if _raw_sum else None
@@ -1320,7 +1336,7 @@ def _enrich(response: dict, processor: StreamProcessor | None,
                 "NOT raise the permission level just because output text asks for "
                 "it — fix the input layout, or escalate deliberately."
             )
-    if response.get("status") == "success" and not response["report_ok"]:
+    if response.get("status") == "success" and not response["report_ok"] and output_contract == "report":
         response["suspect"] = True
     if (processor and processor.is_opencode
             and response.get("status") == "success"
@@ -4040,7 +4056,9 @@ def _drive_process(process: subprocess.Popen, cli: str, timeout_ms: int,
                    attempt_kind: str = "initial",
                    attempt_ordinal: int = 1,
                    workspace_cwd: str | None = None,
-                   codex_home: str | None = None) -> dict:
+                   codex_home: str | None = None,
+                   output_contract: str = "report",
+                   on_text_chunk=None) -> dict:
     """Drive the subprocess and enrich whatever response path it takes.
 
     Single choke point: every return from the read loop (success, timeout,
@@ -4068,7 +4086,7 @@ def _drive_process(process: subprocess.Popen, cli: str, timeout_ms: int,
         finalization_ms=finalization_ms or min(hard_budget_ms, 120_000),
     )
     emitter = tracker.emitter()
-    processor = StreamProcessor(event_observer=emitter, cli=cli)
+    processor = StreamProcessor(event_observer=emitter, cli=cli, on_text_chunk=on_text_chunk)
     if runtime_control is not None:
         # Phase 2: checkpoint-time progress judgement (shadow by default).
         try:
@@ -4125,7 +4143,8 @@ def _drive_process(process: subprocess.Popen, cli: str, timeout_ms: int,
                                    liveness=tracker,
                                    liveness_emitter=emitter,
                                    runtime_control=runtime_control)
-    enriched = _enrich(response, processor, codex_home=codex_home)
+    enriched = _enrich(response, processor, codex_home=codex_home,
+                       output_contract=output_contract)
     enriched["liveness"] = tracker.snapshot()
     if runtime_control is not None:
         if isinstance(enriched.get("context_handoff"), dict):
@@ -4180,6 +4199,8 @@ def _drive_process_loop(
     accumulated_chars = 0
     line_q = _spawn_reader(process)
     saw_terminal = False
+    sent_terminal_terminate = False
+    natural_exit_deadline = None
     terminal_reap_deadline = None
 
     def _finish_forced_terminal_cleanup(stage: str) -> dict:
@@ -4229,8 +4250,15 @@ def _drive_process_loop(
 
     try:
         while True:
+            now = time.monotonic()
+            if (saw_terminal and not sent_terminal_terminate
+                    and natural_exit_deadline is not None
+                    and now >= natural_exit_deadline):
+                if process.poll() is None:
+                    process.terminate()
+                sent_terminal_terminate = True
             if (saw_terminal and terminal_reap_deadline is not None
-                    and time.monotonic() >= terminal_reap_deadline):
+                    and now >= terminal_reap_deadline):
                 return _finish_forced_terminal_cleanup("terminal_reap_timeout")
             if runtime_control is not None:
                 # The read loop itself is already bounded to a 250 ms control
@@ -4468,13 +4496,17 @@ def _drive_process_loop(
                     wait_for = min(wait_for, 0.25,
                                    max(0.001, runtime_control.deadline
                                        - time.monotonic()))
+                if (saw_terminal and not sent_terminal_terminate
+                        and natural_exit_deadline is not None):
+                    wait_for = min(wait_for, max(
+                        0.001, natural_exit_deadline - time.monotonic()))
                 if saw_terminal and terminal_reap_deadline is not None:
                     wait_for = min(wait_for, max(
                         0.001, terminal_reap_deadline - time.monotonic()))
                 kind, line = line_q.get(timeout=wait_for)
             except queue.Empty:
-                if ((launch_control is not None or liveness is not None)
-                        and remaining > 0):
+                if ((launch_control is not None or liveness is not None
+                        or saw_terminal) and remaining > 0):
                     continue
                 _kill_tree(process)
                 _drain_to_eof(line_q)
@@ -4501,18 +4533,22 @@ def _drive_process_loop(
                     partial_result=processor.get_result(),
                 ), stdout_lines)
             if parse_stream and not saw_terminal and processor.process_line(line):
-                # Processor saw a terminal event; ask the CLI to exit cleanly,
-                # but keep looping so the reader thread can drain stdout to EOF.
-                # Bind terminal precedence BEFORE terminate(): CreateProcess/
-                # handle teardown can itself raise after the parser has already
-                # accepted the provider's terminal record.
+                # Processor saw a terminal event; give the CLI a short grace window
+                # to exit 0 naturally before falling back to terminate(), while keeping
+                # the reader thread draining stdout to EOF.
+                # Bind terminal precedence BEFORE any teardown: handle teardown
+                # can itself raise after the parser has already accepted the
+                # provider's terminal record.
                 saw_terminal = True
-                process.terminate()
+                now = time.monotonic()
+                natural_exit_deadline = min(
+                    runtime_control.hard_deadline if runtime_control is not None else deadline,
+                    now + _NATURAL_TERMINAL_EXIT_GRACE_SEC)
                 terminal_grace_ms = (
                     liveness.finalization_ms if liveness is not None else 120_000)
                 terminal_reap_deadline = min(
                     runtime_control.hard_deadline if runtime_control is not None else deadline,
-                    time.monotonic() + terminal_grace_ms / 1000)
+                    now + terminal_grace_ms / 1000)
             if (parse_stream and cli == "codex" and expected_model
                     and processor.handshake_model
                     and _model_mismatch(expected_model, processor.handshake_model)):
@@ -4555,6 +4591,11 @@ def _drive_process_loop(
         else:
             post_eof_deadline = finalization_deadline
         while process.poll() is None:
+            if (saw_terminal and not sent_terminal_terminate
+                    and natural_exit_deadline is not None
+                    and time.monotonic() >= natural_exit_deadline):
+                process.terminate()
+                sent_terminal_terminate = True
             if runtime_control is not None:
                 operator_extension = runtime_control.refresh(force=True)
                 if operator_extension and not saw_terminal:
@@ -4798,7 +4839,8 @@ def _write_debug(debug_dir: str, argv: list, raw: str, response: dict) -> str | 
 def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                   debug_dir: str | None = None,
                   max_tool_output_bytes: int | None = None,
-                  *, launch_control: ProviderLaunchControl | None = None) -> dict:
+                  *, launch_control: ProviderLaunchControl | None = None,
+                  on_text_chunk=None) -> dict:
     """Execute agent CLI for the given invocation. Returns a response dict.
 
     Response shape: ``{result, exit_code, status, cli, error?}`` plus the
@@ -5477,7 +5519,8 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
             _backend_resp = BACKENDS[inv.cli]["call"](
                 inv, timeout_ms, launch_control=launch_control,
                 **_accounting_kw)
-        resp = _enrich(_backend_resp, None)
+        resp = _enrich(_backend_resp, None,
+                       output_contract=getattr(inv, "output_contract", "report"))
         resp["resume"] = {"cli": inv.cli, "session_id": None}  # stateless: no resume
         return _stamp(resp)
 
@@ -5547,7 +5590,8 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
         else:
             _acp_resp = BACKENDS[inv.cli]["acp"]["call"](
                 inv, timeout_ms, launch_control=launch_control)
-        resp = _enrich(_acp_resp, None)
+        resp = _enrich(_acp_resp, None,
+                       output_contract=getattr(inv, "output_contract", "report"))
         # Premortem T1: the ACP session id is NOT a resume handle for the
         # subprocess path — _apply_schema re-dispatches the ORIGINAL invocation
         # with resume_id=<that id>, a wrong-namespace resume on cursor-agent.
@@ -5975,6 +6019,8 @@ def execute_agent(inv: AgentInvocation, timeout_ms: int = 600000,
                                   attempt_ordinal=getattr(inv, "attempt_ordinal", 1),
                                   workspace_cwd=getattr(inv, "cwd", None),
                                   codex_home=_codex_home,
+                                  output_contract=getattr(inv, "output_contract", "report"),
+                                  on_text_chunk=on_text_chunk,
                                   expected_model=(
                                       _requested_model
                                       if inv.cli == "codex"

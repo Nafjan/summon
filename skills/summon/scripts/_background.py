@@ -70,7 +70,11 @@ def _submission_accounting_grants(args: argparse.Namespace) -> dict:
         "transient_retry": retry_grant,
         "acp_fallback": 0 if getattr(args, "no_acp_fallback", False) else 1,
         "schema_correction": 1 if getattr(args, "json_schema", None) else 0,
-        "contract_repair": 0 if getattr(args, "no_contract_repair", False) else 1,
+        "contract_repair": (
+            1 if (getattr(args, "contract_repair", False)
+                  and not getattr(args, "no_contract_repair", False))
+            else 0
+        ),
         # Evidence authority only. The adapter's existing consent, endpoint,
         # secondary-launch, and deadline gates remain unchanged. Standing
         # operator consent is an already-authorized fresh path, but it must
@@ -262,6 +266,8 @@ def child_argv(args: argparse.Namespace, result_file: str, *, private_resume: bo
         out += ["--require-tools"]
     if getattr(args, "require_exact_model", False):
         out += ["--require-exact-model"]
+    if getattr(args, "contract_repair", False) and not getattr(args, "no_contract_repair", False):
+        out += ["--contract-repair"]
     if getattr(args, "no_contract_repair", False):
         out += ["--no-contract-repair"]     # honor the opt-out in the detached child
     if getattr(args, "no_acp_fallback", False):
@@ -316,6 +322,11 @@ def child_argv(args: argparse.Namespace, result_file: str, *, private_resume: bo
         out += ["--gate-timeout", str(args.gate_timeout)]
     if args.worktree is not None:
         out += [f"--worktree={args.worktree}"]  # =form is unambiguous for the bare case
+    for scope_item in (getattr(args, "_files_scope_normalized", None)
+                       or getattr(args, "files_scope", None) or ()):
+        out += ["--files-scope", str(scope_item)]
+    if getattr(args, "patch_out", None) is not None:
+        out += ["--patch-out", str(args.patch_out)]
     if getattr(args, "link_deps", None):
         out += ["--link-deps", str(args.link_deps)]
     if getattr(args, "link_deps_allow_mutation", False):
@@ -755,6 +766,7 @@ def _resume_dispatch_args(args, reservation):
     child.retries = 0
     child.transient_retries = False
     child.retry_nonretryable = False
+    child.contract_repair = False
     child.no_contract_repair = True
     child.no_acp_fallback = True
     child.allow_kimi_acp_fallback = False
@@ -1019,20 +1031,153 @@ def run_jobs_query(args, emit_error, *, entry_path: str | None = None,
         st["heartbeat"] = private_heartbeat
         print(json.dumps(st, ensure_ascii=False))
         return 0
+    if getattr(args, "jobs_wait_all", False) and getattr(args, "jobs_wait_any", False):
+        emit_error("cannot combine --jobs-wait-all and --jobs-wait-any")
+        return 1
+
+    def _validate_target_ids(target_ids: list[str]) -> bool:
+        for jid in target_ids:
+            if not _jobs.valid_job_id(jid):
+                emit_error(f"invalid job id: {jid!r}")
+                return False
+            rec, rec_state = _jobs._read(_jobs.record_path(root, jid))
+            res, res_state = _jobs._read(_jobs.result_path(root, jid))
+            if rec is None and rec_state == "missing" and res is None and res_state == "missing":
+                emit_error(f"background job {jid!r} was not found in this job directory; check --job-dir")
+                return False
+        return True
+
+    def _format_wait_job_summary(jid: str, rec: dict | None, result: dict | None, outcome: str) -> dict:
+        agent_name = (
+            (result.get("agent") if isinstance(result, dict) else None)
+            or (rec.get("agent") if isinstance(rec, dict) else None)
+        )
+        if outcome == "done" and isinstance(result, dict):
+            report_dict = result.get("report") if isinstance(result.get("report"), dict) else {}
+            summary_text = (
+                result.get("summary")
+                or report_dict.get("summary")
+                or result.get("report_text")
+                or (result.get("result") or "")[:240]
+                or result.get("error")
+            )
+            if isinstance(summary_text, str):
+                summary_text = summary_text.splitlines()[0].strip() or None
+            files_touched = result.get("files_touched")
+            if not isinstance(files_touched, list):
+                we = result.get("workspace_evidence")
+                files_touched = list(we.get("files_touched") or []) if isinstance(we, dict) else []
+            return {
+                "job_id": jid,
+                "agent": agent_name,
+                "status": result.get("status"),
+                "terminal": True,
+                "wait_outcome": "done",
+                "exit_code": result.get("exit_code", 0 if result.get("status") == "success" else 1),
+                "report_ok": bool(result.get("report_ok")),
+                "report_source": result.get("report_source") or ("structured" if result.get("report_ok") else "raw"),
+                "summary": summary_text,
+                "confidence": result.get("confidence"),
+                "files_touched": files_touched,
+                "result": result.get("result"),
+                "final_result": result.get("final_result"),
+                "report_text": result.get("report_text"),
+                "report": result.get("report"),
+                "verdict": result.get("verdict"),
+                "result_file": _jobs.result_path(root, jid),
+            }
+        if outcome == "timeout":
+            pid = rec.get("pid") if isinstance(rec, dict) else None
+            liveness = _jobs._pid_liveness(pid) if pid is not None else None
+            state = "running" if liveness == "alive" else ("prepared" if pid is None else "unverified")
+            return {
+                "job_id": jid,
+                "agent": agent_name,
+                "status": state,
+                "terminal": False,
+                "wait_outcome": "timeout",
+                "exit_code": 124,
+                "report_ok": False,
+                "report_source": "none",
+                "summary": None,
+                "confidence": None,
+                "files_touched": [],
+            }
+        return {
+            "job_id": jid,
+            "agent": agent_name,
+            "status": "error",
+            "terminal": True,
+            "wait_outcome": outcome,
+            "exit_code": 1,
+            "report_ok": False,
+            "report_source": "none",
+            "summary": f"background job {jid!r} ended with outcome {outcome!r}",
+            "confidence": None,
+            "files_touched": [],
+        }
+
+    if getattr(args, "jobs_wait_any", False):
+        target_ids = list(getattr(args, "jobs_wait_ids", None) or [])
+        active_only = bool(getattr(args, "jobs_active_only", False))
+        if not target_ids and not active_only:
+            emit_error("jobs wait --any requires explicit job IDs or --active-only")
+            return 1
+        if target_ids:
+            if not _validate_target_ids(target_ids):
+                return 1
+        else:
+            rows = [r for r in _jobs.list_jobs(root) if r.get("state") in ("running", "prepared")]
+            target_ids = [r["job_id"] for r in rows]
+        if not target_ids:
+            print(json.dumps({
+                "status": "error",
+                "error_kind": "no_active_jobs",
+                "error": "no active background jobs found",
+                "job_dir": root,
+                "remaining_ids": [],
+            }, ensure_ascii=False))
+            return 1
+        deadline = time.monotonic() + max(0.0, int(args.timeout) / 1000.0)
+        while True:
+            for jid in target_ids:
+                result, outcome = _jobs.wait_job(root, jid, 0, poll_sec=0.0)
+                if outcome != "timeout":
+                    rec, _ = _jobs._read(_jobs.record_path(root, jid))
+                    summary_item = _format_wait_job_summary(jid, rec, result, outcome)
+                    remaining = [other for other in target_ids if other != jid]
+                    success = outcome == "done" and isinstance(result, dict) and result.get("status") == "success"
+                    payload = {
+                        "status": "success" if success else "error",
+                        "job_dir": root,
+                        "completed_job_id": jid,
+                        "wait_outcome": outcome,
+                        "job": summary_item,
+                        "remaining_ids": remaining,
+                    }
+                    print(json.dumps(payload, ensure_ascii=False))
+                    return 0 if success else 1
+            if time.monotonic() >= deadline:
+                print(json.dumps({
+                    "status": "running",
+                    "wait_outcome": "timeout",
+                    "timed_out": True,
+                    "job_dir": root,
+                    "completed_job_id": None,
+                    "job": None,
+                    "remaining_ids": list(target_ids),
+                    "exit_code": 124,
+                }, ensure_ascii=False))
+                return 124
+            time.sleep(min(0.1, max(0.005, deadline - time.monotonic())))
+
     if getattr(args, "jobs_wait_all", False):
         target_ids = list(getattr(args, "jobs_wait_ids", None) or [])
         active_only = bool(getattr(args, "jobs_active_only", False))
         skipped_stale = 0
         if target_ids:
-            for jid in target_ids:
-                if not _jobs.valid_job_id(jid):
-                    emit_error(f"invalid job id: {jid!r}")
-                    return 1
-                rec, rec_state = _jobs._read(_jobs.record_path(root, jid))
-                res, res_state = _jobs._read(_jobs.result_path(root, jid))
-                if rec is None and rec_state == "missing" and res is None and res_state == "missing":
-                    emit_error(f"background job {jid!r} was not found in this job directory; check --job-dir")
-                    return 1
+            if not _validate_target_ids(target_ids):
+                return 1
         else:
             rows = _jobs.list_jobs(root)
             if active_only:
@@ -1059,75 +1204,7 @@ def run_jobs_query(args, emit_error, *, entry_path: str | None = None,
             remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
             result, outcome = _jobs.wait_job(root, jid, remaining_ms, poll_sec=0.1)
             rec, _ = _jobs._read(_jobs.record_path(root, jid))
-            agent_name = (
-                (result.get("agent") if isinstance(result, dict) else None)
-                or (rec.get("agent") if isinstance(rec, dict) else None)
-            )
-            if outcome == "done" and isinstance(result, dict):
-                report_dict = result.get("report") if isinstance(result.get("report"), dict) else {}
-                summary_text = (
-                    result.get("summary")
-                    or report_dict.get("summary")
-                    or result.get("report_text")
-                    or (result.get("result") or "")[:240]
-                    or result.get("error")
-                )
-                if isinstance(summary_text, str):
-                    summary_text = summary_text.splitlines()[0].strip() or None
-                files_touched = result.get("files_touched")
-                if not isinstance(files_touched, list):
-                    we = result.get("workspace_evidence")
-                    files_touched = list(we.get("files_touched") or []) if isinstance(we, dict) else []
-                summaries.append({
-                    "job_id": jid,
-                    "agent": agent_name,
-                    "status": result.get("status"),
-                    "terminal": True,
-                    "wait_outcome": "done",
-                    "exit_code": result.get("exit_code", 0 if result.get("status") == "success" else 1),
-                    "report_ok": bool(result.get("report_ok")),
-                    "report_source": result.get("report_source") or ("structured" if result.get("report_ok") else "raw"),
-                    "summary": summary_text,
-                    "confidence": result.get("confidence"),
-                    "files_touched": files_touched,
-                    "result": result.get("result"),
-                    "final_result": result.get("final_result"),
-                    "report_text": result.get("report_text"),
-                    "report": result.get("report"),
-                    "verdict": result.get("verdict"),
-                    "result_file": _jobs.result_path(root, jid),
-                })
-            elif outcome == "timeout":
-                pid = rec.get("pid") if isinstance(rec, dict) else None
-                liveness = _jobs._pid_liveness(pid) if pid is not None else None
-                state = "running" if liveness == "alive" else ("prepared" if pid is None else "unverified")
-                summaries.append({
-                    "job_id": jid,
-                    "agent": agent_name,
-                    "status": state,
-                    "terminal": False,
-                    "wait_outcome": "timeout",
-                    "exit_code": 124,
-                    "report_ok": False,
-                    "report_source": "none",
-                    "summary": None,
-                    "confidence": None,
-                    "files_touched": [],
-                })
-            else:
-                summaries.append({
-                    "job_id": jid,
-                    "agent": agent_name,
-                    "status": "error",
-                    "terminal": True,
-                    "wait_outcome": outcome,
-                    "exit_code": 1,
-                    "report_ok": False,
-                    "report_source": "none",
-                    "summary": f"background job {jid!r} ended with outcome {outcome!r}",
-                    "confidence": None,
-                    "files_touched": [],
-                })
+            summaries.append(_format_wait_job_summary(jid, rec, result, outcome))
         all_terminal = all(item["terminal"] for item in summaries)
         succeeded = sum(1 for item in summaries if item["status"] == "success")
         failed = sum(1 for item in summaries if item["terminal"] and item["status"] != "success")
